@@ -1,0 +1,141 @@
+"""File-backed session/chat-history storage.
+
+v1 persists each session as one JSON file under a data folder — an interim
+step before a real database (per the project owner's direction: "in future
+we will design the db tables for that"). The on-disk shape is deliberately
+close to a normalized {sessions, messages} table pair so that a future
+migration is a straight mapping exercise, not a redesign:
+
+    data/sessions/<session_id>.json
+    {
+      "session_id": "...", "created_at": "<iso8601>", "updated_at": "<iso8601>",
+      "messages": [{"role": "user"|"assistant", "content": "...", "at": "<iso8601>"}, ...]
+    }
+
+SessionStore's method surface (create/get_or_create/append/list/get) is the
+contract the rest of the app depends on — a future DB-backed implementation
+swaps in behind the same methods, matching the AIProvider/CodeSandbox-style
+seams already used elsewhere (see app/providers.py, app/sandbox.py).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "sessions"
+PREVIEW_CHARS = 120
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class SessionStore:
+    """File-backed session/conversation history. See module docstring for
+    the on-disk schema. An in-memory cache avoids re-reading a session's
+    file on every message within the same process lifetime; every write
+    still goes straight to disk so history survives a restart."""
+
+    def __init__(self, data_dir: Path | None = None):
+        self.data_dir = data_dir or DEFAULT_DATA_DIR
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._cache: dict[str, dict] = {}
+
+    def _path(self, session_id: str) -> Path:
+        # session_id is our own uuid4, but never trust it as a path component blindly.
+        safe_id = re.sub(r"[^A-Za-z0-9-]", "", session_id)
+        return self.data_dir / f"{safe_id}.json"
+
+    def _write(self, session: dict) -> None:
+        session["updated_at"] = _now_iso()
+        try:
+            self._path(session["session_id"]).write_text(json.dumps(session, indent=2), encoding="utf-8")
+        except OSError as exc:
+            # A disk-write failure shouldn't take the chat request down; the
+            # in-memory cache still has this turn, it just won't survive a restart.
+            logger.warning("Could not persist session %s: %s", session["session_id"], exc)
+        self._cache[session["session_id"]] = session
+
+    def _load(self, session_id: str) -> dict | None:
+        if session_id in self._cache:
+            return self._cache[session_id]
+        path = self._path(session_id)
+        if not path.is_file():
+            return None
+        try:
+            session = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read session file %s: %s", path, exc)
+            return None
+        self._cache[session_id] = session
+        return session
+
+    def create(self) -> dict:
+        session_id = str(uuid4())
+        now = _now_iso()
+        session = {"session_id": session_id, "created_at": now, "updated_at": now, "messages": []}
+        self._write(session)
+        return session
+
+    def get_or_create(self, session_id: str | None) -> dict:
+        if session_id:
+            existing = self._load(session_id)
+            if existing is not None:
+                return existing
+        return self.create()
+
+    def append(self, session_id: str, role: str, content: str) -> None:
+        session = self._load(session_id)
+        if session is None:
+            return
+        session["messages"].append({"role": role, "content": content, "at": _now_iso()})
+        self._write(session)
+
+    def set_field(self, session_id: str, key: str, value) -> None:
+        """Persists arbitrary session-scoped state alongside the transcript —
+        e.g. an in-progress skill Q&A (see CopilotService._start_chat_skill_run).
+        A no-op for an unknown session, matching append()'s behavior."""
+        session = self._load(session_id)
+        if session is None:
+            return
+        session[key] = value
+        self._write(session)
+
+    def list(self) -> list[dict]:
+        """Summaries (no message bodies) for a session picker — newest first."""
+        summaries = []
+        for path in self.data_dir.glob("*.json"):
+            session = self._load(path.stem)
+            if session is None:
+                continue
+            messages = session.get("messages", [])
+            first_user = next((m["content"] for m in messages if m.get("role") == "user"), "")
+            summaries.append({
+                "session_id": session["session_id"],
+                "created_at": session["created_at"],
+                "updated_at": session.get("updated_at", session["created_at"]),
+                "message_count": len(messages),
+                "preview": first_user[:PREVIEW_CHARS],
+                # Not returned to callers, just a tiebreaker: two writes can land on
+                # the same `updated_at` string under fast/loaded conditions (observed
+                # under CI-like load), at which point falling back to filesystem glob
+                # order would be effectively arbitrary. mtime_ns reflects real write
+                # order even when the ISO-string clock reading ties.
+                "_mtime_ns": path.stat().st_mtime_ns,
+            })
+        summaries.sort(key=lambda s: (s["updated_at"], s["_mtime_ns"]), reverse=True)
+        for s in summaries:
+            del s["_mtime_ns"]
+        return summaries
+
+    def get(self, session_id: str) -> dict:
+        session = self._load(session_id)
+        if session is None:
+            raise KeyError("Session not found")
+        return session

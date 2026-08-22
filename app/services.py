@@ -1,0 +1,898 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable
+from uuid import uuid4
+
+from autogen_core import CancellationToken
+
+from .agents import (
+    AgentOrchestrator, AutoGenOrchestrator,
+    default_agent_registry, default_skill_registry, reset_router_provider_cache,
+)
+from .artifacts import ArtifactStore
+from .config import settings
+from .hitl_agents import run_approved_code
+from .memory import BUFFER_SIZE, CompactMemoryState, compact_history
+from .observability import tracer
+from .providers import (
+    EmbeddingProvider, HashEmbeddingProvider, build_embedding_provider, build_provider,
+    describe_embedding_config,
+)
+from .retrieval import (
+    BM25Index, chunk_text, cosine_similarity, embed,
+    lexical_rerank_score, reciprocal_rank_fusion, tokenize,
+)
+from .sandbox import CodeSandbox, build_sandbox
+from .skills import SkillPackageStore, SkillRunService
+from .storage import SessionStore
+from .streaming import stream_chat
+
+logger = logging.getLogger(__name__)
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+class HitlService:
+    """Phase 0 HITL foundation: PENDING/WAITING_FOR_APPROVAL -> APPROVED/REJECTED -> COMPLETED/CANCELLED.
+
+    Code execution itself runs via a real CodeExecutorAgent wrapping this
+    app's own CodeSandbox (app/sandbox.py) — see app/hitl_agents.py — this
+    class owns the approval workflow: the WAITING_FOR_APPROVAL/decided
+    record bookkeeping and the REST surface, plus (await_decision below) a
+    way for a live agent-mode turn to genuinely wait for a decision instead
+    of only ever polling.
+    """
+
+    def __init__(self, sandbox: CodeSandbox, artifacts: ArtifactStore | None = None):
+        self.sandbox = sandbox
+        self.requests: dict[str, dict] = {}
+        # request_id -> every Future currently awaiting this request's
+        # decision (see await_decision/await_human_decision in
+        # app/hitl_agents.py). Empty for the overwhelmingly common case — a
+        # decision made from the Agents & Tools tab with nothing live
+        # waiting on it — decide() just finds nothing to resolve.
+        self._decision_futures: dict[str, list[asyncio.Future]] = {}
+        # Where an approved run's downloadable artifact_files (a generated
+        # .html dashboard, a .pdf report — see app/sandbox.py) actually get
+        # persisted — see decide() below. Optional/defaulted so existing
+        # direct HitlService(sandbox) construction (tests) keeps working.
+        self.artifacts = artifacts or ArtifactStore()
+
+    def submit_code_execution(self, code: str, session_id: str | None) -> dict:
+        request_id = str(uuid4())
+        record = {
+            "request_id": request_id,
+            "kind": "code_execution",
+            "session_id": session_id,
+            "code": code,
+            "status": "WAITING_FOR_APPROVAL",
+            "result": None,
+            "downloadable_artifacts": [],  # populated by decide() only if approved code actually produced one
+            "created_at": now_iso(),
+            "decided_at": None,
+        }
+        self.requests[request_id] = record
+        return record
+
+    def await_decision(self, request_id: str) -> asyncio.Future:
+        """Returns a Future that resolves to this request's decided record
+        the moment decide() runs for it (from anywhere — the Agents & Tools
+        tab's normal POST /api/hitl/decide is the overwhelmingly common
+        caller). Safe to call more than once for the same request_id."""
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._decision_futures.setdefault(request_id, []).append(future)
+        return future
+
+    async def decide(self, request_id: str, approved: bool) -> dict:
+        if request_id not in self.requests:
+            raise KeyError("HITL request not found")
+        record = self.requests[request_id]
+        if record["status"] != "WAITING_FOR_APPROVAL":
+            raise ValueError("HITL request already decided")
+        record["decided_at"] = now_iso()
+        if not approved:
+            record["status"] = "REJECTED"
+        else:
+            record["status"] = "APPROVED"
+            if record["kind"] == "code_execution":
+                result = await run_approved_code(self.sandbox, record["code"])
+                record["result"] = result.public()
+                # Any downloadable file the approved code produced (a
+                # generated .html dashboard, a .pdf report) — persisted into
+                # the artifact store here, the ONE place approved code's
+                # output is captured, so the record carries a real,
+                # servable view/download URL alongside the plain stdout
+                # already in `result`. Named distinctly from
+                # result["artifacts"] (ExecutionResult.public()'s plain
+                # filename list, every artifact regardless of type) — this
+                # is only the subset that was actually captured and stored.
+                # Empty (the overwhelming common case — most executed code
+                # has no downloadable output) means an empty list, not an error.
+                record["downloadable_artifacts"] = [
+                    self.artifacts.add(
+                        filename, content,
+                        session_id=record.get("session_id"), hitl_request_id=request_id,
+                    ).public()
+                    for filename, content in result.artifact_files.items()
+                ]
+                record["status"] = "COMPLETED"
+        for future in self._decision_futures.pop(request_id, []):
+            if not future.done():
+                future.set_result(record)
+        return record
+
+    def list(self) -> list[dict]:
+        return list(self.requests.values())
+
+    def get(self, request_id: str) -> dict:
+        if request_id not in self.requests:
+            raise KeyError("HITL request not found")
+        return self.requests[request_id]
+
+class GuardrailService:
+    """Phase 0: lightweight input/output safety and policy checks."""
+
+    BLOCKED_PATTERNS = (
+        "ignore previous instructions",
+        "reveal system prompt",
+        "show me your api key",
+        "print environment variables",
+    )
+
+    def check_input(self, text: str) -> dict:
+        lowered = text.lower()
+        matched = [p for p in self.BLOCKED_PATTERNS if p in lowered]
+        return {
+            "allowed": not matched,
+            "phase": 0,
+            "matched_rules": matched,
+            "message": "Input allowed" if not matched else "Input blocked by Phase 0 guardrails",
+        }
+
+    def check_output(self, text: str) -> dict:
+        lowered = text.lower()
+        secret_like = ("api_key=" in lowered, "password=" in lowered)
+        blocked = any(secret_like)
+        return {
+            "allowed": not blocked,
+            "phase": 0,
+            "matched_rules": ["secret-like-output"] if blocked else [],
+            "message": "Output allowed" if not blocked else "Output blocked by Phase 0 guardrails",
+        }
+
+    def check_context(self, chunks: list[dict]) -> dict:
+        """Screens retrieved chunks for indirect prompt injection — a
+        compromised/malicious document trying to override instructions —
+        before they're placed into the model's context. Distinct from
+        check_input (user message) and check_output (model response); see
+        docs/rag.md."""
+        flagged = [c["chunk_id"] for c in chunks if any(p in c["snippet"].lower() for p in self.BLOCKED_PATTERNS)]
+        return {
+            "allowed": not flagged,
+            "phase": 0,
+            "matched_rules": ["retrieved-context-injection"] if flagged else [],
+            "flagged_chunk_ids": flagged,
+            "message": "Context allowed" if not flagged
+                       else f"{len(flagged)} retrieved chunk(s) blocked by Phase 0 guardrails",
+        }
+
+class RAGStore:
+    """Ingestion: extract -> clean -> chunk -> metadata -> embed -> index.
+    Retrieval: understand -> hybrid retrieve (vector + BM25) -> rerank -> context.
+    See docs/rag.md for the full design and what v1 vs. future covers.
+
+    Embedding is behind `EmbeddingProvider` (app/providers.py) — the offline hash
+    embedder by default, or a real model (Gemini/Ollama) in configured mode, with
+    graceful fallback to the hash embedder on any failure. add/update/search are
+    async because a real embedding call is a network call.
+    """
+
+    VECTOR_TOP_K = 8
+    BM25_TOP_K = 8
+    RERANK_POOL = 8
+
+    def __init__(self, embedding_provider: EmbeddingProvider | None = None):
+        self.documents: dict[str, dict] = {}
+        self.chunks: dict[str, dict] = {}
+        self.bm25 = BM25Index()
+        self.embedding_provider = embedding_provider or HashEmbeddingProvider()
+        # Last actual embed() outcome (ingestion or query) — see describe_embedding().
+        self.last_embedding: dict | None = None
+
+        # Bootstrap doc, seeded synchronously at construction time (no event loop
+        # available yet) — always via the offline hash embedder directly, regardless
+        # of self.embedding_provider, since this trivial internal doc doesn't
+        # warrant a real embedding call.
+        document_id = str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        content = "Enterprise Copilot knowledge base. Documents can be added, updated, deleted and retrieved."
+        self.documents[document_id] = {
+            "document_id": document_id, "filename": "welcome.md", "content": content,
+            "status": "indexed", "created_at": now, "updated_at": now,
+            "size": len(content.encode("utf-8")),
+        }
+        for index, text in enumerate(chunk_text(content)):
+            index_text = f"welcome.md {text}"
+            self._index_chunk(document_id, index, text, embed(index_text), "hash")
+
+    async def add(self, filename: str, content: str) -> dict:
+        document_id = str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        doc = {
+            "document_id": document_id,
+            "filename": filename,
+            "content": content,
+            "status": "indexed",
+            "created_at": now,
+            "updated_at": now,
+            "size": len(content.encode("utf-8")),
+        }
+        self.documents[document_id] = doc
+        await self._reindex(document_id)
+        return self.public(doc)
+
+    async def update(self, document_id: str, filename: str | None, content: str | None) -> dict:
+        if document_id not in self.documents:
+            raise KeyError("Document not found")
+        doc = self.documents[document_id]
+        if filename is not None:
+            doc["filename"] = filename
+        if content is not None:
+            doc["content"] = content
+            doc["size"] = len(content.encode("utf-8"))
+        doc["updated_at"] = datetime.now(timezone.utc).isoformat()
+        doc["status"] = "indexed"
+        await self._reindex(document_id)  # re-chunk/re-embed immediately — v1 has no separate reindex step
+        return self.public(doc)
+
+    def delete(self, document_id: str) -> None:
+        if document_id not in self.documents:
+            raise KeyError("Document not found")
+        self._drop_chunks(document_id)
+        del self.documents[document_id]
+
+    def list(self) -> list[dict]:
+        return [self.public(d) for d in self.documents.values()]
+
+    def get(self, document_id: str) -> dict:
+        # Single-document fetch includes content (needed to view/edit); list() stays
+        # content-stripped since it's a summary view over potentially many documents.
+        if document_id not in self.documents:
+            raise KeyError("Document not found")
+        return dict(self.documents[document_id])
+
+    def public(self, doc: dict) -> dict:
+        result = dict(doc)
+        result.pop("content", None)
+        result["chunk_count"] = sum(1 for c in self.chunks.values() if c["document_id"] == doc["document_id"])
+        return result
+
+    # --- ingestion: extract -> clean -> chunk -> metadata -> embed -> index ---
+
+    def _drop_chunks(self, document_id: str) -> None:
+        stale = [chunk_id for chunk_id, c in self.chunks.items() if c["document_id"] == document_id]
+        for chunk_id in stale:
+            del self.chunks[chunk_id]
+            self.bm25.remove(chunk_id)
+
+    def _index_chunk(
+        self, document_id: str, index: int, text: str, vector: list[float],
+        provider_name: str, model_name: str | None = None,
+    ) -> None:
+        chunk_id = str(uuid4())
+        doc = self.documents[document_id]
+        # metadata: filename folded into the indexed text (not the stored/cited
+        # snippet) so retrieval can match on it, same as a real chunk's source path
+        index_text = f"{doc['filename']} {text}"
+        self.chunks[chunk_id] = {
+            "chunk_id": chunk_id,
+            "document_id": document_id,
+            "filename": doc["filename"],
+            "chunk_index": index,
+            "text": text,
+            "tokens": tokenize(index_text),
+            "embedding": vector,
+            "embedding_provider": provider_name,
+            "embedding_model": model_name,
+        }
+        self.bm25.add(chunk_id, self.chunks[chunk_id]["tokens"])
+
+    async def _reindex(self, document_id: str) -> None:
+        self._drop_chunks(document_id)
+        doc = self.documents[document_id]
+        # extract: v1 documents are already plain text, so this stage is a no-op
+        for index, text in enumerate(chunk_text(doc["content"])):
+            index_text = f"{doc['filename']} {text}"
+            result = await self.embedding_provider.embed(index_text)
+            self._index_chunk(document_id, index, text, result.vector, result.provider, result.model)
+            # Remembered so RAGStore.describe_embedding() can report what
+            # actually embedded the most recent document, not just what's
+            # configured — the two can differ if a provider fell back.
+            self.last_embedding = {"provider": result.provider, "model": result.model, "used_fallback": result.used_fallback}
+
+    # --- retrieval: understand -> hybrid retrieve -> rerank -> context -------
+
+    async def search(self, query: str, limit: int = 3) -> list[dict]:
+        if not self.chunks:
+            return []
+        query_tokens = tokenize(query)  # understand: normalize the question
+        if not query_tokens:
+            return []
+        query_result = await self.embedding_provider.embed(query)
+        query_vector = query_result.vector
+        self.last_embedding = {
+            "provider": query_result.provider, "model": query_result.model,
+            "used_fallback": query_result.used_fallback,
+        }
+
+        # A chunk embedded by a different provider than the query (e.g. an earlier
+        # ingestion call fell back to the hash embedder while a later one used the
+        # real model) lives in a different, incomparable vector space. Guard on
+        # matching dimensionality rather than silently dot-producting mismatched
+        # spaces (cosine_similarity would zip-truncate and return a meaningless
+        # number); BM25 still covers that chunk regardless.
+        vector_scores = {
+            cid: cosine_similarity(query_vector, c["embedding"])
+            for cid, c in self.chunks.items() if len(c["embedding"]) == len(query_vector)
+        }
+        vector_ranked = [cid for cid, score in sorted(vector_scores.items(), key=lambda p: p[1], reverse=True)
+                          if score > 0][: self.VECTOR_TOP_K]
+
+        bm25_scores = self.bm25.search(query_tokens)
+        bm25_ranked = [cid for cid, _ in sorted(bm25_scores.items(), key=lambda p: p[1], reverse=True)][: self.BM25_TOP_K]
+
+        # hybrid retrieve: fuse the vector leg and the BM25 leg
+        fused = reciprocal_rank_fusion([vector_ranked, bm25_ranked])
+        if not fused:
+            return []
+        candidates = sorted(fused.items(), key=lambda p: p[1], reverse=True)[: self.RERANK_POOL]
+
+        # rerank: independent lexical-coverage signal over the fused candidate pool
+        reranked = sorted(
+            ((lexical_rerank_score(query_tokens, self.chunks[cid]["tokens"]), hybrid_score, cid)
+             for cid, hybrid_score in candidates),
+            reverse=True,
+        )
+
+        results = []
+        for rerank_score, hybrid_score, chunk_id in reranked[:limit]:
+            chunk = self.chunks[chunk_id]
+            results.append({
+                "document_id": chunk["document_id"],
+                "filename": chunk["filename"],
+                "chunk_id": chunk_id,
+                "chunk_index": chunk["chunk_index"],
+                "snippet": chunk["text"][:400].strip(),
+                "vector_score": round(vector_scores.get(chunk_id, 0.0), 4),
+                "bm25_score": round(bm25_scores.get(chunk_id, 0.0), 4),
+                "rerank_score": round(rerank_score, 4),
+                "embedding_provider": chunk["embedding_provider"],
+                "embedding_model": chunk.get("embedding_model"),
+            })
+        return results
+
+    def describe_embedding(self) -> dict:
+        """RAG status for the UI: what embedding is configured (from
+        settings, static) plus what actually ran the most recent ingest/query
+        (dynamic — can differ if a provider fell back mid-session)."""
+        return {"configured": describe_embedding_config(), "last_used": self.last_embedding}
+
+class CopilotService:
+    def __init__(self, data_dir: Path | str | None = None):
+        """`data_dir`: root directory for every file-backed store this
+        service owns (SessionStore, SkillPackageStore, SkillRunService —
+        each gets its own named subdirectory below it). Resolution order:
+        the explicit argument, then settings.data_dir (DATA_DIR env var —
+        see app/config.py, set by the repo-root conftest.py to a throwaway
+        temp dir so test runs never write into this repo's real data/), then None
+        (each store falls back to its own real repo-root data/<name>/
+        default — normal production/local-dev behavior, unchanged)."""
+        resolved_dir = Path(data_dir) if data_dir else (Path(settings.data_dir) if settings.data_dir else None)
+        self.provider = build_provider()
+        self.embedding_provider = build_embedding_provider()
+        self.guardrails = GuardrailService()
+        self.rag = RAGStore(embedding_provider=self.embedding_provider)
+        self.sessions = SessionStore(data_dir=resolved_dir / "sessions" if resolved_dir else None)
+        self.sandbox = build_sandbox()
+        self.artifacts = ArtifactStore()
+        self.hitl = HitlService(self.sandbox, artifacts=self.artifacts)
+        self.agent_registry = default_agent_registry()
+        self.skill_registry = default_skill_registry()
+        self.orchestrator: AgentOrchestrator = AutoGenOrchestrator(
+            self.provider, self.agent_registry, self.skill_registry, self.rag, self.hitl,
+            guardrails=self.guardrails,
+        )
+        self.skill_packages = SkillPackageStore(data_dir=resolved_dir / "skills" if resolved_dir else None)
+        self.skill_runs = SkillRunService(
+            self.skill_packages, self.provider, data_dir=resolved_dir / "skill-runs" if resolved_dir else None,
+        )
+
+    def reload_providers(self) -> None:
+        """Rebuilds every provider instance derived from `settings` after a
+        runtime settings change (see POST /api/settings/models,
+        docs/runtime-settings.md) — MODEL_PROVIDER, GEMINI_MODEL,
+        OLLAMA_MODEL, *_EMBEDDING_MODEL, or AGENT_ROUTER_MODEL.
+
+        Everywhere else in this app already reads `settings.X` fresh on
+        every call (build_streaming_model_client, list_available_models,
+        the router prompt in AgentRegistry.select_llm, ...) — this only
+        needs to rebuild the handful of instances CopilotService caches at
+        construction time and hands out by reference: self.provider,
+        self.embedding_provider, and everything holding onto either of
+        those (self.orchestrator, self.skill_runs, self.rag). Rebuilding
+        RAGStore itself would wipe every indexed document, so its
+        embedding_provider is swapped in place instead — same object,
+        fresh provider.
+
+        Called once, synchronously, right after a settings write — takes
+        effect on the very next request; nothing needs a process restart.
+        """
+        self.provider = build_provider()
+        self.embedding_provider = build_embedding_provider()
+        self.rag.embedding_provider = self.embedding_provider
+        self.orchestrator.provider = self.provider
+        self.skill_runs.provider = self.provider
+        reset_router_provider_cache()
+
+    async def chat(
+        self, message: str, agent_mode: bool, session_id: str | None,
+        on_event: Callable[[dict], Awaitable[None]] | None = None,
+        images: list[dict] | None = None, allow_live_hitl_wait: bool = False,
+        web_search: bool = False,
+    ) -> dict:
+        """`on_event`, when given, receives live progress events for the
+        multi-step paths below (skill drafting/generation, agent-mode
+        retrieval/thinking) as they actually happen — see CopilotService.
+        chat_stream, which is the only caller that passes one. None (the
+        default, and every non-streaming caller) means those calls are
+        no-ops, so this costs nothing outside the streaming path.
+
+        Every one of those same events, plus each completed model call, is
+        also mirrored to Langfuse (app/observability.py) as one span/event/
+        generation nested under a single per-turn trace — a no-op unless
+        Langfuse is configured, so this costs nothing when it isn't.
+
+        `images`: optional multimodal attachments for this turn (see
+        app/models.py:ImageAttachment).
+
+        `web_search`: the turn's "Web Search" UI toggle — offers the Tavily
+        web_search MCP tool for this turn (app/mcp_tools.py) when agent_mode
+        is also on. No effect otherwise (only agent-mode turns tool-call at
+        all) — see AutoGenOrchestrator.run's `context["web_search"]`.
+
+        `allow_live_hitl_wait`: only CopilotService.chat_stream's real-time
+        SSE delegate branch sets this — a long-lived connection that can
+        genuinely wait for a human's HITL decision (app/hitl_agents.py) mid-
+        turn. The plain /api/chat route leaves this False: a bare POST can't
+        sensibly stay open for arbitrary approval time, so its coding-agent
+        turns keep the original "queue and return immediately" behavior.
+
+        Context management (buffered + compact-summary memory, see
+        app/memory.py) persists across restarts via
+        SessionStore.set_field(session_id, "memory_state", ...) — loaded
+        once at the top of this method, updated by whichever branch below
+        actually talks to a model, and always persisted before returning."""
+        session = self.sessions.get_or_create(session_id)
+        sid = session["session_id"]
+        history = list(session["messages"])  # snapshot before appending this turn
+        memory_state = CompactMemoryState.from_dict(session.get("memory_state"))
+        self.sessions.append(sid, "user", message)
+
+        async with tracer.turn(
+            "chat_turn", input=message, metadata={"agent_mode": agent_mode, "session_id": sid},
+        ) as turn:
+            async def emit(event: dict) -> None:
+                if event.get("stage") == "model_call":
+                    turn.generation(
+                        event.get("provider") or "model", model=event.get("model"), provider=event.get("provider"),
+                        input=event.get("prompt_preview"), output=event.get("response_preview"),
+                        metadata={"used_fallback": event.get("used_fallback"), "tool_calls": event.get("tool_calls")},
+                    )
+                else:
+                    turn.event(event.get("stage") or "progress", **{k: v for k, v in event.items() if k != "stage"})
+                if on_event is not None:
+                    await on_event(event)
+
+            input_check = self.guardrails.check_input(message)
+            if not input_check["allowed"]:
+                response = input_check["message"]
+                self.sessions.append(sid, "assistant", response)
+                turn.set_output(response, metadata={"blocked": "input"})
+                return {
+                    "response": response, "session_id": sid,
+                    "guardrails": {"input": input_check, "context": None, "output": None},
+                    "agent": None, "skills": [], "provider": None, "model": None,
+                    "used_fallback": False, "hitl_pending": [], "sources": [], "skill_run": None,
+                    "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
+                }
+
+            # Skill routing: checked before agent_mode, regardless of its toggle state —
+            # "create a docx about X" is a tool-dispatch decision, not a chat-generation
+            # one. An in-progress skill Q&A (pending_skill_run) always continues first;
+            # only once nothing is pending do we check for a *new* skill trigger.
+            skill_run_meta = None
+            pending_skill_run = session.get("pending_skill_run")
+            if pending_skill_run:
+                response, skill_run_meta = await self._continue_chat_skill_run(
+                    sid, pending_skill_run, message, on_event=emit,
+                )
+                context_check = None
+                meta = {
+                    "agent": "skill", "skills": [pending_skill_run["skill_id"]],
+                    # Only the finish turn actually calls a provider (to draft the
+                    # spec) — skill_run_meta carries provider/used_fallback then
+                    # (see SkillRunSession.public()); mid-flow Q&A turns leave
+                    # both unset, which correctly renders as "no model call" in
+                    # the UI rather than a misleading "mock".
+                    "provider": (skill_run_meta or {}).get("provider"), "model": None,
+                    "used_fallback": (skill_run_meta or {}).get("used_fallback", False),
+                    "hitl_pending": [], "sources": [], "tool_calls": [], "web_sources": [],
+                    "downloadable_artifacts": [],
+                }
+            else:
+                matched_skill = self.skill_packages.select_for_chat(message)
+                if matched_skill:
+                    response, skill_run_meta = await self._start_chat_skill_run(sid, matched_skill, on_event=emit)
+                    context_check = None
+                    meta = {
+                        "agent": "skill", "skills": [matched_skill.skill_id],
+                        "provider": (skill_run_meta or {}).get("provider"), "model": None,
+                        "used_fallback": (skill_run_meta or {}).get("used_fallback", False),
+                        "hitl_pending": [], "sources": [], "tool_calls": [], "web_sources": [],
+                        "downloadable_artifacts": [],
+                    }
+                elif agent_mode:
+                    result = await self.orchestrator.run(message, {
+                        "session_id": sid, "history": history, "images": images,
+                        "memory_state": memory_state.to_dict(), "allow_live_hitl_wait": allow_live_hitl_wait,
+                        "web_search": web_search,
+                    }, on_event=emit)
+                    response = result.text
+                    context_check = result.context_guardrail
+                    if result.memory_state is not None:
+                        memory_state = CompactMemoryState.from_dict(result.memory_state)
+                    meta = {
+                        "agent": result.agent, "skills": result.skills, "provider": result.provider,
+                        "model": result.model,
+                        "used_fallback": result.used_fallback, "hitl_pending": result.hitl_pending,
+                        "sources": result.sources, "tool_calls": result.tool_calls,
+                        "web_sources": result.web_sources,
+                        "downloadable_artifacts": result.downloadable_artifacts,
+                    }
+                else:
+                    # Direct model call for simple, single-step requests (no agent/skill
+                    # selection, so there's no retrieved context for the context guardrail).
+                    context_check = None
+                    await emit({"stage": "thinking", "label": "Thinking…"})
+                    compacted, memory_state = await compact_history(self.provider, history, memory_state, BUFFER_SIZE)
+                    provider_result = await self.provider.complete(message, compacted, images=images)
+                    response = provider_result.text
+                    await emit({
+                        "stage": "model_call",
+                        "label": f"Answered ({provider_result.provider}"
+                                 f"{f'/{provider_result.model}' if provider_result.model else ''}).",
+                        "provider": provider_result.provider, "model": provider_result.model,
+                        "used_fallback": provider_result.used_fallback,
+                        "prompt_preview": message[:2000], "response_preview": response[:2000],
+                    })
+                    meta = {
+                        "agent": None, "skills": [], "provider": provider_result.provider,
+                        "model": provider_result.model,
+                        "used_fallback": provider_result.used_fallback, "hitl_pending": [], "sources": [],
+                        "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
+                    }
+
+            output_check = self.guardrails.check_output(response)
+            if not output_check["allowed"]:
+                response = "The response was blocked by the configured guardrails."
+
+            self.sessions.append(sid, "assistant", response)
+            self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
+            turn.set_output(response, metadata={
+                "agent": meta.get("agent"), "skills": meta.get("skills"),
+                "provider": meta.get("provider"), "model": meta.get("model"),
+                "used_fallback": meta.get("used_fallback"), "tool_calls": meta.get("tool_calls"),
+            })
+            return {
+                "response": response, "session_id": sid,
+                "guardrails": {"input": input_check, "context": context_check, "output": output_check},
+                "skill_run": skill_run_meta,
+                **meta,
+            }
+
+    @staticmethod
+    def _parse_model_choice(model: str | None) -> tuple[str | None, str | None]:
+        """"provider/model" -> (provider, model); None/"auto" -> (None, None)
+        meaning "use the server's configured default", same as today."""
+        if not model or model in ("auto", "default"):
+            return None, None
+        provider, _, model_name = model.partition("/")
+        return (provider or None), (model_name or None)
+
+    async def chat_stream(
+        self, message: str, agent_mode: bool, session_id: str | None, cancellation_token: CancellationToken,
+        model: str | None = None, images: list[dict] | None = None, web_search: bool = False,
+    ) -> AsyncIterator[dict]:
+        """SSE-friendly variant of chat(): yields incremental event dicts
+        instead of returning one final dict.
+
+        Real token-by-token AutoGen streaming (app/streaming.py) powers the
+        plain direct-chat case (agent_mode off, no skill match, input
+        allowed) — the one case that's genuinely a bare "stream the model's
+        answer." It also yields a "model_info" event (the actual resolved
+        provider/model, not a guess) and a "status" event ("thinking") before
+        the first token.
+
+        Every other case (blocked input, skill Q&A, agent_mode) delegates to
+        chat() via a background task, but still streams live: chat() accepts
+        an `on_event` callback (see its docstring) that fires real progress
+        events — knowledge retrieval, thinking, skill drafting/generation —
+        as they happen; this generator bridges that callback to further
+        "status" SSE events through an asyncio.Queue while awaiting the task,
+        then delivers the same single "done" event as before once it
+        finishes.
+
+        `model` ("provider/model", from the Copilot model picker) is None for
+        "use the server default" — same silent-fallback behavior as before.
+        When set, it's an explicit user choice: a failure is always reported
+        (see app/providers.py's describe_model_error), never silently
+        swapped for mock — that would hide exactly what the picker is for.
+        """
+        session = self.sessions.get_or_create(session_id)
+        sid = session["session_id"]
+        yield {"type": "session", "session_id": sid}
+
+        explicit_provider, explicit_model = self._parse_model_choice(model)
+
+        input_check = self.guardrails.check_input(message)
+        pending_skill_run = session.get("pending_skill_run")
+        would_skill_route = bool(pending_skill_run) or (
+            input_check["allowed"] and bool(self.skill_packages.select_for_chat(message))
+        )
+        attempt_real_stream = input_check["allowed"] and not would_skill_route and not agent_mode
+
+        if attempt_real_stream:
+            history = list(session["messages"])
+            full_text = ""
+            cancelled = False
+            error = None
+            result_provider = None
+            result_model = None
+            memory_state = CompactMemoryState.from_dict(session.get("memory_state"))
+            async with tracer.turn(
+                "chat_turn_stream", input=message, metadata={"agent_mode": False, "session_id": sid},
+            ) as turn:
+                async for event in stream_chat(
+                    message, history, cancellation_token,
+                    provider=explicit_provider, model=explicit_model, strict=bool(explicit_provider),
+                    images=images, memory_provider=self.provider, memory_state=memory_state.to_dict(),
+                ):
+                    if event["type"] == "delta":
+                        full_text += event["text"]
+                        yield event
+                    elif event["type"] in ("team_event", "status"):
+                        turn.event(event.get("stage") or event.get("event_type") or "progress",
+                                   **{k: v for k, v in event.items() if k not in ("type", "stage")})
+                        yield event
+                    elif event["type"] == "model_info":
+                        # The real, resolved identity of what's answering —
+                        # replaces the old "autogen-stream" placeholder, which
+                        # named the streaming mechanism, not the model. Forwarded
+                        # live so the UI can show it immediately, and kept for
+                        # the "done" event below.
+                        result_provider, result_model = event["provider"], event["model"]
+                        yield event
+                    elif event["type"] == "memory_state":
+                        memory_state = CompactMemoryState.from_dict(event["state"])
+                        self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
+                    elif event["type"] == "cancelled":
+                        cancelled = True
+                    elif event["type"] == "error":
+                        error = event["message"]
+
+                if error and not full_text and not cancelled and not explicit_provider:
+                    # Automatic path, unavailable -> fall through to chat() below (which
+                    # opens its own "chat_turn" trace), no error shown. This trace still
+                    # closes with a note of why, rather than a silently empty one.
+                    turn.set_output(None, metadata={"fallback": "delegate"})
+                else:
+                    self.sessions.append(sid, "user", message)
+                    result_provider = result_provider or explicit_provider or "unknown"
+                    result_model = result_model or explicit_model
+                    if cancelled:
+                        response = full_text or "(cancelled before any output)"
+                        self.sessions.append(sid, "assistant", response)
+                        turn.set_output(response, metadata={"cancelled": True, "provider": result_provider, "model": result_model})
+                        yield {
+                            "response": response, "session_id": sid, "type": "done", "cancelled": True,
+                            "guardrails": {"input": input_check, "context": None, "output": None},
+                            "agent": None, "skills": [], "provider": result_provider, "model": result_model,
+                            "used_fallback": False,
+                            "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
+                            "web_sources": [], "downloadable_artifacts": [],
+                        }
+                        return
+                    if error:
+                        response = (f"Couldn't get a response from {explicit_provider}/{explicit_model}: {error}"
+                                    if explicit_provider else f"Something went wrong generating that response ({error}).")
+                        self.sessions.append(sid, "assistant", response)
+                        turn.set_output(response, metadata={"error": error, "provider": result_provider, "model": result_model})
+                        yield {
+                            "response": response, "session_id": sid, "type": "done", "model_error": True,
+                            "guardrails": {"input": input_check, "context": None, "output": None},
+                            "agent": None, "skills": [], "provider": result_provider, "model": result_model,
+                            "used_fallback": True,
+                            "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
+                            "web_sources": [], "downloadable_artifacts": [],
+                        }
+                        return
+                    output_check = self.guardrails.check_output(full_text)
+                    if not output_check["allowed"]:
+                        full_text = "The response was blocked by the configured guardrails."
+                    self.sessions.append(sid, "assistant", full_text)
+                    turn.generation(
+                        "stream_chat", model=result_model, provider=result_provider,
+                        input=message[:2000], output=full_text[:2000],
+                    )
+                    turn.set_output(full_text, metadata={"provider": result_provider, "model": result_model})
+                    yield {
+                        "response": full_text, "session_id": sid, "type": "done",
+                        "guardrails": {"input": input_check, "context": None, "output": output_check},
+                        "agent": None, "skills": [], "provider": result_provider, "model": result_model,
+                        "used_fallback": False,
+                        "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
+                        "web_sources": [], "downloadable_artifacts": [],
+                    }
+                    return
+
+        # Delegate: input blocked, skill-routed, agent_mode, or real streaming
+        # unavailable. Still streams live: chat()'s on_event callback (fired
+        # from real, already-happening steps — knowledge retrieval, thinking,
+        # skill drafting/generation) is bridged through this queue to "status"
+        # SSE events while chat() runs as a background task, instead of the
+        # request going quiet until one final lump response.
+        #
+        # Wrapped in its own task, with the SAME cancellation_token linked only to
+        # this task (not shared with any outer task-level link) — a genuine stop
+        # button even for a path with no AutoGen involvement, and no race against
+        # the real-stream branch's own cancellation handling above.
+        event_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+        async def on_event(event: dict) -> None:
+            await event_queue.put(event)
+
+        # allow_live_hitl_wait=True: this SSE connection is already long-lived
+        # (that's the whole point of this delegate path), so a coding-agent
+        # turn here can genuinely wait for a live HITL decision instead of
+        # only ever reporting "queued" — see AutoGenOrchestrator.run's coding
+        # skill section and app/hitl_agents.py.
+        chat_task = asyncio.ensure_future(self.chat(
+            message, agent_mode, sid, on_event=on_event, images=images, allow_live_hitl_wait=True,
+            web_search=web_search,
+        ))
+        cancellation_token.link_future(chat_task)
+        try:
+            while True:
+                get_event = asyncio.ensure_future(event_queue.get())
+                done, _ = await asyncio.wait({chat_task, get_event}, return_when=asyncio.FIRST_COMPLETED)
+                if get_event in done:
+                    yield {"type": "status", **get_event.result()}
+                if chat_task in done:
+                    if not get_event.done():
+                        get_event.cancel()
+                    break
+            # Drain anything queued between the task finishing and this loop's
+            # last check (asyncio.wait's two futures can both resolve in the
+            # same tick) so no progress event is silently dropped.
+            while not event_queue.empty():
+                yield {"type": "status", **event_queue.get_nowait()}
+            result = await chat_task
+        except asyncio.CancelledError:
+            yield {"type": "cancelled"}
+            yield {
+                "response": "(cancelled)", "session_id": sid, "type": "done", "cancelled": True,
+                "guardrails": {"input": input_check, "context": None, "output": None},
+                "agent": None, "skills": [], "provider": None, "model": None, "used_fallback": False,
+                "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
+                "web_sources": [], "downloadable_artifacts": [],
+            }
+            return
+        yield {"type": "delta", "text": result["response"]}
+        yield {"type": "done", **result}
+
+    # --- chat-integrated skill Q&A: ask the skill's declared questions inline,
+    # one per turn, then generate — the same HITL flow as the Skills tab's
+    # pre-flight form, but conversational instead of a modal. ---------------
+
+    @staticmethod
+    def _question_public(question) -> dict:
+        return {
+            "id": question.id, "prompt": question.prompt, "type": question.type,
+            "options": question.options, "required": question.required,
+        }
+
+    @staticmethod
+    def _format_skill_question(skill, question, index: int, total: int) -> str:
+        lines = [f"I'll help you create a {skill.output or 'file'} with **{skill.name}**.", "", f"**{question.prompt}**"]
+        if question.options:
+            lines.append("Options: " + ", ".join(question.options))
+        note = "required" if question.required else 'optional — reply "skip" to skip'
+        lines.append(f"_(question {index + 1} of {total} — {note})_")
+        return "\n".join(lines)
+
+    async def _start_chat_skill_run(
+        self, session_id: str, skill, on_event: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> tuple[str, dict]:
+        run = self.skill_runs.start(skill.skill_id)
+        question_ids = [q.id for q in skill.questions]
+        if not question_ids:
+            return await self._finish_chat_skill_run(run.run_id, {}, on_event=on_event)
+
+        self.sessions.set_field(session_id, "pending_skill_run", {
+            "run_id": run.run_id, "skill_id": skill.skill_id, "question_ids": question_ids, "index": 0,
+        })
+        first_question = skill.questions[0]
+        text = self._format_skill_question(skill, first_question, index=0, total=len(question_ids))
+        return text, {
+            "run_id": run.run_id, "skill_id": skill.skill_id, "status": "AWAITING_ANSWERS",
+            "question": self._question_public(first_question), "download_ready": False,
+        }
+
+    async def _continue_chat_skill_run(
+        self, session_id: str, pending: dict, message: str,
+        on_event: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> tuple[str, dict]:
+        run_id, skill_id = pending["run_id"], pending["skill_id"]
+        question_ids, index = pending["question_ids"], pending["index"]
+        try:
+            skill = self.skill_packages.get(skill_id)
+            run = self.skill_runs.get(run_id)
+        except KeyError:
+            self.sessions.set_field(session_id, "pending_skill_run", None)
+            return "That skill run is no longer available — say the word again (e.g. \"create a docx\") to start over.", None
+
+        question = next(q for q in skill.questions if q.id == question_ids[index])
+        answer = message.strip()
+        if not question.required and answer.lower() in ("skip", "none", "n/a", "-"):
+            answer = ""
+        elif question.required and not answer:
+            text = self._format_skill_question(skill, question, index, len(question_ids))
+            return f"That one's required — {text}", {
+                "run_id": run_id, "skill_id": skill_id, "status": "AWAITING_ANSWERS",
+                "question": self._question_public(question), "download_ready": False,
+            }
+
+        run.answers[question.id] = answer
+        next_index = index + 1
+        if next_index < len(question_ids):
+            self.sessions.set_field(session_id, "pending_skill_run", {**pending, "index": next_index})
+            next_question = next(q for q in skill.questions if q.id == question_ids[next_index])
+            text = self._format_skill_question(skill, next_question, next_index, len(question_ids))
+            return text, {
+                "run_id": run_id, "skill_id": skill_id, "status": "AWAITING_ANSWERS",
+                "question": self._question_public(next_question), "download_ready": False,
+            }
+
+        self.sessions.set_field(session_id, "pending_skill_run", None)
+        return await self._finish_chat_skill_run(run_id, run.answers, on_event=on_event)
+
+    async def _finish_chat_skill_run(
+        self, run_id: str, answers: dict, on_event: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> tuple[str, dict]:
+        try:
+            run = await self.skill_runs.submit_answers(run_id, answers, on_event=on_event)
+        except Exception as exc:  # noqa: BLE001 - a run failure is a chat response, not a crash
+            return f"Couldn't generate that: {exc}", None
+        skill = self.skill_packages.get(run.skill_id)
+        if run.status == "COMPLETED":
+            text = (f"Done! Generated **{skill.name}.{skill.output}**. "
+                    "Download it below, or open the Skills tab to view/edit it.")
+        else:
+            text = f"Generation failed: {run.error or 'unknown error'}. Open the Skills tab to try again."
+        return text, {**run.public(), "skill_name": skill.name, "output": skill.output}
+
+service = CopilotService()

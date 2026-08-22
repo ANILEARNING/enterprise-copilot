@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enterprise Copilot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="/style.css" rel="stylesheet">
+</head>
+<body>
+
+<div class="ambient-bg" aria-hidden="true"><span class="aura-3"></span></div>
+
+<div class="app-shell" id="appShell">
+
+  <!-- ============================= SIDEBAR ============================= -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">EC</div>
+      <div class="brand-text">
+        <strong>Enterprise Copilot</strong>
+        <span>Phase 0 · v1</span>
+      </div>
+    </div>
+
+    <div class="nav-section-label">Workspace</div>
+    <ul class="nav-list">
+      <li><button class="nav-link active" data-view="copilot"><span class="nav-icon">💬</span> Copilot</button></li>
+      <li><button class="nav-link" data-view="knowledge"><span class="nav-icon">📚</span> Knowledge</button></li>
+      <li><button class="nav-link" data-view="skills"><span class="nav-icon">🧩</span> Skills</button></li>
+      <li><button class="nav-link" data-view="sessions"><span class="nav-icon">🕒</span> Sessions</button></li>
+      <li><button class="nav-link" data-view="agents"><span class="nav-icon">🧭</span> Agents &amp; Tools <span class="nav-badge d-none" id="hitlNavBadge">0</span></button></li>
+    </ul>
+
+    <div class="nav-section-label">Workspace</div>
+    <ul class="nav-list">
+      <li><button class="nav-link" data-view="settings"><span class="nav-icon">⚙️</span> Settings</button></li>
+      <li><button class="nav-link" data-view="login"><span class="nav-icon">🔐</span> Login</button></li>
+      <li><button class="nav-link" data-view="about"><span class="nav-icon">ℹ️</span> About</button></li>
+    </ul>
+
+    <div class="sidebar-footer">
+      <div class="env-pill">
+        <span class="env-dot" id="envDot"></span>
+        <span id="envLabel">Guardrails active</span>
+      </div>
+    </div>
+  </aside>
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+  <!-- ============================== TOPBAR ============================== -->
+  <header class="topbar">
+    <button class="icon-btn menu-toggle" id="menuToggle" aria-label="Toggle navigation">☰</button>
+    <div>
+      <div class="topbar-title" id="pageTitle">Copilot</div>
+      <div class="topbar-sub" id="pageSub">Ask questions, run agent workflows, and review guardrails</div>
+    </div>
+    <div class="topbar-spacer"></div>
+
+    <button class="search-trigger" id="cmdkTrigger">
+      <span>🔎</span><span>Search or jump to…</span><span class="kbd-hint">Ctrl K</span>
+    </button>
+
+    <span class="pill pill-success" id="guardrailPill" title="Guardrails status">
+      <span class="pill-dot"></span><span>Guardrails</span>
+    </span>
+
+    <button class="icon-btn" id="themeToggle" title="Toggle theme">🌙</button>
+
+    <div class="dropdown">
+      <button class="btn btn-ghost d-flex align-items-center gap-2 px-2" data-bs-toggle="dropdown" aria-expanded="false">
+        <span class="avatar-ring">G</span>
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end">
+        <li><h6 class="dropdown-header">Local session</h6></li>
+        <li><span class="dropdown-item-text small text-muted" id="profileSessionId">No session yet</span></li>
+        <li><hr class="dropdown-divider"></li>
+        <li><button class="dropdown-item" id="profileNewSession">Start new session</button></li>
+        <li><button class="dropdown-item" data-view-link="settings">Settings</button></li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ================================ MAIN ================================ -->
+  <main class="main">
+
+    <!-- ---------------------------- COPILOT VIEW ---------------------------- -->
+    <section class="view active" id="view-copilot">
+      <div class="chat-shell">
+        <div class="chat-panel">
+          <div class="chat-toolbar">
+            <span class="pill pill-neutral" id="modePill"><span class="pill-dot"></span>Demo mode</span>
+            <span class="session-tag" id="chatSessionTag">no session</span>
+            <div class="topbar-spacer"></div>
+            <label class="composer-toggle">
+              <input type="checkbox" id="agentMode" class="form-check-input" style="margin:0">
+              Agent mode
+            </label>
+            <label class="composer-toggle" id="webSearchToggleWrap" title="Lets the agent search the live web when it decides that helps answer your question. Requires Agent mode.">
+              <input type="checkbox" id="webSearch" class="form-check-input" style="margin:0">
+              🔎 Web Search
+            </label>
+            <button class="btn btn-ghost btn-sm" id="clearChat" title="Clear conversation">Clear</button>
+          </div>
+
+          <div class="chat-scroll" id="chatScroll">
+            <div class="chat-welcome" id="chatWelcome">
+              <div class="brand-mark">EC</div>
+              <h2>How can I help today?</h2>
+              <p>Ask a direct question, or turn on Agent mode to route your request through the agent/skill/tool layer with guardrails and human approval on risky actions.</p>
+              <div class="prompt-suggestions">
+                <button class="prompt-chip" data-prompt="Summarize what this Enterprise Copilot can do today.">
+                  <strong>What can you do?</strong>Get an overview of current capabilities
+                </button>
+                <button class="prompt-chip" data-prompt="please debug this &#96;&#96;&#96;print(1)&#96;&#96;&#96;" data-agent="1">
+                  <strong>Debug some code</strong>Routes to the coding agent + HITL
+                </button>
+                <button class="prompt-chip" data-prompt="What does the knowledge base say about pricing?" data-agent="1">
+                  <strong>Ask the knowledge base</strong>Routes to the research agent
+                </button>
+                <button class="prompt-chip" data-prompt="Reply with exactly the word: PONG">
+                  <strong>Quick smoke test</strong>Confirms the provider is responding
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-composer">
+            <div class="composer-box">
+              <div class="composer-attachments d-none" id="composerAttachments"></div>
+              <textarea id="message" rows="2" placeholder="Message Copilot… (Enter to send, Shift+Enter for a new line)"></textarea>
+              <input type="file" id="imageInput" accept="image/*" multiple hidden>
+              <div class="composer-actions">
+                <button type="button" class="btn-icon btn-ghost btn btn-sm" id="attachImage" title="Attach an image">🖼️</button>
+                <span class="chip" id="guardrailChip" title="Guardrail status for the last message">Guardrails ready</span>
+                <div class="topbar-spacer"></div>
+                <button class="btn btn-outline-danger d-none" id="stopStream" title="Cancel the in-flight response">⏹ Stop</button>
+                <button class="btn btn-primary" id="send">
+                  <span id="sendLabel">Send</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="side-stack">
+          <div class="panel">
+            <div class="panel-header"><h2>Guardrails</h2></div>
+            <div class="panel-body" id="guardrailPanel">
+              <div class="skeleton" style="height:56px;"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Last run</h2>
+              <span class="muted">Agent · skills · sources</span>
+            </div>
+            <div class="panel-body" id="lastRunPanel">
+              <p class="text-faint small mb-0" style="color:var(--text-faint)">Send a message to see execution details here.</p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Pending approvals</h2>
+              <span class="muted" id="pendingCountLabel">0</span>
+            </div>
+            <div class="panel-body p-0" id="pendingHitlPanel">
+              <div class="state-block" style="padding:28px 16px;">
+                <p style="margin:0;">Nothing waiting on you right now.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------- KNOWLEDGE VIEW --------------------------- -->
+    <section class="view" id="view-knowledge">
+      <div class="page-header d-flex align-items-start justify-content-between flex-wrap gap-3">
+        <div>
+          <h1>Knowledge base</h1>
+          <p>Documents retrieved by the research agent to ground Copilot's answers.</p>
+        </div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-outline-secondary" id="refreshDocs">↻ Refresh</button>
+          <button class="btn btn-primary" id="openAddDoc">+ Add document</button>
+        </div>
+      </div>
+
+      <p class="small mb-3" style="color:var(--text-faint)" id="knowledgeEmbeddingStatus">Embedding: loading…</p>
+
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-md-3">
+          <div class="stat-card">
+            <span class="stat-label">Documents</span>
+            <span class="stat-value" id="statDocCount">–</span>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card">
+            <span class="stat-label">Indexed</span>
+            <span class="stat-value" id="statDocIndexed">–</span>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card">
+            <span class="stat-label">Needs attention</span>
+            <span class="stat-value" id="statDocErrors">–</span>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card">
+            <span class="stat-label">Total size</span>
+            <span class="stat-value" id="statDocSize">–</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div class="toolbar-row flex-grow-1">
+            <div class="search-input-wrap">
+              <span class="search-icon">🔎</span>
+              <input class="form-control" id="docSearch" placeholder="Search documents by name or content…">
+            </div>
+            <select class="form-select" id="docStatusFilter" style="max-width:170px;">
+              <option value="">All statuses</option>
+              <option value="indexed">Indexed</option>
+              <option value="error">Error</option>
+            </select>
+          </div>
+        </div>
+        <div class="panel-body p-0" id="documentsContainer">
+          <div class="p-3"><div class="skeleton" style="height:180px;"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------- SKILLS VIEW --------------------------- -->
+    <section class="view" id="view-skills">
+      <div class="page-header d-flex align-items-start justify-content-between flex-wrap gap-3">
+        <div>
+          <h1>Skills</h1>
+          <p>SKILL.md + scripts packages that ask a few questions, then generate a file.</p>
+        </div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-outline-secondary" id="refreshSkills">↻ Refresh</button>
+          <button class="btn btn-primary" id="openUploadSkill">+ Upload skill</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body p-3" id="skillsContainer">
+          <div class="skeleton" style="height:140px;"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------- SESSIONS VIEW --------------------------- -->
+    <section class="view" id="view-sessions">
+      <div class="page-header">
+        <h1>Session</h1>
+        <p>Enterprise Copilot keeps conversation context server-side for the active session. This view reflects what's happening in your current browser session.</p>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-md-4">
+          <div class="stat-card">
+            <span class="stat-label">Session ID</span>
+            <span class="stat-value text-mono truncate" style="font-size:14px;" id="sessSessionId">none yet</span>
+            <span class="stat-meta">Created on first message or manual start</span>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="stat-card">
+            <span class="stat-label">Messages this session</span>
+            <span class="stat-value" id="sessMsgCount">0</span>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="stat-card">
+            <span class="stat-label">Started</span>
+            <span class="stat-value" id="sessStarted" style="font-size:14px;">–</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header">
+          <h2>Transcript</h2>
+          <span class="muted">Client-observed, this browser only</span>
+        </div>
+        <div class="panel-body p-0" id="sessionTranscript">
+          <div class="state-block">
+            <div class="state-icon">🕒</div>
+            <h3>No messages yet</h3>
+            <p>Start a conversation in Copilot to see the transcript here.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="d-flex gap-2 mb-3">
+        <button class="btn btn-outline-primary" id="startNewSessionBtn">Start new session</button>
+        <button class="btn btn-outline-secondary" data-view-link="copilot">Go to Copilot</button>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Past sessions</h2>
+          <span class="muted">Persisted to disk (data/sessions/) — resume any of them</span>
+        </div>
+        <div class="panel-body p-3" id="pastSessionsContainer">
+          <div class="skeleton" style="height:100px;"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------- AGENTS & TOOLS VIEW ------------------------- -->
+    <section class="view" id="view-agents">
+      <div class="page-header">
+        <h1>Agents &amp; tools</h1>
+        <p>Registered agents, reusable skills, and the human-in-the-loop queue for risky actions like code execution.</p>
+      </div>
+
+      <div class="row g-3">
+        <div class="col-lg-7">
+          <div class="panel mb-3">
+            <div class="panel-header"><h2>Registered agents</h2></div>
+            <div class="panel-body p-0" id="agentsContainer">
+              <div class="p-3"><div class="skeleton" style="height:120px;"></div></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header"><h2>Registered skills</h2></div>
+            <div class="panel-body p-0" id="registeredSkillsContainer">
+              <div class="p-3"><div class="skeleton" style="height:90px;"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-5">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Approval queue (HITL)</h2>
+              <span class="muted">Code execution, dev-only sandbox</span>
+            </div>
+            <div class="panel-body">
+              <p class="small mb-2" style="color:var(--text-faint)">Every code-execution request is queued here and only runs after explicit approval.</p>
+              <form id="codeForm" class="mb-3">
+                <textarea id="codeInput" class="form-control mb-2" rows="3" placeholder="print('hello from the sandbox')" required></textarea>
+                <button class="btn btn-primary btn-sm w-100" type="submit">Submit for approval</button>
+              </form>
+              <hr class="divider mb-3">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong class="small">Queue</strong>
+                <button class="btn btn-ghost btn-sm" id="refreshHitl">↻ Refresh</button>
+              </div>
+              <div id="hitlRequests"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----------------------------- SETTINGS VIEW ---------------------------- -->
+    <section class="view" id="view-settings">
+      <div class="page-header">
+        <h1>Settings</h1>
+        <p>Local, per-browser preferences and read-only system status.</p>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>Appearance</h2></div>
+        <div class="panel-body">
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Theme</div>
+              <div class="settings-desc">Choose light, dark, or follow your system setting.</div>
+            </div>
+            <div class="theme-switch" id="themeSwitch">
+              <button data-theme-choice="light">☀️ Light</button>
+              <button data-theme-choice="dark">🌙 Dark</button>
+              <button data-theme-choice="system">🖥️ System</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>Guardrails</h2></div>
+        <div class="panel-body" id="settingsGuardrails">
+          <div class="skeleton" style="height:40px;"></div>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header">
+          <h2>Models</h2>
+          <span class="muted">Provider &amp; model per subsystem — applies immediately, no restart</span>
+        </div>
+        <div class="panel-body d-flex flex-column gap-3" id="settingsModels">
+          <div class="skeleton" style="height:160px;"></div>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>AI provider (last observed)</h2></div>
+        <div class="panel-body" id="settingsProvider">
+          <p class="small mb-0" style="color:var(--text-faint)">Send a message in Copilot to detect the active provider — this reflects the most recent response, not a live poll.</p>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>RAG embedding model</h2></div>
+        <div class="panel-body d-flex flex-column gap-2" id="settingsEmbedding">
+          <p class="small mb-0" style="color:var(--text-faint)">Loading…</p>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>MCP tools</h2></div>
+        <div class="panel-body d-flex flex-column gap-2" id="settingsMcp">
+          <p class="small mb-0" style="color:var(--text-faint)">Loading…</p>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>Observability</h2></div>
+        <div class="panel-body" id="settingsObservability">
+          <p class="small mb-0" style="color:var(--text-faint)">Loading…</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h2>Session</h2></div>
+        <div class="panel-body">
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Current session</div>
+              <div class="settings-desc text-mono" id="settingsSessionId">none yet</div>
+            </div>
+            <button class="btn btn-outline-primary btn-sm" id="settingsNewSession">Start new session</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----------------------------- LOGIN VIEW (placeholder) ---------------------------- -->
+    <section class="view" id="view-login">
+      <div class="page-header">
+        <h1>Login</h1>
+        <p>A placeholder screen — this app has no real authentication in v1.</p>
+      </div>
+
+      <div class="row justify-content-center">
+        <div class="col-12 col-md-6 col-lg-4">
+          <div class="panel">
+            <div class="panel-header"><h2>Sign in</h2></div>
+            <div class="panel-body d-flex flex-column gap-3">
+              <p class="small mb-0" style="color:var(--text-faint)">
+                This form doesn't do anything yet. Enterprise Copilot v1 runs as a single local
+                workspace with no accounts, sessions are per-browser (see Sessions), and nothing
+                here is gated behind sign-in. Real authentication is future work, not wired up.
+              </p>
+              <div>
+                <label class="form-label">Email</label>
+                <input type="email" class="form-control" placeholder="you@company.com" disabled>
+              </div>
+              <div>
+                <label class="form-label">Password</label>
+                <input type="password" class="form-control" placeholder="••••••••" disabled>
+              </div>
+              <button class="btn btn-primary" disabled title="Not implemented — placeholder only">Sign in</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----------------------------- ABOUT VIEW ---------------------------- -->
+    <section class="view" id="view-about">
+      <div class="page-header">
+        <h1>About Enterprise Copilot</h1>
+        <p>Phase 0 · v1 — what this workspace is and how it's built.</p>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>Mission</h2></div>
+        <div class="panel-body">
+          <p class="mb-0">
+            Build and maintain a minimal, reliable Enterprise Copilot — a chat assistant backed by
+            agents, skills, retrieval over your own documents, and guardrails, with
+            human-in-the-loop approval on risky actions like code execution.
+          </p>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>Architecture</h2></div>
+        <div class="panel-body">
+          <ul class="mb-0">
+            <li>FastAPI + Pydantic backend, this page as a plain HTML/CSS/JS/Bootstrap SPA frontend.</li>
+            <li>Agents run through a single <code>AgentOrchestrator</code> contract (currently backed by
+              AutoGen) — application code never depends on the agent framework directly.</li>
+            <li>Guardrails check every chat request's input and output, visibly, before and after
+              the model runs — a Phase 0 feature, not a placeholder.</li>
+            <li>Knowledge/RAG documents and generation skills support the full add / list / view /
+              update / delete lifecycle, all through POST APIs.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h2>Scope</h2></div>
+        <div class="panel-body">
+          <p class="mb-0 small" style="color:var(--text-faint)">
+            v1 keeps infrastructure in-memory or file-backed locally rather than a real database or
+            production sandbox — local code execution is development-only. This About page and the
+            Login page are static; there is no account system behind either yet.
+          </p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- =============================== TOASTS =============================== -->
+<div class="toast-stack" id="toastStack"></div>
+
+<!-- ========================== COMMAND PALETTE ========================== -->
+<div class="cmdk-backdrop" id="cmdkBackdrop">
+  <div class="cmdk-panel">
+    <div class="cmdk-input-wrap">
+      <span>🔎</span>
+      <input class="cmdk-input" id="cmdkInput" placeholder="Type a command or search…" autocomplete="off">
+      <span class="kbd-hint">Esc</span>
+    </div>
+    <div class="cmdk-list" id="cmdkList"></div>
+  </div>
+</div>
+
+<!-- ============================ DOC MODAL (Add/Edit) ============================ -->
+<div class="modal fade" id="docModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="docModalTitle">Add document</h5>
+        <button type="button" class="btn-close" id="docCloseBtn" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <ul class="nav nav-tabs mb-3" id="docModalTabs">
+          <li class="nav-item"><button class="nav-link active" type="button" data-tab="paste">Paste content</button></li>
+          <li class="nav-item"><button class="nav-link" type="button" data-tab="upload">Upload file</button></li>
+        </ul>
+
+        <form id="docForm">
+          <input id="docId" type="hidden">
+          <div id="tab-paste">
+            <div class="mb-3">
+              <label class="form-label">Document name</label>
+              <input id="docName" class="form-control" placeholder="pricing.md" required>
+            </div>
+            <div class="mb-1">
+              <label class="form-label">Content</label>
+              <textarea id="docContent" class="form-control" rows="10" placeholder="Paste document content…" required></textarea>
+            </div>
+          </div>
+          <div id="tab-upload" class="d-none">
+            <div class="doc-drop" id="docDrop">
+              <strong>Drop a text or PDF file here, or click to browse</strong>
+              Plain text / markdown files are read directly in your browser; PDFs are sent as-is and their text is
+              extracted on the server. Nothing leaves the page until you save.
+              <input type="file" id="docFileInput" class="d-none" accept=".txt,.md,.csv,.json,.log,.pdf,text/plain,text/markdown,application/pdf">
+            </div>
+            <div id="docFilePreview" class="mt-3 d-none">
+              <div class="d-flex align-items-center gap-2 mb-2">
+                <div class="file-icon">DOC</div>
+                <div class="flex-grow-1">
+                  <div class="fw-semibold small" id="docFileName">—</div>
+                  <div class="small" style="color:var(--text-faint)" id="docFileSize">—</div>
+                </div>
+                <button type="button" class="btn btn-ghost btn-sm" id="docFileClear">Remove</button>
+              </div>
+            </div>
+          </div>
+        </form>
+
+        <div id="docSaveProgress" class="save-progress d-none">
+          <ul id="docSaveProgressSteps" class="save-progress-steps"></ul>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" id="docCancelBtn" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-primary" id="saveDoc" form="docForm" type="submit">Add document</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ VIEW DOC MODAL (read-only) ============================ -->
+<div class="modal fade" id="docViewModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div>
+          <h5 class="modal-title mb-1" id="docViewName">document.md</h5>
+          <div class="d-flex gap-2 align-items-center" id="docViewMeta"></div>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <pre class="code-block" id="docViewContent" style="max-height:420px;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-danger me-auto" id="docViewDelete">Delete</button>
+        <button class="btn btn-outline-secondary" id="docViewReindex">↻ Re-index</button>
+        <button class="btn btn-primary" id="docViewEdit">Edit</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ DELETE CONFIRM MODAL ============================ -->
+<div class="modal fade" id="deleteConfirmModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Delete document?</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="mb-1">This removes <strong id="deleteDocName">this document</strong> from the knowledge base immediately.</p>
+        <p class="small mb-0" style="color:var(--text-faint)">The research agent will no longer be able to retrieve it. This can't be undone.</p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-danger" id="confirmDeleteBtn">Delete document</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ UPLOAD SKILL MODAL ============================ -->
+<div class="modal fade" id="skillUploadModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Upload skill</h5>
+        <button type="button" class="btn-close" id="skillUploadCloseBtn" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="doc-drop" id="skillDrop">
+          <strong>Drop a skill .zip here, or click to browse</strong>
+          Must contain a SKILL.md at its root (or one level inside a single top-level folder),
+          plus its scripts/ and reference/ files.
+          <input type="file" id="skillFileInput" class="d-none" accept=".zip,application/zip">
+        </div>
+        <div id="skillFilePreview" class="mt-3 d-none">
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <div class="file-icon">ZIP</div>
+            <div class="flex-grow-1">
+              <div class="fw-semibold small" id="skillFileName">—</div>
+              <div class="small" style="color:var(--text-faint)" id="skillFileSize">—</div>
+            </div>
+            <button type="button" class="btn btn-ghost btn-sm" id="skillFileClear">Remove</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" id="skillUploadCancelBtn" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-primary" id="skillUploadSubmit">Upload</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ RUN SKILL MODAL ============================ -->
+<div class="modal fade" id="skillRunModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="skillRunModalTitle">Run skill</h5>
+        <button type="button" class="btn-close" id="skillRunCloseBtn" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="skillRunForm">
+          <div id="skillRunQuestions" class="d-flex flex-column gap-3"></div>
+        </form>
+
+        <div id="skillRunProgress" class="save-progress d-none">
+          <ul id="skillRunProgressSteps" class="save-progress-steps"></ul>
+        </div>
+
+        <div id="skillRunResult" class="d-none mt-3"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" id="skillRunCancelBtn" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-primary" id="skillRunSubmit" form="skillRunForm" type="submit">Generate</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

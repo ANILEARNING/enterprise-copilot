@@ -1,0 +1,78 @@
+"""In-memory store for downloadable files an approved code execution
+produced (a generated HTML dashboard, a PDF report, ...) — see
+app/sandbox.py:ExecutionResult.artifact_files and docs/dashboards.md.
+
+Distinct from:
+- app/skills.py's SkillPackageStore/SkillRunService — pre-authored,
+  fixed-question skill packages (docx/pptx generators) with their own
+  question-flow and generation-script mechanism.
+- app/sandbox.py's ExecutionResult.artifacts (plain filenames) — that list
+  exists regardless of file type and is never itself downloadable; this
+  store only ever holds the subset that qualified (see
+  DOWNLOADABLE_ARTIFACT_EXTENSIONS) and whose bytes were actually captured.
+
+In-memory only, per this project's v1 architecture
+(.claude/rules/architecture.md) — a process restart clears every stored
+artifact, same posture as SessionStore/RAGStore/HitlService's own queue.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from uuid import uuid4
+
+_MIME_TYPES = {
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".pdf": "application/pdf",
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class StoredArtifact:
+    artifact_id: str
+    filename: str
+    content: bytes
+    mime_type: str
+    session_id: str | None
+    hitl_request_id: str | None
+    created_at: str = field(default_factory=_now_iso)
+
+    def public(self) -> dict:
+        # Never includes `content` — this is what appears in HITL records
+        # and chat responses; the actual bytes are only ever served through
+        # the dedicated view/download routes (app/routes.py), never inlined
+        # into a JSON response.
+        return {
+            "artifact_id": self.artifact_id, "filename": self.filename,
+            "mime_type": self.mime_type, "size_bytes": len(self.content),
+            "created_at": self.created_at,
+            "view_url": f"/artifacts/{self.artifact_id}",
+        }
+
+
+class ArtifactStore:
+    def __init__(self):
+        self._artifacts: dict[str, StoredArtifact] = {}
+
+    def add(
+        self, filename: str, content: bytes,
+        session_id: str | None = None, hitl_request_id: str | None = None,
+    ) -> StoredArtifact:
+        suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        mime_type = _MIME_TYPES.get(suffix, "application/octet-stream")
+        artifact = StoredArtifact(
+            artifact_id=str(uuid4()), filename=filename, content=content,
+            mime_type=mime_type, session_id=session_id, hitl_request_id=hitl_request_id,
+        )
+        self._artifacts[artifact.artifact_id] = artifact
+        return artifact
+
+    def get(self, artifact_id: str) -> StoredArtifact:
+        if artifact_id not in self._artifacts:
+            raise KeyError("Artifact not found")
+        return self._artifacts[artifact_id]

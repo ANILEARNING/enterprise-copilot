@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+autogen-agentchat
+autogen-ext[openai,mcp]
+# autogen-ext's mcp extra floors this at >=1.11.0; capped below 2.0 since
+# that release renamed/removed mcp.shared.context.RequestContext, which
+# autogen-ext 0.7.5's own MCP integration still imports (breaks at import
+# time, not just at call time) — verified against the pinned version above.
+mcp>=1.11.0,<2
+langfuse
+httpx
+pypdf
+python-pptx
+python-docx
+pyyaml
+# Pure-Python PDF generation (no external binary/system dependency, same
+# posture as python-docx/python-pptx above) — skills/brd-prd-generator's
+# PDF output.
+reportlab
