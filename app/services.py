@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -15,6 +16,8 @@ from .agents import (
 )
 from .artifacts import ArtifactStore
 from .config import settings
+from .document_store import DocumentStore
+from .extraction import ExtractedBlock
 from .hitl_agents import run_approved_code
 from .memory import BUFFER_SIZE, CompactMemoryState, compact_history
 from .observability import tracer
@@ -23,15 +26,38 @@ from .providers import (
     describe_embedding_config,
 )
 from .retrieval import (
-    BM25Index, chunk_text, cosine_similarity, embed,
-    lexical_rerank_score, reciprocal_rank_fusion, tokenize,
+    BM25Index, ParentChildChunk, chunk_blocks, chunk_text, compress_context, cosine_similarity,
+    dedupe_results, embed, lexical_rerank_score, reciprocal_rank_fusion, tokenize,
 )
 from .sandbox import CodeSandbox, build_sandbox
 from .skills import SkillPackageStore, SkillRunService
 from .storage import SessionStore
 from .streaming import stream_chat
+from .vector_store import VectorPoint, VectorStore, build_vector_store
 
 logger = logging.getLogger(__name__)
+
+
+def _run_sync(coro):
+    """Runs an async coroutine to completion from synchronous code — used
+    only by RAGStore.__init__'s bootstrap-document seeding (see there),
+    which has to be sync (no event loop exists yet the first time
+    CopilotService() constructs it at plain app-startup/import time).
+
+    asyncio.run() alone would suffice for THAT case, but RAGStore() is also
+    constructed directly by ~20 tests, some of them themselves `async def`
+    (pytest-asyncio) — i.e. already inside a running event loop, where
+    asyncio.run() raises "cannot be called from a running event loop." This
+    falls back to running the coroutine on a throwaway thread with its own
+    fresh loop in that case, so RAGStore() behaves identically regardless of
+    which context constructs it."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # no loop running — the common, cheap path
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coro).result()
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -134,7 +160,18 @@ class HitlService:
         return self.requests[request_id]
 
 class GuardrailService:
-    """Phase 0: lightweight input/output safety and policy checks."""
+    """Phase 0 guardrails: prompt-injection screening, PII detection with
+    redaction, a toxic/unsafe-content policy, and sensitive-data (secrets)
+    filtering — run before the model sees a request and again before the
+    reply reaches the user. Every check returns structured findings (not
+    just allow/block) so the UI can show exactly what guardrail activity
+    happened on a given turn; see docs/guardrails.md and
+    static/app.js:guardrailActivityHtml for how this surfaces.
+
+    Detection here is pattern/regex-based by design, matching the rest of
+    v1's "always-available, no external dependency" posture (same reasoning
+    as the hash embedder in app/retrieval.py) — swappable later for a real
+    PII/toxicity model behind this same method contract."""
 
     BLOCKED_PATTERNS = (
         "ignore previous instructions",
@@ -143,25 +180,126 @@ class GuardrailService:
         "print environment variables",
     )
 
-    def check_input(self, text: str) -> dict:
-        lowered = text.lower()
-        matched = [p for p in self.BLOCKED_PATTERNS if p in lowered]
-        return {
-            "allowed": not matched,
-            "phase": 0,
-            "matched_rules": matched,
-            "message": "Input allowed" if not matched else "Input blocked by Phase 0 guardrails",
-        }
+    # --- PII: detected AND redacted, not just flagged ---------------------
+    # Each pattern is (category, compiled regex, mask). Order matters: card
+    # before phone (both are digit runs) so a 16-digit card number, once
+    # redacted, can't also get partially eaten by the phone pattern.
+    _PII_PATTERNS: tuple[tuple[str, re.Pattern, str], ...] = (
+        ("email", re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"), "[REDACTED_EMAIL]"),
+        ("credit_card", re.compile(r"\b\d(?:[ -]?\d){12,15}\b"), "[REDACTED_CARD]"),
+        ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[REDACTED_SSN]"),
+        ("phone", re.compile(r"\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]\d{3}[ -]\d{4}\b"), "[REDACTED_PHONE]"),
+        ("ip_address", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
+    )
 
-    def check_output(self, text: str) -> dict:
+    # --- Sensitive data / secrets: config-shaped key=value & token literals
+    _SECRET_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+        ("api_key", re.compile(r"(?i)\b(api[_-]?key|apikey)\s*[:=]\s*\S+")),
+        ("password", re.compile(r"(?i)\b(password|passwd|pwd)\s*[:=]\s*\S+")),
+        ("bearer_token", re.compile(r"(?i)\bbearer\s+[a-z0-9._-]{10,}")),
+        ("private_key_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+        # Provider-shaped secret literals — catches a pasted/echoed real key
+        # even without a "key=" label in front of it.
+        ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+        ("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    )
+
+    # --- Toxic / unsafe content: keyword-family policy, not an ML classifier.
+    # Grouped by category so findings say *what kind* of content tripped the
+    # policy, never the matched phrase itself (matched_terms stays out of
+    # every returned dict — see docs/guardrails.md's "never expose ... policy").
+    _UNSAFE_TERM_GROUPS: dict[str, tuple[str, ...]] = {
+        "violence": ("kill you", "murder", "how to build a bomb", "mass shooting"),
+        "self_harm": ("kill myself", "end my life", "suicide method"),
+        "hate_harassment": ("racial slur", "ethnic slur"),
+        "illegal_activity": ("how to make meth", "buy stolen credit card", "hire a hacker to"),
+    }
+
+    def _redact_pii(self, text: str) -> tuple[str, list[dict]]:
+        findings: list[dict] = []
+        redacted = text
+        for category, pattern, mask in self._PII_PATTERNS:
+            count = 0
+            def _sub(m: re.Match, _mask=mask) -> str:
+                nonlocal count
+                count += 1
+                return _mask
+            redacted = pattern.sub(_sub, redacted)
+            if count:
+                findings.append({"category": category, "count": count})
+        return redacted, findings
+
+    def _detect_secrets(self, text: str) -> list[dict]:
+        findings = []
+        for category, pattern in self._SECRET_PATTERNS:
+            count = len(pattern.findall(text))
+            if count:
+                findings.append({"category": category, "count": count})
+        return findings
+
+    def _detect_unsafe_content(self, text: str) -> list[dict]:
         lowered = text.lower()
-        secret_like = ("api_key=" in lowered, "password=" in lowered)
-        blocked = any(secret_like)
+        findings = []
+        for category, terms in self._UNSAFE_TERM_GROUPS.items():
+            count = sum(1 for t in terms if t in lowered)
+            if count:
+                findings.append({"category": category, "count": count})
+        return findings
+
+    def _prompt_injection_rules(self, text: str) -> list[str]:
+        lowered = text.lower()
+        return [p for p in self.BLOCKED_PATTERNS if p in lowered]
+
+    def check_input(self, text: str) -> dict:
+        """Runs on the raw user message before it reaches the model.
+        Blocks on prompt-injection indicators or an unsafe-content policy
+        hit; PII is redacted (not blocked) so the model never sees the raw
+        value but the turn still proceeds — see docs/guardrails.md."""
+        injection_rules = self._prompt_injection_rules(text)
+        unsafe = self._detect_unsafe_content(text)
+        redacted_text, pii = self._redact_pii(text)
+        secrets = self._detect_secrets(text)
+
+        blocked = bool(injection_rules) or bool(unsafe)
+        matched_rules = list(injection_rules) + [f"unsafe-content:{f['category']}" for f in unsafe]
         return {
             "allowed": not blocked,
             "phase": 0,
-            "matched_rules": ["secret-like-output"] if blocked else [],
+            "matched_rules": matched_rules,
+            "message": "Input allowed" if not blocked else "Input blocked by Phase 0 guardrails",
+            "pii": pii,
+            "redacted_text": redacted_text if pii else None,
+            "sensitive_data": secrets,
+            "unsafe_content": unsafe,
+        }
+
+    def check_output(self, text: str) -> dict:
+        """Runs on the model's reply before it's shown to the user. Secrets
+        and PII are both redacted from the returned text (defense against
+        the model echoing something sensitive it saw in context); an
+        unsafe-content hit blocks the reply outright, same as check_input."""
+        unsafe = self._detect_unsafe_content(text)
+        secrets = self._detect_secrets(text)
+        redacted_text, pii = self._redact_pii(text)
+        # Secrets get masked too, using the same key=value span the pattern matched.
+        for category, pattern in self._SECRET_PATTERNS:
+            redacted_text = pattern.sub(f"[REDACTED_{category.upper()}]", redacted_text)
+
+        blocked = bool(unsafe)
+        matched_rules = [f"unsafe-content:{f['category']}" for f in unsafe]
+        if secrets:
+            matched_rules.append("sensitive-data-redacted")
+        if pii:
+            matched_rules.append("pii-redacted")
+        return {
+            "allowed": not blocked,
+            "phase": 0,
+            "matched_rules": matched_rules,
             "message": "Output allowed" if not blocked else "Output blocked by Phase 0 guardrails",
+            "pii": pii,
+            "redacted_text": redacted_text if (pii or secrets) else None,
+            "sensitive_data": secrets,
+            "unsafe_content": unsafe,
         }
 
     def check_context(self, chunks: list[dict]) -> dict:
@@ -180,144 +318,299 @@ class GuardrailService:
                        else f"{len(flagged)} retrieved chunk(s) blocked by Phase 0 guardrails",
         }
 
-class RAGStore:
-    """Ingestion: extract -> clean -> chunk -> metadata -> embed -> index.
-    Retrieval: understand -> hybrid retrieve (vector + BM25) -> rerank -> context.
-    See docs/rag.md for the full design and what v1 vs. future covers.
 
-    Embedding is behind `EmbeddingProvider` (app/providers.py) — the offline hash
-    embedder by default, or a real model (Gemini/Ollama) in configured mode, with
-    graceful fallback to the hash embedder on any failure. add/update/search are
-    async because a real embedding call is a network call.
+def _serialize_blocks(blocks: list[ExtractedBlock] | None) -> list[dict] | None:
+    """ExtractedBlock -> plain JSON-serializable dict, for DocumentStore
+    persistence (see its `blocks` param). None passes through unchanged —
+    "no structural extraction available for this document," not an empty list."""
+    if blocks is None:
+        return None
+    return [{"kind": b.kind, "text": b.text, "level": b.level} for b in blocks]
+
+
+def _deserialize_blocks(raw: list[dict]) -> list[ExtractedBlock]:
+    return [ExtractedBlock(kind=b["kind"], text=b["text"], level=b.get("level")) for b in raw]
+
+
+class RAGStore:
+    """Ingestion: extract(format-aware) -> clean -> chunk(structure-aware,
+    parent-child) -> metadata -> embed -> index (Qdrant + BM25).
+    Retrieval: understand -> hybrid retrieve (vector + BM25) -> RRF fusion ->
+    rerank -> dedupe -> context compression -> citation. See docs/rag.md for
+    the full design.
+
+    Vectors live in a `VectorStore` (app/vector_store.py — Qdrant Cloud when
+    configured, an in-memory cosine scan otherwise); document metadata (full
+    text, filename, timestamps, per-chunk content hashes) lives in a
+    `DocumentStore` (app/document_store.py, file-backed, survives a restart
+    even though vectors don't unless Qdrant is configured); BM25 stays an
+    in-memory index (`self.bm25`) since neither backend does lexical search.
+    `self.chunk_meta` is a slim in-memory chunk_id -> citation-metadata cache
+    (filename, chunk_index, parent_text, heading_path, tokens for BM25/
+    rerank) — never the embedding vector itself, which is VectorStore's job
+    alone — rebuilt from DocumentStore + a re-chunk pass at construction so
+    a restart's first search doesn't need a Qdrant round-trip per citation.
+
+    Embedding is behind `EmbeddingProvider` (app/providers.py) — the offline
+    hash embedder by default, or a real model (Gemini/Ollama) in configured
+    mode, with graceful fallback to the hash embedder on any failure.
+    add/update/search are async because a real embedding call (and a real
+    Qdrant call) is a network call.
+
+    Public method surface (add/update/delete/list/get/public/search) is
+    unchanged from v1 — AgentOrchestrator, routes, and the UI need zero
+    changes to keep working, same boundary discipline as the AutoGen/MAF
+    orchestrator swap.
     """
 
     VECTOR_TOP_K = 8
     BM25_TOP_K = 8
     RERANK_POOL = 8
 
-    def __init__(self, embedding_provider: EmbeddingProvider | None = None):
-        self.documents: dict[str, dict] = {}
-        self.chunks: dict[str, dict] = {}
+    def __init__(
+        self, embedding_provider: EmbeddingProvider | None = None,
+        vector_store: VectorStore | None = None, data_dir=None,
+    ):
+        # Same settings.data_dir resolution CopilotService.__init__ does for
+        # its own stores (SessionStore, SkillPackageStore, ...) — a bare
+        # RAGStore() must still honor DATA_DIR (see conftest.py) rather than
+        # silently falling through to DocumentStore's real repo-root default.
+        #
+        # A caller-omitted data_dir additionally gets its OWN fresh uuid-
+        # named subdirectory each construction, rather than every bare
+        # RAGStore() sharing one directory: the old in-memory-dict RAGStore
+        # was naturally isolated per instance (a plain Python dict, never
+        # persisted), and ~19 existing tests construct RAGStore() this way
+        # expecting exactly that isolation. DocumentStore's real persistence
+        # is what CopilotService's one long-lived singleton wants (it
+        # explicitly resolves and passes its own fixed data_dir below), not
+        # what a fresh ad-hoc RAGStore() in a test wants — those callers get
+        # a throwaway directory, not a real shared one.
+        if data_dir:
+            resolved_data_dir = Path(data_dir)
+        elif settings.data_dir:
+            resolved_data_dir = Path(settings.data_dir) / "documents" / str(uuid4())
+        else:
+            resolved_data_dir = None
+        self.documents = DocumentStore(data_dir=resolved_data_dir)
+        # chunk_id -> {document_id, filename, chunk_index, tokens, parent_text,
+        # heading_path, is_table, content_hash, embedding_provider, embedding_model}
+        self.chunk_meta: dict[str, dict] = {}
         self.bm25 = BM25Index()
         self.embedding_provider = embedding_provider or HashEmbeddingProvider()
+        self.vector_store = vector_store or build_vector_store()
+        self.tenant_id = settings.rag_tenant_id
         # Last actual embed() outcome (ingestion or query) — see describe_embedding().
         self.last_embedding: dict | None = None
 
-        # Bootstrap doc, seeded synchronously at construction time (no event loop
-        # available yet) — always via the offline hash embedder directly, regardless
-        # of self.embedding_provider, since this trivial internal doc doesn't
-        # warrant a real embedding call.
-        document_id = str(uuid4())
-        now = datetime.now(timezone.utc).isoformat()
-        content = "Enterprise Copilot knowledge base. Documents can be added, updated, deleted and retrieved."
-        self.documents[document_id] = {
-            "document_id": document_id, "filename": "welcome.md", "content": content,
-            "status": "indexed", "created_at": now, "updated_at": now,
-            "size": len(content.encode("utf-8")),
-        }
-        for index, text in enumerate(chunk_text(content)):
-            index_text = f"welcome.md {text}"
-            self._index_chunk(document_id, index, text, embed(index_text), "hash")
+        # Bootstrap doc, seeded synchronously at construction time (no event
+        # loop available yet — CopilotService() is constructed at plain
+        # synchronous app-startup time) — always via the offline hash
+        # embedder directly, regardless of self.embedding_provider, since
+        # this trivial internal doc doesn't warrant a real embedding call.
+        # See _run_sync's docstring for why this can't just be asyncio.run().
+        existing = self.documents.list()
+        if not existing:
+            content = "Enterprise Copilot knowledge base. Documents can be added, updated, deleted and retrieved."
+            doc = self.documents.create("welcome.md", content, tenant_id=self.tenant_id)
+            _run_sync(self._reindex(doc["document_id"], embedding_provider=HashEmbeddingProvider()))
+        else:
+            # A restart with documents already on disk (DocumentStore
+            # persisted them, or Qdrant still has their vectors) — rebuild
+            # chunk_meta/BM25 from what's stored so citations/BM25 work
+            # immediately without waiting on a query to trigger it. Vectors
+            # themselves are NOT re-embedded here (that would defeat the
+            # whole point of Qdrant persisting them) — only the local
+            # metadata cache is rebuilt, from each document's own
+            # chunk_hashes, by re-chunking (cheap, no network) and matching
+            # hashes rather than re-embedding.
+            for doc in existing:
+                self._rebuild_chunk_meta_from_document(doc)
 
-    async def add(self, filename: str, content: str) -> dict:
-        document_id = str(uuid4())
-        now = datetime.now(timezone.utc).isoformat()
-        doc = {
-            "document_id": document_id,
-            "filename": filename,
-            "content": content,
-            "status": "indexed",
-            "created_at": now,
-            "updated_at": now,
-            "size": len(content.encode("utf-8")),
-        }
-        self.documents[document_id] = doc
-        await self._reindex(document_id)
+    async def add(self, filename: str, content: str, blocks: list[ExtractedBlock] | None = None) -> dict:
+        """`blocks`: the document's real structural blocks (see
+        app/extraction.py:extract_document), when the caller has them —
+        app/routes.py passes these through from ingestion so DOCX/HTML/MD
+        headings and tables actually reach chunk_blocks' structure-aware
+        chunking instead of being flattened away. None (every existing
+        `rag.add(filename, text)` caller/test) falls back to flat
+        paragraph-only blocks derived from `content` at reindex time —
+        today's pre-structural-chunking behavior, unchanged."""
+        doc = self.documents.create(filename, content, tenant_id=self.tenant_id, blocks=_serialize_blocks(blocks))
+        await self._reindex(doc["document_id"])
         return self.public(doc)
 
-    async def update(self, document_id: str, filename: str | None, content: str | None) -> dict:
-        if document_id not in self.documents:
-            raise KeyError("Document not found")
-        doc = self.documents[document_id]
-        if filename is not None:
-            doc["filename"] = filename
-        if content is not None:
-            doc["content"] = content
-            doc["size"] = len(content.encode("utf-8"))
-        doc["updated_at"] = datetime.now(timezone.utc).isoformat()
-        doc["status"] = "indexed"
+    async def update(
+        self, document_id: str, filename: str | None, content: str | None,
+        blocks: list[ExtractedBlock] | None = None,
+    ) -> dict:
+        # blocks only applies alongside new content (see DocumentStore.update) —
+        # a content-less update (e.g. a filename-only rename) has nothing new
+        # to derive blocks from anyway.
+        doc = self.documents.update(  # raises KeyError if unknown
+            document_id, filename, content, blocks=_serialize_blocks(blocks) if content is not None else None,
+        )
         await self._reindex(document_id)  # re-chunk/re-embed immediately — v1 has no separate reindex step
         return self.public(doc)
 
-    def delete(self, document_id: str) -> None:
-        if document_id not in self.documents:
-            raise KeyError("Document not found")
-        self._drop_chunks(document_id)
-        del self.documents[document_id]
+    async def delete(self, document_id: str) -> None:
+        self.documents.get(document_id)  # raises KeyError if unknown, before any side effect
+        stale_chunk_ids = self._drop_chunks(document_id)
+        await self.vector_store.delete(stale_chunk_ids)
+        self.documents.delete(document_id)
 
     def list(self) -> list[dict]:
-        return [self.public(d) for d in self.documents.values()]
+        return [self.public(d) for d in self.documents.list()]
 
     def get(self, document_id: str) -> dict:
         # Single-document fetch includes content (needed to view/edit); list() stays
         # content-stripped since it's a summary view over potentially many documents.
-        if document_id not in self.documents:
-            raise KeyError("Document not found")
-        return dict(self.documents[document_id])
+        return dict(self.documents.get(document_id))
 
     def public(self, doc: dict) -> dict:
         result = dict(doc)
         result.pop("content", None)
-        result["chunk_count"] = sum(1 for c in self.chunks.values() if c["document_id"] == doc["document_id"])
+        result.pop("chunk_hashes", None)
+        result.pop("blocks", None)
+        result["chunk_count"] = sum(1 for c in self.chunk_meta.values() if c["document_id"] == doc["document_id"])
         return result
 
     # --- ingestion: extract -> clean -> chunk -> metadata -> embed -> index ---
 
-    def _drop_chunks(self, document_id: str) -> None:
-        stale = [chunk_id for chunk_id, c in self.chunks.items() if c["document_id"] == document_id]
-        for chunk_id in stale:
-            del self.chunks[chunk_id]
-            self.bm25.remove(chunk_id)
+    def _resolve_blocks(self, doc: dict) -> list[ExtractedBlock]:
+        """The blocks to feed chunk_blocks() for this document: its real
+        persisted structural blocks (app/extraction.py, threaded through
+        add/update — see their docstrings) when present, otherwise a flat
+        paragraph-only fallback derived from chunk_text(content) — today's
+        pre-structural-chunking behavior, for any document added via the
+        plain `rag.add(filename, text)` path (no extraction step ran) or
+        ingested before structural blocks existed at all."""
+        if doc.get("blocks"):
+            return _deserialize_blocks(doc["blocks"])
+        if not doc["content"]:
+            return []
+        return [ExtractedBlock("paragraph", p) for p in chunk_text(doc["content"])]
 
-    def _index_chunk(
-        self, document_id: str, index: int, text: str, vector: list[float],
-        provider_name: str, model_name: str | None = None,
+    def _rebuild_chunk_meta_from_document(self, doc: dict) -> None:
+        """Re-chunks a document's stored content/blocks (no network call —
+        pure text processing) and matches each resulting chunk's
+        content_hash against the document's persisted chunk_hashes to
+        recover its chunk_id, so a restart's chunk_meta/BM25 cache lines up
+        with whatever's actually in the vector store without re-embedding
+        anything. A chunk whose hash isn't found (the persisted mapping
+        predates this rebuild, or was hand-edited) gets a fresh chunk_id —
+        its vector is orphaned in the store until the next real reindex,
+        same graceful-degrade posture as everywhere else in this app."""
+        chunks = chunk_blocks(self._resolve_blocks(doc))
+        hash_to_chunk_id = {v: k for k, v in doc.get("chunk_hashes", {}).items()}
+        for index, chunk in enumerate(chunks):
+            chunk_id = hash_to_chunk_id.get(chunk.content_hash) or str(uuid4())
+            self._register_chunk_meta(chunk_id, doc["document_id"], doc["filename"], index, chunk)
+
+    def _register_chunk_meta(
+        self, chunk_id: str, document_id: str, filename: str, index: int, chunk: ParentChildChunk,
+        embedding_provider: str | None = None, embedding_model: str | None = None,
     ) -> None:
-        chunk_id = str(uuid4())
-        doc = self.documents[document_id]
-        # metadata: filename folded into the indexed text (not the stored/cited
-        # snippet) so retrieval can match on it, same as a real chunk's source path
-        index_text = f"{doc['filename']} {text}"
-        self.chunks[chunk_id] = {
-            "chunk_id": chunk_id,
-            "document_id": document_id,
-            "filename": doc["filename"],
-            "chunk_index": index,
-            "text": text,
-            "tokens": tokenize(index_text),
-            "embedding": vector,
-            "embedding_provider": provider_name,
-            "embedding_model": model_name,
+        # metadata: filename folded into the indexed/tokenized text (not the
+        # stored/cited snippet) so retrieval can match on it, same as a real
+        # chunk's source path.
+        index_text = f"{filename} {chunk.text}"
+        self.chunk_meta[chunk_id] = {
+            "chunk_id": chunk_id, "document_id": document_id, "filename": filename,
+            "chunk_index": index, "text": chunk.text, "tokens": tokenize(index_text),
+            "parent_text": chunk.parent_text, "heading_path": chunk.heading_path,
+            "is_table": chunk.is_table, "content_hash": chunk.content_hash,
+            "embedding_provider": embedding_provider, "embedding_model": embedding_model,
         }
-        self.bm25.add(chunk_id, self.chunks[chunk_id]["tokens"])
+        self.bm25.add(chunk_id, self.chunk_meta[chunk_id]["tokens"])
 
-    async def _reindex(self, document_id: str) -> None:
-        self._drop_chunks(document_id)
-        doc = self.documents[document_id]
-        # extract: v1 documents are already plain text, so this stage is a no-op
-        for index, text in enumerate(chunk_text(doc["content"])):
-            index_text = f"{doc['filename']} {text}"
-            result = await self.embedding_provider.embed(index_text)
-            self._index_chunk(document_id, index, text, result.vector, result.provider, result.model)
+    def _drop_chunks(self, document_id: str, chunk_ids: list[str] | None = None) -> list[str]:
+        """Removes chunk_ids (or every chunk of document_id when chunk_ids
+        is None — full-document delete) from chunk_meta and BM25, and
+        returns the chunk_ids that were dropped so the caller can also
+        remove them from the vector store (this method itself is sync and
+        can't await that). Used both by delete() (whole document) and
+        _reindex()'s incremental diff (just the chunks that changed)."""
+        stale = chunk_ids if chunk_ids is not None else [
+            cid for cid, c in self.chunk_meta.items() if c["document_id"] == document_id
+        ]
+        for chunk_id in stale:
+            self.chunk_meta.pop(chunk_id, None)
+            self.bm25.remove(chunk_id)
+        return stale
+
+    async def _reindex(self, document_id: str, embedding_provider: EmbeddingProvider | None = None) -> None:
+        """Incremental reindex: re-chunk the document's current content,
+        diff each resulting chunk's content_hash against what was indexed
+        last time (DocumentStore's persisted chunk_hashes), and only
+        embed+upsert chunks that are new or changed. Unchanged chunks keep
+        their existing chunk_id/Qdrant point/vector completely untouched —
+        this is the literal implementation of "if the user updates the doc
+        just re-embed that part." A fresh document (no prior chunk_hashes)
+        naturally has every chunk as "new," so this is also just `add`'s
+        ingestion path with no special-casing needed."""
+        provider = embedding_provider or self.embedding_provider
+        doc = self.documents.get(document_id)
+        # extract/chunk: real structural blocks when add/update supplied
+        # them (app/extraction.py, via app/routes.py), else a flat
+        # paragraph-only fallback — see _resolve_blocks.
+        new_chunks = chunk_blocks(self._resolve_blocks(doc))
+
+        old_hash_to_chunk_id = {v: k for k, v in doc.get("chunk_hashes", {}).items()}
+        new_hashes = {c.content_hash for c in new_chunks}
+        old_hashes = set(old_hash_to_chunk_id.keys())
+
+        removed_hashes = old_hashes - new_hashes
+        removed_chunk_ids = [old_hash_to_chunk_id[h] for h in removed_hashes]
+        if removed_chunk_ids:
+            self._drop_chunks(document_id, chunk_ids=removed_chunk_ids)
+            await self.vector_store.delete(removed_chunk_ids)
+
+        final_chunk_hashes: dict[str, str] = {}
+        points: list[VectorPoint] = []
+        for index, chunk in enumerate(new_chunks):
+            existing_chunk_id = old_hash_to_chunk_id.get(chunk.content_hash)
+            if existing_chunk_id is not None:
+                # Unchanged chunk: keep its id, its metadata (chunk_index may
+                # shift if earlier chunks were added/removed — cheap to
+                # refresh, doesn't touch the vector), and crucially never
+                # re-embed or re-upsert it.
+                self._register_chunk_meta(
+                    existing_chunk_id, document_id, doc["filename"], index, chunk,
+                    embedding_provider=self.chunk_meta.get(existing_chunk_id, {}).get("embedding_provider"),
+                    embedding_model=self.chunk_meta.get(existing_chunk_id, {}).get("embedding_model"),
+                )
+                final_chunk_hashes[existing_chunk_id] = chunk.content_hash
+                continue
+
+            chunk_id = str(uuid4())
+            index_text = f"{doc['filename']} {chunk.text}"
+            result = await provider.embed(index_text)
+            self._register_chunk_meta(
+                chunk_id, document_id, doc["filename"], index, chunk,
+                embedding_provider=result.provider, embedding_model=result.model,
+            )
+            final_chunk_hashes[chunk_id] = chunk.content_hash
+            points.append(VectorPoint(point_id=chunk_id, vector=result.vector, payload={
+                "tenant_id": self.tenant_id, "document_id": document_id, "chunk_id": chunk_id,
+                "filename": doc["filename"], "chunk_index": index, "parent_text": chunk.parent_text,
+                "heading_path": chunk.heading_path, "is_table": chunk.is_table,
+                "content_hash": chunk.content_hash, "embedding_provider": result.provider,
+                "embedding_model": result.model,
+            }))
             # Remembered so RAGStore.describe_embedding() can report what
             # actually embedded the most recent document, not just what's
             # configured — the two can differ if a provider fell back.
             self.last_embedding = {"provider": result.provider, "model": result.model, "used_fallback": result.used_fallback}
 
+        if points:
+            await self.vector_store.upsert(points)
+        self.documents.set_chunk_hashes(document_id, final_chunk_hashes)
+
     # --- retrieval: understand -> hybrid retrieve -> rerank -> context -------
 
     async def search(self, query: str, limit: int = 3) -> list[dict]:
-        if not self.chunks:
+        if not self.chunk_meta:
             return []
         query_tokens = tokenize(query)  # understand: normalize the question
         if not query_tokens:
@@ -329,18 +622,16 @@ class RAGStore:
             "used_fallback": query_result.used_fallback,
         }
 
-        # A chunk embedded by a different provider than the query (e.g. an earlier
-        # ingestion call fell back to the hash embedder while a later one used the
-        # real model) lives in a different, incomparable vector space. Guard on
-        # matching dimensionality rather than silently dot-producting mismatched
-        # spaces (cosine_similarity would zip-truncate and return a meaningless
-        # number); BM25 still covers that chunk regardless.
-        vector_scores = {
-            cid: cosine_similarity(query_vector, c["embedding"])
-            for cid, c in self.chunks.items() if len(c["embedding"]) == len(query_vector)
-        }
-        vector_ranked = [cid for cid, score in sorted(vector_scores.items(), key=lambda p: p[1], reverse=True)
-                          if score > 0][: self.VECTOR_TOP_K]
+        # Vector leg: delegates to VectorStore (Qdrant's own ANN search, or
+        # the in-memory cosine scan) — the dimension-mismatch guard that
+        # used to live here (a chunk embedded by a different provider than
+        # the query lives in an incomparable vector space) is now
+        # InMemoryVectorStore's job; Qdrant enforces a single vector size
+        # per collection by construction, so the same class of mismatch
+        # simply can't occur there. BM25 still covers any chunk regardless.
+        scored_points = await self.vector_store.search(query_vector, tenant_id=self.tenant_id, limit=self.VECTOR_TOP_K)
+        vector_scores = {p.point_id: p.score for p in scored_points}
+        vector_ranked = [p.point_id for p in scored_points]
 
         bm25_scores = self.bm25.search(query_tokens)
         bm25_ranked = [cid for cid, _ in sorted(bm25_scores.items(), key=lambda p: p[1], reverse=True)][: self.BM25_TOP_K]
@@ -349,30 +640,49 @@ class RAGStore:
         fused = reciprocal_rank_fusion([vector_ranked, bm25_ranked])
         if not fused:
             return []
+        # Only chunk ids this process actually knows the metadata for (a
+        # restart-recovered chunk_meta might lag a Qdrant point briefly, or
+        # vice versa mid-reindex) — never index into chunk_meta with an id
+        # it doesn't have.
+        fused = {cid: score for cid, score in fused.items() if cid in self.chunk_meta}
         candidates = sorted(fused.items(), key=lambda p: p[1], reverse=True)[: self.RERANK_POOL]
 
         # rerank: independent lexical-coverage signal over the fused candidate pool
         reranked = sorted(
-            ((lexical_rerank_score(query_tokens, self.chunks[cid]["tokens"]), hybrid_score, cid)
+            ((lexical_rerank_score(query_tokens, self.chunk_meta[cid]["tokens"]), hybrid_score, cid)
              for cid, hybrid_score in candidates),
             reverse=True,
         )
 
         results = []
-        for rerank_score, hybrid_score, chunk_id in reranked[:limit]:
-            chunk = self.chunks[chunk_id]
+        for rerank_score, hybrid_score, chunk_id in reranked:
+            chunk = self.chunk_meta[chunk_id]
             results.append({
                 "document_id": chunk["document_id"],
                 "filename": chunk["filename"],
                 "chunk_id": chunk_id,
                 "chunk_index": chunk["chunk_index"],
                 "snippet": chunk["text"][:400].strip(),
+                "parent_text": chunk["parent_text"],
+                "heading_path": chunk["heading_path"],
+                "is_table": chunk["is_table"],
+                "content_hash": chunk["content_hash"],
+                "tokens": chunk["tokens"],
                 "vector_score": round(vector_scores.get(chunk_id, 0.0), 4),
                 "bm25_score": round(bm25_scores.get(chunk_id, 0.0), 4),
                 "rerank_score": round(rerank_score, 4),
                 "embedding_provider": chunk["embedding_provider"],
                 "embedding_model": chunk.get("embedding_model"),
             })
+
+        # dedupe: drop near-duplicate chunks (parent-child overlap can
+        # surface two children of the same section both scoring well)
+        results = dedupe_results(results)
+        # ordering + context compression: rerank-sorted, budget-capped —
+        # this is also where the final top-`limit` cut happens, AFTER dedup
+        # (deduping post-limit would silently return fewer than `limit`
+        # results even when enough genuinely distinct chunks existed).
+        results = compress_context(results[:limit], settings.rag_context_token_budget)
         return results
 
     def describe_embedding(self) -> dict:
@@ -380,6 +690,12 @@ class RAGStore:
         settings, static) plus what actually ran the most recent ingest/query
         (dynamic — can differ if a provider fell back mid-session)."""
         return {"configured": describe_embedding_config(), "last_used": self.last_embedding}
+
+    async def describe_vector_store(self) -> dict:
+        """Vector-store backend status for the UI (Qdrant Cloud vs.
+        in-memory fallback, reachability, point count) — see
+        VectorStore.health()."""
+        return await self.vector_store.health()
 
 class CopilotService:
     def __init__(self, data_dir: Path | str | None = None):
@@ -395,7 +711,10 @@ class CopilotService:
         self.provider = build_provider()
         self.embedding_provider = build_embedding_provider()
         self.guardrails = GuardrailService()
-        self.rag = RAGStore(embedding_provider=self.embedding_provider)
+        self.rag = RAGStore(
+            embedding_provider=self.embedding_provider,
+            data_dir=resolved_dir / "documents" if resolved_dir else None,
+        )
         self.sessions = SessionStore(data_dir=resolved_dir / "sessions" if resolved_dir else None)
         self.sandbox = build_sandbox()
         self.artifacts = ArtifactStore()
@@ -480,6 +799,15 @@ class CopilotService:
         sid = session["session_id"]
         history = list(session["messages"])  # snapshot before appending this turn
         memory_state = CompactMemoryState.from_dict(session.get("memory_state"))
+
+        # PII/secrets are redacted BEFORE anything (session history, the trace,
+        # the model prompt) ever stores or forwards the raw value — check_input
+        # runs first and message is reassigned to its redacted_text when it
+        # found anything, so every downstream use in this method already sees
+        # the safe version. See GuardrailService.check_input.
+        input_check = self.guardrails.check_input(message)
+        if input_check["redacted_text"] is not None:
+            message = input_check["redacted_text"]
         self.sessions.append(sid, "user", message)
 
         async with tracer.turn(
@@ -497,7 +825,6 @@ class CopilotService:
                 if on_event is not None:
                     await on_event(event)
 
-            input_check = self.guardrails.check_input(message)
             if not input_check["allowed"]:
                 response = input_check["message"]
                 self.sessions.append(sid, "assistant", response)
@@ -589,6 +916,8 @@ class CopilotService:
             output_check = self.guardrails.check_output(response)
             if not output_check["allowed"]:
                 response = "The response was blocked by the configured guardrails."
+            elif output_check["redacted_text"] is not None:
+                response = output_check["redacted_text"]
 
             self.sessions.append(sid, "assistant", response)
             self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
@@ -648,7 +977,11 @@ class CopilotService:
 
         explicit_provider, explicit_model = self._parse_model_choice(model)
 
+        # See chat()'s matching comment: redact before anything downstream
+        # (the model call, session history, the trace) ever sees the raw value.
         input_check = self.guardrails.check_input(message)
+        if input_check["redacted_text"] is not None:
+            message = input_check["redacted_text"]
         pending_skill_run = session.get("pending_skill_run")
         would_skill_route = bool(pending_skill_run) or (
             input_check["allowed"] and bool(self.skill_packages.select_for_chat(message))
@@ -733,6 +1066,17 @@ class CopilotService:
                     output_check = self.guardrails.check_output(full_text)
                     if not output_check["allowed"]:
                         full_text = "The response was blocked by the configured guardrails."
+                    elif output_check["redacted_text"] is not None:
+                        # NOTE: real token-by-token streaming (stream_chat above)
+                        # has already sent every delta to the client by this
+                        # point — redaction here can only fix what gets stored/
+                        # returned in the "done" payload and session history,
+                        # not what was already rendered live. The guardrail
+                        # activity panel still reports the finding either way
+                        # (see updateGuardrailChip/guardrailActivityHtml), so a
+                        # PII/secret leak in a streamed reply is visible even
+                        # though it couldn't be intercepted mid-stream.
+                        full_text = output_check["redacted_text"]
                     self.sessions.append(sid, "assistant", full_text)
                     turn.generation(
                         "stream_chat", model=result_model, provider=result_provider,

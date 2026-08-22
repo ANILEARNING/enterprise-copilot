@@ -9,7 +9,7 @@ from autogen_core import CancellationToken
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from .config import settings
-from .extraction import ExtractionError, extract_text, sanitize_filename
+from .extraction import ExtractionError, extract_document, sanitize_filename
 from .models import (
     HealthResponse, ChatRequest, ChatResponse, ChatCancelRequest,
     DocumentCreate, DocumentUpdate, DocumentDelete, DocumentGet,
@@ -20,7 +20,7 @@ from .models import (
 )
 from .mcp_tools import describe_mcp_config
 from .observability import describe_observability
-from .providers import list_available_embedding_models, list_available_models
+from .providers import build_vision_provider, list_available_embedding_models, list_available_models
 from .services import service
 from .skills import SkillPackageError
 
@@ -244,16 +244,25 @@ async def guardrails_status():
     return {
         "phase": 0,
         "enabled": True,
-        "checks": ["prompt-injection", "retrieved-context-injection", "secret-like-output"],
-        "description": "Lightweight input/output policy checks run before and after model responses."
+        "checks": [
+            "prompt-injection", "retrieved-context-injection", "pii-detection-redaction",
+            "toxic-unsafe-content-policy", "sensitive-data-filtering",
+        ],
+        "description": "Input, retrieved-context, and output are screened for prompt injection, PII "
+                        "(redacted, not blocked), secrets/sensitive data (redacted), and an unsafe-content "
+                        "policy (blocked) — before and after every model response.",
     }
 
 @router.post("/rag/status")
 async def rag_status():
     """What embedding is configured vs. what actually ran the most recent
-    ingest/query — see RAGStore.describe_embedding(). Powers the Knowledge
-    tab's "embedding model" status line."""
-    return service.rag.describe_embedding()
+    ingest/query (RAGStore.describe_embedding()), plus which vector-store
+    backend is actually live — Qdrant Cloud or the in-memory fallback,
+    reachability, point count (RAGStore.describe_vector_store()). Powers the
+    Knowledge tab's status line."""
+    embedding = service.rag.describe_embedding()
+    vector_store = await service.rag.describe_vector_store()
+    return {**embedding, "vector_store": vector_store}
 
 @router.post("/tools/mcp/status")
 async def mcp_status():
@@ -275,21 +284,24 @@ async def observability_status():
 async def rag_add(request: DocumentCreate):
     try:
         filename = sanitize_filename(request.filename)
-        text = extract_text(filename, request.content, request.content_encoding,
-                             settings.max_upload_mb * 1024 * 1024)
+        extracted = await extract_document(filename, request.content, request.content_encoding,
+                                            settings.max_upload_mb * 1024 * 1024, vision_provider=build_vision_provider())
     except ExtractionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return await service.rag.add(filename, text)
+    return await service.rag.add(filename, extracted.text, blocks=extracted.blocks)
 
 @router.post("/rag/document/update")
 async def rag_update(request: DocumentUpdate):
     try:
         filename = sanitize_filename(request.filename) if request.filename is not None else None
         content = None
+        blocks = None
         if request.content is not None:
-            content = extract_text(filename or "", request.content, request.content_encoding,
-                                    settings.max_upload_mb * 1024 * 1024)
-        return await service.rag.update(request.document_id, filename, content)
+            extracted = await extract_document(filename or "", request.content, request.content_encoding,
+                                                settings.max_upload_mb * 1024 * 1024,
+                                                vision_provider=build_vision_provider())
+            content, blocks = extracted.text, extracted.blocks
+        return await service.rag.update(request.document_id, filename, content, blocks=blocks)
     except ExtractionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except KeyError as exc:
@@ -298,7 +310,7 @@ async def rag_update(request: DocumentUpdate):
 @router.post("/rag/document/delete")
 async def rag_delete(request: DocumentDelete):
     try:
-        service.rag.delete(request.document_id)
+        await service.rag.delete(request.document_id)
         return {"deleted": True, "document_id": request.document_id}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

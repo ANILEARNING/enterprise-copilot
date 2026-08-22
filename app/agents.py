@@ -21,7 +21,10 @@ from autogen_core import CancellationToken
 from .config import settings
 from .hitl_agents import await_human_decision
 from .mcp_tools import get_mcp_tools
-from .memory import BUFFER_SIZE, CompactingChatCompletionContext, CompactMemoryState, compact_history, history_to_llm_messages
+from .memory import (
+    BUFFER_SIZE, CompactingChatCompletionContext, CompactMemoryState, compact_history,
+    history_to_llm_messages, llm_messages_to_plain, render_memory_preview,
+)
 from .providers import AIProvider, GeminiProvider, MockProvider, describe_embedding_config
 from .streaming import build_streaming_model_client, build_user_message
 
@@ -646,7 +649,7 @@ class AutoGenOrchestrator(AgentOrchestrator):
                     "tools": [t.name for t in mcp_tools],
                 })
                 try:
-                    text, tool_names, web_sources, memory_state = await self._run_with_tools(
+                    text, tool_names, web_sources, memory_state, memory_preview = await self._run_with_tools(
                         model_client, mcp_tools, prompt, history, agent_name, on_event, images, memory_state,
                     )
                     # A successful-but-empty result is just as unusable as an
@@ -680,6 +683,11 @@ class AutoGenOrchestrator(AgentOrchestrator):
                         "system_preview": _build_agent_mode_system_message(agent_name, {t.name for t in mcp_tools}),
                         "prompt_preview": prompt[:2000], "response_preview": (text or "")[:2000],
                         "tool_calls": tool_names,
+                        # The buffered/summarized prior-turn context this
+                        # turn's AssistantAgent actually saw via its
+                        # CompactingChatCompletionContext — see
+                        # _run_with_tools' return and render_memory_preview.
+                        "memory_preview": memory_preview,
                     })
                     degraded_from_tools = False
                 except Exception as exc:  # noqa: BLE001 - degrade to the plain completion below, never fail the turn
@@ -723,6 +731,14 @@ class AutoGenOrchestrator(AgentOrchestrator):
                 # not an oversight — see _build_agent_mode_system_message for
                 # the tool-calling path, which does have one.
                 "prompt_preview": prompt[:2000], "response_preview": text[:2000],
+                # `compacted` (above) is exactly what compact_history() built
+                # and handed to self.provider.complete() as prior-turn
+                # context — the buffered recent turns plus, once the session
+                # is long enough, a synthetic summary turn. Rendered here so
+                # "View context sent to model" (static/app.js) can show it
+                # alongside the prompt, instead of the memory the model
+                # actually used being invisible. See render_memory_preview.
+                "memory_preview": render_memory_preview(compacted),
             })
 
         # Tool invocation: coding agent queues code execution behind HITL
@@ -877,8 +893,11 @@ class AutoGenOrchestrator(AgentOrchestrator):
 
         Returns (final_text, names_of_tools_actually_called, web_sources,
         updated_memory_state as a CompactMemoryState object, matching
-        compact_history()'s return shape) — tool_calls/web_sources are empty
-        if the model answered directly without needing any tool.
+        compact_history()'s return shape, memory_preview — a human-readable
+        rendering of the buffered/summarized prior-turn context this turn's
+        agent actually received, see render_memory_preview) — tool_calls/
+        web_sources are empty if the model answered directly without needing
+        any tool.
 
         web_sources is parsed straight out of web_search's own
         ToolCallExecutionEvent result (mcp_servers/tavily_search_server.py
@@ -943,4 +962,13 @@ class AutoGenOrchestrator(AgentOrchestrator):
             if source["url"] not in seen_urls:
                 seen_urls.add(source["url"])
                 deduped_sources.append(source)
-        return final_text, called, deduped_sources, model_context.state
+        # Same buffered turns + summary the agent itself just used —
+        # get_messages() re-runs compact_history() internally, but by now
+        # model_context.state already accounts for all overflow (the stream
+        # above already triggered that), so this re-call finds no NEW
+        # overflow and makes no extra provider call; it's just reading back
+        # what was actually sent. Rendered for "View context sent to model"
+        # (static/app.js) — see render_memory_preview.
+        sent_messages = await model_context.get_messages()
+        memory_preview = render_memory_preview(llm_messages_to_plain(sent_messages))
+        return final_text, called, deduped_sources, model_context.state, memory_preview

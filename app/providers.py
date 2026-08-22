@@ -274,6 +274,20 @@ def build_provider() -> AIProvider:
     return FallbackProvider(primary, mock)
 
 
+def build_vision_provider() -> AIProvider | None:
+    """Image-only PDF OCR (app/extraction.py) always tries Gemini directly,
+    independent of MODEL_PROVIDER/AI_MODE — same posture as
+    settings.agent_router_model always calling Gemini regardless of the main
+    chat provider (app/agents.py:_build_router_provider): OCR is a small,
+    self-contained capability need, not "the configured chat model," so a
+    user running MODEL_PROVIDER=ollama with a Gemini key still gets OCR.
+    None (no GEMINI_API_KEY) means "no vision provider available" — callers
+    treat that as a clear, honest rejection, never a silent mock/no-op."""
+    if not settings.gemini_api_key:
+        return None
+    return GeminiProvider(settings.gemini_api_key, settings.max_output_tokens, model=GeminiProvider.DEFAULT_MODEL)
+
+
 # --- explicit model selection (Copilot's model picker) -----------------------
 #
 # build_provider()/FallbackProvider above back the *default* chat path, which

@@ -62,6 +62,11 @@ always-available offline implementation. See `docs/runtime-settings.md`.
 **Safety**
 - Three-stage guardrails, visible in the UI: `check_input` (user message),
   `check_context` (retrieved chunks — indirect prompt injection), `check_output` (model reply)
+- PII detection & redaction (email, phone, SSN, credit card, IP) and sensitive-data
+  filtering (API keys, passwords, tokens) — redacted in place, turn still proceeds
+- Toxic/unsafe-content policy — blocks the turn, same as prompt injection
+- Per-message "Guardrail activity" panel showing exactly what was caught this turn
+  (category + count only, never the matched value) — see `docs/guardrails.md`
 - HITL approval queue — risky actions require explicit approval before running
 - Local Python execution with timeout and output limits (**development-only, not a secure sandbox**)
 

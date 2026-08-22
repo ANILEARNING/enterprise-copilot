@@ -89,6 +89,24 @@ async def _extend_summary(provider, state: CompactMemoryState, new_overflow: lis
     return CompactMemoryState(summary=summary, summarized_count=state.summarized_count + len(new_overflow))
 
 
+def render_memory_preview(context_for_the_prompt: list[dict]) -> str | None:
+    """Renders `compact_history()`'s `context_for_the_prompt` (the synthetic
+    summary turn, if any, plus the buffered recent turns) as a flat,
+    human-readable transcript — the same shape "View context sent to model"
+    (static/app.js contextDisclosureHtml) already shows for the system
+    prompt and grounded prompt, just for the *memory* piece: what prior-turn
+    context the model actually received alongside this turn's prompt.
+
+    None when there's nothing to show (a session's very first turn, or one
+    with fewer than BUFFER_SIZE prior turns and no summary yet) — the UI
+    already treats an absent preview as "nothing to disclose" for the other
+    context-preview fields, same convention here."""
+    if not context_for_the_prompt:
+        return None
+    lines = [f"{turn.get('role', 'user')}: {turn.get('content', '')}" for turn in context_for_the_prompt]
+    return "\n\n".join(lines)
+
+
 async def compact_history(
     provider, history: list[dict], state: CompactMemoryState, buffer_size: int = BUFFER_SIZE,
 ) -> tuple[list[dict], CompactMemoryState]:
@@ -134,7 +152,7 @@ def history_to_llm_messages(history: list[dict]) -> list[LLMMessage]:
     return messages
 
 
-def _llm_messages_to_plain(messages: list[LLMMessage]) -> list[dict]:
+def llm_messages_to_plain(messages: list[LLMMessage]) -> list[dict]:
     plain: list[dict] = []
     for m in messages:
         if isinstance(m, UserMessage):
@@ -178,7 +196,7 @@ class CompactingChatCompletionContext(BufferedChatCompletionContext):
         return self._state
 
     async def get_messages(self) -> list[LLMMessage]:
-        plain_history = _llm_messages_to_plain(self._messages)
+        plain_history = llm_messages_to_plain(self._messages)
         _, self._state = await compact_history(self._provider, plain_history, self._state, self._buffer_size)
         recent = await super().get_messages()  # last buffer_size raw messages, real AutoGen types, untouched
         if not self._state.summary:

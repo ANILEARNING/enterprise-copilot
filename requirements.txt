@@ -19,3 +19,7 @@ pyyaml
 # posture as python-docx/python-pptx above) — skills/brd-prd-generator's
 # PDF output.
 reportlab
+# RAG v2 (see docs/rag.md): production vector store + extra ingestion formats.
+qdrant-client
+openpyxl
+beautifulsoup4

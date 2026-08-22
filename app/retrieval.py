@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from dataclasses import dataclass, field
 
 _WORD_RE = re.compile(r"\w+")
 _PARAGRAPH_RE = re.compile(r"\n\s*\n")
@@ -40,16 +41,14 @@ def tokenize(text: str) -> list[str]:
 
 # --- chunk ----------------------------------------------------------------
 
-def chunk_text(text: str, chunk_size: int = 600, overlap: int = 80) -> list[str]:
-    """Paragraph-aware chunking, bounded to ~chunk_size chars, with a small
-    overlap carried into each following chunk so context isn't lost at a
-    boundary. Falls back to sentence-by-sentence packing for paragraphs that
-    alone exceed chunk_size."""
-    cleaned = clean_text(text)
-    if not cleaned:
-        return []
-    paragraphs = [p.strip() for p in _PARAGRAPH_RE.split(cleaned) if p.strip()] or [cleaned]
-
+def _pack_paragraphs(paragraphs: list[str], chunk_size: int, overlap: int) -> list[str]:
+    """The packing algorithm itself, factored out of chunk_text so
+    chunk_blocks (below) can reuse it for a section's prose blocks without
+    going back through clean_text/paragraph-splitting on already-structured
+    input. Bounded to ~chunk_size chars per chunk, falling back to
+    sentence-by-sentence packing for a paragraph that alone exceeds
+    chunk_size, then a small overlap carried into each following chunk so
+    context isn't lost at a boundary."""
     chunks: list[str] = []
     buffer = ""
 
@@ -86,6 +85,134 @@ def chunk_text(text: str, chunk_size: int = 600, overlap: int = 80) -> list[str]
         carry = previous[-overlap:]
         overlapped.append(f"{carry} {current}".strip())
     return overlapped
+
+
+def chunk_text(text: str, chunk_size: int = 600, overlap: int = 80) -> list[str]:
+    """Paragraph-aware chunking, bounded to ~chunk_size chars, with a small
+    overlap carried into each following chunk so context isn't lost at a
+    boundary. Falls back to sentence-by-sentence packing for paragraphs that
+    alone exceed chunk_size.
+
+    Kept as the flat-text entry point (unstructured input, no document
+    structure to key off) — see chunk_blocks() for the structure-aware
+    (heading/table/parent-child) chunker used everywhere ingestion has real
+    ExtractedBlock structure to work with (app/extraction.py)."""
+    cleaned = clean_text(text)
+    if not cleaned:
+        return []
+    paragraphs = [p.strip() for p in _PARAGRAPH_RE.split(cleaned) if p.strip()] or [cleaned]
+    return _pack_paragraphs(paragraphs, chunk_size, overlap)
+
+
+# --- structure-aware, parent-child chunking ---------------------------------
+
+@dataclass
+class ParentChildChunk:
+    """One retrieval unit. `text` is the child — what gets embedded and
+    searched; `parent_text` is that child's full parent section — what gets
+    sent to the model as grounding context, so a small precise match doesn't
+    lose its surrounding meaning. `heading_path` is the breadcrumb of
+    headings above this chunk (["Document", "Chapter 2", "Refund Policy"]),
+    empty for a document with no headings at all. `content_hash` is
+    sha256(text) — the child text's own hash, not the parent's — used by
+    RAGStore's incremental reindex to diff old vs. new chunks and re-embed
+    only what actually changed."""
+    text: str
+    parent_text: str
+    heading_path: list[str] = field(default_factory=list)
+    is_table: bool = False
+    content_hash: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.content_hash:
+            self.content_hash = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+
+def chunk_blocks(blocks, chunk_size: int = 600, overlap: int = 80) -> list[ParentChildChunk]:
+    """Structure-aware chunking over app/extraction.py's ExtractedBlock
+    list. One unified, format-aware pipeline — not a strategy the caller
+    picks — the content itself decides:
+
+    - A heading starts a new *parent section*: that heading plus every block
+      until the next same-or-higher-level heading. A document with no
+      headings at all is one single implicit section (heading_path stays
+      empty, parent_text is the whole document).
+    - Within a section, a table block becomes its own atomic child chunk —
+      never merged with adjacent prose, never split mid-row (splitting a
+      table mid-row is the single most common cause of "the model can't
+      answer a table question" in RAG systems).
+    - Prose blocks in a section are packed into child chunks via the same
+      paragraph/sentence-packing chunk_text already used (bounded to
+      chunk_size/overlap).
+    - Every child chunk in a section carries that section's full text as
+      parent_text — the grounding context sent to the model is the whole
+      section, even though only the small child chunk was what matched.
+
+    `blocks` is `list[ExtractedBlock]` (app/extraction.py) — typed loosely
+    here (duck-typed on .kind/.level/.text) to avoid a retrieval.py ->
+    extraction.py import for a pure-dataclass shape neither module owns
+    exclusively.
+    """
+    if not blocks:
+        return []
+
+    # Split into sections: each section is (heading_path, [blocks in it]).
+    sections: list[tuple[list[str], list]] = []
+    current_path: list[str] = []
+    current_blocks: list = []
+
+    def start_new_section() -> None:
+        nonlocal current_blocks
+        if current_blocks:
+            sections.append((list(current_path), current_blocks))
+        current_blocks = []
+
+    for block in blocks:
+        if block.kind == "heading":
+            start_new_section()
+            level = block.level or 1
+            # Truncate the path to this heading's level, then append it —
+            # e.g. an h2 after an h1/h2/h3 path replaces the h2 and h3 with
+            # itself, keeping only ancestors strictly above its own level.
+            current_path = current_path[: level - 1] + [block.text]
+            current_blocks.append(block)
+        else:
+            current_blocks.append(block)
+    start_new_section()
+
+    if not sections:
+        return []
+
+    chunks: list[ParentChildChunk] = []
+    for heading_path, section_blocks in sections:
+        parent_text = "\n\n".join(b.text for b in section_blocks if b.text.strip())
+        prose_buffer: list[str] = []
+
+        def flush_prose() -> None:
+            if not prose_buffer:
+                return
+            for child_text in _pack_paragraphs(list(prose_buffer), chunk_size, overlap):
+                chunks.append(ParentChildChunk(text=child_text, parent_text=parent_text, heading_path=heading_path))
+            prose_buffer.clear()
+
+        for block in section_blocks:
+            if block.kind == "table":
+                flush_prose()
+                if block.text.strip():
+                    chunks.append(ParentChildChunk(
+                        text=block.text, parent_text=parent_text, heading_path=heading_path, is_table=True,
+                    ))
+            elif block.kind == "heading":
+                # The heading's own text is part of parent_text (joined
+                # above) but isn't itself a searchable child chunk — a query
+                # matching only a heading string with no body would retrieve
+                # a chunk with nothing to ground an answer in.
+                continue
+            elif block.text.strip():
+                prose_buffer.append(block.text)
+        flush_prose()
+
+    return chunks
 
 
 # --- embed ------------------------------------------------------------------
@@ -195,3 +322,79 @@ def lexical_rerank_score(query_tokens: list[str], chunk_tokens: list[str]) -> fl
     hits = sum(1 for t in chunk_tokens if t in unique_query)
     density = min(hits / len(chunk_tokens) * 4, 1.0)
     return 0.7 * coverage + 0.3 * density
+
+
+# --- dedup / ordering / context compression (post-rerank query stages) --------
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def dedupe_results(results: list[dict], jaccard_threshold: float = 0.9) -> list[dict]:
+    """Drops near-duplicate chunks from a ranked result list, keeping the
+    higher-scored copy of each. Matters once parent-child chunking + chunk
+    overlap can surface two children of the same parent section (or two
+    overlapping chunks from adjacent documents) both scoring well for the
+    same query — showing both wastes context-budget on redundant text and
+    dilutes the citation list.
+
+    Exact duplicates (identical `content_hash`) are always dropped. Near-
+    duplicates are caught via token-set Jaccard similarity over each
+    result's `tokens` field — the same tokenization already computed for
+    BM25/rerank, reused here rather than re-tokenizing. `results` is
+    expected sorted by relevance already (as RAGStore.search's reranked
+    list is); the FIRST (highest-ranked) occurrence of a duplicate group is
+    kept."""
+    seen_hashes: set[str] = set()
+    kept: list[dict] = []
+    kept_token_sets: list[set[str]] = []
+    for result in results:
+        content_hash = result.get("content_hash")
+        if content_hash and content_hash in seen_hashes:
+            continue
+        tokens = set(result.get("tokens", []))
+        if any(_jaccard(tokens, kept_tokens) >= jaccard_threshold for kept_tokens in kept_token_sets):
+            continue
+        if content_hash:
+            seen_hashes.add(content_hash)
+        kept.append(result)
+        kept_token_sets.append(tokens)
+    return kept
+
+
+def compress_context(results: list[dict], token_budget: int) -> list[dict]:
+    """Orders by rerank score (already the case for RAGStore.search's input
+    here, but enforced explicitly so this function is correct standalone
+    too) and greedily includes whole chunks until `token_budget` (a
+    character-count proxy — consistent with this app's existing
+    prompt[:2000]-style char-budgeting elsewhere, no tokenizer dependency
+    added) is hit.
+
+    Budget is measured against each result's grounding context — its
+    `parent_text` when present (parent-child chunking, app/retrieval.py:
+    chunk_blocks), falling back to `snippet`/`text` for chunks with no
+    parent (flat chunk_text() ingestion). The last chunk that would exceed
+    the budget gets its parent_text TRUNCATED rather than dropped entirely,
+    so grounding never silently vanishes at the boundary — the model still
+    sees a same, if truncated, excerpt of the most relevant remaining
+    chunk instead of only the chunks that fit whole."""
+    ordered = sorted(results, key=lambda r: r.get("rerank_score", 0.0), reverse=True)
+    included: list[dict] = []
+    remaining = token_budget
+    for result in ordered:
+        context_text = result.get("parent_text") or result.get("snippet") or result.get("text", "")
+        length = len(context_text)
+        if remaining <= 0:
+            break
+        if length <= remaining:
+            included.append(result)
+            remaining -= length
+        else:
+            truncated = dict(result)
+            key = "parent_text" if result.get("parent_text") else ("snippet" if result.get("snippet") else "text")
+            truncated[key] = context_text[:remaining].rstrip() + "…"
+            included.append(truncated)
+            remaining = 0
+    return included

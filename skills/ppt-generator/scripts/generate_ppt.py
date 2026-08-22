@@ -31,7 +31,7 @@ from pathlib import Path
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.util import Pt
+from pptx.util import Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).parent))
 from theme_presets import Theme, resolve_theme  # noqa: E402
@@ -63,6 +63,12 @@ def build_presentation(spec: dict) -> Presentation:
 
     theme = resolve_theme(spec.get("theme"), spec.get("tone"))
     prs = Presentation()
+    # python-pptx's default template is 4:3, which letterboxes on essentially
+    # every current display/projector. 16:9 (13.333in x 7.5in) is PowerPoint's
+    # own default for new decks — set it before any slide is added so the
+    # layouts lay out against the final canvas size.
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
 
     # --- title slide ---
     title_layout = prs.slide_layouts[0]

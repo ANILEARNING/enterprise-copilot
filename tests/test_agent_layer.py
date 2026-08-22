@@ -845,7 +845,7 @@ async def test_orchestrator_falls_back_when_tool_calling_returns_empty_text(monk
         # Success, no exception — but no usable answer, exactly what
         # exhausting max_tool_iterations without a final Response produces.
         from app.memory import CompactMemoryState
-        return "", ["web_search", "web_search", "web_search"], [], CompactMemoryState()
+        return "", ["web_search", "web_search", "web_search"], [], CompactMemoryState(), None
 
     monkeypatch.setattr("app.agents.get_mcp_tools", fake_get_mcp_tools)
     monkeypatch.setattr("app.agents.build_streaming_model_client", fake_build_streaming_model_client)

@@ -46,6 +46,13 @@ class SessionStore:
         self.data_dir = data_dir or DEFAULT_DATA_DIR
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, dict] = {}
+        # Monotonic in-process write counter, keyed by session_id — see
+        # list()'s docstring for why this replaced a pure mtime_ns tiebreak
+        # (verified: two writes microseconds apart can land on the identical
+        # mtime_ns value on this filesystem, so that alone doesn't actually
+        # break the tie it exists for).
+        self._write_seq: dict[str, int] = {}
+        self._next_seq = 0
 
     def _path(self, session_id: str) -> Path:
         # session_id is our own uuid4, but never trust it as a path component blindly.
@@ -54,6 +61,8 @@ class SessionStore:
 
     def _write(self, session: dict) -> None:
         session["updated_at"] = _now_iso()
+        self._next_seq += 1
+        self._write_seq[session["session_id"]] = self._next_seq
         try:
             self._path(session["session_id"]).write_text(json.dumps(session, indent=2), encoding="utf-8")
         except OSError as exc:
@@ -108,7 +117,18 @@ class SessionStore:
         self._write(session)
 
     def list(self) -> list[dict]:
-        """Summaries (no message bodies) for a session picker — newest first."""
+        """Summaries (no message bodies) for a session picker — newest first.
+        Ties on `updated_at` (two writes can land on the same ISO-timestamp
+        string under fast/loaded conditions — observed under CI-like load)
+        break on this process's own write-order counter when available (a
+        session this process actually wrote), falling back to filesystem
+        mtime_ns for one only ever loaded fresh from disk. Offset well past
+        any real mtime_ns value so the two scales can never cross — verified
+        mtime_ns alone is NOT fine-grained enough on every filesystem to
+        break a tie between two fast successive writes (two writes
+        microseconds apart can land on the identical mtime_ns value), which
+        is why a pure mtime_ns tiebreak wasn't actually solving the problem
+        it existed for."""
         summaries = []
         for path in self.data_dir.glob("*.json"):
             session = self._load(path.stem)
@@ -116,22 +136,19 @@ class SessionStore:
                 continue
             messages = session.get("messages", [])
             first_user = next((m["content"] for m in messages if m.get("role") == "user"), "")
+            seq = self._write_seq.get(session["session_id"])
+            tiebreak = (2**63 + seq) if seq is not None else path.stat().st_mtime_ns
             summaries.append({
                 "session_id": session["session_id"],
                 "created_at": session["created_at"],
                 "updated_at": session.get("updated_at", session["created_at"]),
                 "message_count": len(messages),
                 "preview": first_user[:PREVIEW_CHARS],
-                # Not returned to callers, just a tiebreaker: two writes can land on
-                # the same `updated_at` string under fast/loaded conditions (observed
-                # under CI-like load), at which point falling back to filesystem glob
-                # order would be effectively arbitrary. mtime_ns reflects real write
-                # order even when the ISO-string clock reading ties.
-                "_mtime_ns": path.stat().st_mtime_ns,
+                "_tiebreak": tiebreak,  # not returned to callers, see docstring
             })
-        summaries.sort(key=lambda s: (s["updated_at"], s["_mtime_ns"]), reverse=True)
+        summaries.sort(key=lambda s: (s["updated_at"], s["_tiebreak"]), reverse=True)
         for s in summaries:
-            del s["_mtime_ns"]
+            del s["_tiebreak"]
         return summaries
 
     def get(self, session_id: str) -> dict:

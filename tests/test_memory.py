@@ -6,7 +6,7 @@ live in app/streaming.py's own manual verification since it needs a real
 model client — these tests stick to the framework-agnostic core."""
 import pytest
 
-from app.memory import CompactMemoryState, compact_history
+from app.memory import CompactMemoryState, compact_history, render_memory_preview
 from app.providers import MockProvider
 
 
@@ -84,3 +84,40 @@ def test_compact_memory_state_round_trips_through_dict():
 def test_compact_memory_state_from_dict_handles_none_and_empty():
     assert CompactMemoryState.from_dict(None) == CompactMemoryState()
     assert CompactMemoryState.from_dict({}) == CompactMemoryState()
+
+
+# --- render_memory_preview: powers "View context sent to model" -> memory ----
+
+def test_render_memory_preview_none_when_nothing_to_show():
+    assert render_memory_preview([]) is None
+
+
+def test_render_memory_preview_renders_buffered_turns():
+    context = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    preview = render_memory_preview(context)
+    assert "user: hi" in preview
+    assert "assistant: hello" in preview
+
+
+def test_render_memory_preview_includes_summary_turn_when_present():
+    context = [
+        {"role": "system", "content": "Summary of earlier conversation: the user likes ramen"},
+        {"role": "user", "content": "what did I say I liked?"},
+    ]
+    preview = render_memory_preview(context)
+    assert "Summary of earlier conversation: the user likes ramen" in preview
+    assert "user: what did I say I liked?" in preview
+
+
+@pytest.mark.asyncio
+async def test_render_memory_preview_matches_what_compact_history_actually_sends():
+    # End-to-end: what a real call site (AutoGenOrchestrator's plain-
+    # completion path) hands to render_memory_preview is exactly
+    # compact_history()'s own output — this is the integration point the UI
+    # feature depends on, not just the rendering function in isolation.
+    provider = MockProvider()
+    history = _turns(8)
+    context, _ = await compact_history(provider, history, CompactMemoryState(), buffer_size=5)
+    preview = render_memory_preview(context)
+    assert "Summary of earlier conversation" in preview
+    assert "user: turn 6" in preview or "assistant: turn 6" in preview

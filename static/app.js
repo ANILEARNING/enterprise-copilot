@@ -473,10 +473,12 @@ function timelineChipsHtml(meta) {
 
 // What the model actually saw this turn — the fully-assembled prompt
 // (RAG-grounded context, retrieved-source citations instructions, guardrail-
-// screened) captured straight from the backend's own "model_call" status
-// event (see sendMessage's "status" handler) rather than reconstructed
-// client-side, so this is never a guess. Collapsed by default since it's a
-// debugging/transparency aid, not primary content.
+// screened), the buffered/summarized prior-turn memory (app/memory.py —
+// render_memory_preview), and where the path has one, the system message —
+// captured straight from the backend's own "model_call"/"model_call_started"
+// status events (see sendMessage's "status" handler) rather than
+// reconstructed client-side, so this is never a guess. Collapsed by default
+// since it's a debugging/transparency aid, not primary content.
 function contextDisclosureHtml(m) {
   if (!m.promptPreview) return "";
   const block = (label, value) => `
@@ -490,9 +492,51 @@ function contextDisclosureHtml(m) {
       <div class="mt-2" style="display:flex; flex-direction:column; gap:8px;">
         ${m.systemPreview ? block("System prompt", m.systemPreview) : `
         <div class="small" style="color:var(--text-faint); font-style:italic;">This turn's provider has no separate system prompt — only the combined prompt below.</div>`}
+        ${m.memoryPreview ? block("Conversation memory (buffered recent turns + summary of older ones)", m.memoryPreview) : `
+        <div class="small" style="color:var(--text-faint); font-style:italic;">No prior-turn memory sent yet — this is early enough in the session that there's nothing to buffer or summarize.</div>`}
         ${block("Prompt (incl. any retrieved/grounded context)", m.promptPreview)}
         ${m.responsePreview ? block("Raw model response", m.responsePreview) : ""}
       </div>
+    </details>`;
+}
+
+// Per-turn guardrail activity — what check_input/check_context/check_output
+// (app/services.py:GuardrailService) actually found and did, not just the
+// pass/fail chip. Never renders matched terms/patterns themselves (only
+// category + count), per .claude/rules/guardrails.md's "never expose ...
+// hidden policies" rule — a category name like "email" or "api_key" says
+// what kind of thing was caught without repeating the sensitive value.
+function guardrailFindingsHtml(label, check) {
+  if (!check) return "";
+  const rows = [];
+  (check.pii || []).forEach((f) => rows.push(`PII redacted — ${escapeHtml(f.category)} ×${f.count}`));
+  (check.sensitive_data || []).forEach((f) => rows.push(`Sensitive data redacted — ${escapeHtml(f.category)} ×${f.count}`));
+  (check.unsafe_content || []).forEach((f) => rows.push(`Unsafe content policy — ${escapeHtml(f.category)} ×${f.count}`));
+  if (check.matched_rules?.some((r) => !r.startsWith("unsafe-content:") && !["sensitive-data-redacted", "pii-redacted"].includes(r))) {
+    rows.push(`Prompt-injection pattern matched`);
+  }
+  if (!rows.length) return "";
+  const tone = check.allowed ? "var(--warning)" : "var(--danger)";
+  return `
+    <div class="small" style="padding:4px 0; border-left:2px solid ${tone}; padding-left:8px;">
+      <div style="color:var(--text-faint);">${label}${check.allowed ? "" : " — blocked"}</div>
+      ${rows.map((r) => `<div>${r}</div>`).join("")}
+    </div>`;
+}
+
+function guardrailActivityHtml(meta) {
+  const g = meta?.guardrails;
+  if (!g) return "";
+  const sections = [
+    guardrailFindingsHtml("Input", g.input),
+    guardrailFindingsHtml("Retrieved context", g.context),
+    guardrailFindingsHtml("Output", g.output),
+  ].filter(Boolean);
+  if (!sections.length) return "";
+  return `
+    <details class="context-disclosure" style="margin-top:6px;">
+      <summary class="small" style="color:var(--text-faint); cursor:pointer;">🛡️ Guardrail activity (${sections.length})</summary>
+      <div class="mt-2" style="display:flex; flex-direction:column; gap:6px;">${sections.join("")}</div>
     </details>`;
 }
 
@@ -630,6 +674,7 @@ function renderMessage(m, idx) {
     <div class="msg-bubble-wrap">
       <div class="${bubbleClass}">${imagesHtml}${renderMarkdownLite(m.content)}${streamingCursor}${cancelledNote}${skillRunExtrasHtml(m.meta?.skill_run)}</div>
       ${!isUser ? timelineChipsHtml(m.meta) : ""}
+      ${!isUser ? guardrailActivityHtml(m.meta) : ""}
       ${!isUser ? hitlCardsHtml(m.hitlRecords) : ""}
       ${!isUser ? contextDisclosureHtml(m) : ""}
       <div class="msg-meta-row">
@@ -782,6 +827,7 @@ async function sendMessage(text, opts = {}) {
         if (evt.stage === "model_call_started") {
           messages[assistantIdx].systemPreview = evt.system_preview;
           messages[assistantIdx].promptPreview = evt.prompt_preview;
+          messages[assistantIdx].memoryPreview = evt.memory_preview;
           renderChat();
           return;
         }
@@ -797,6 +843,7 @@ async function sendMessage(text, opts = {}) {
           m.systemPreview = evt.system_preview;
           m.promptPreview = evt.prompt_preview;
           m.responsePreview = evt.response_preview;
+          m.memoryPreview = evt.memory_preview;
         }
         renderChat();
       } else if (evt.type === "model_info") {
@@ -812,11 +859,12 @@ async function sendMessage(text, opts = {}) {
     });
 
     if (finalData) {
-      const priorPreview = messages[assistantIdx]; // carries systemPreview/promptPreview/responsePreview captured from "status" events above
+      const priorPreview = messages[assistantIdx]; // carries systemPreview/promptPreview/responsePreview/memoryPreview captured from "status" events above
       messages[assistantIdx] = {
         role: "assistant", content: finalData.response, at: new Date().toISOString(),
         meta: finalData, cancelled: !!finalData.cancelled,
         systemPreview: priorPreview?.systemPreview, promptPreview: priorPreview?.promptPreview,
+        memoryPreview: priorPreview?.memoryPreview,
         // Direct-mode streaming (model_call_started) never gets a separate
         // response_preview event — the response only exists as the deltas
         // that became finalData.response — so fall back to that instead of
@@ -887,10 +935,19 @@ function updateGuardrailChip(guardrails) {
     chip.style.color = "var(--danger)";
     chip.style.borderColor = "var(--danger)";
   } else {
+    // Redaction activity (PII/secrets caught but not blocking) is worth
+    // surfacing on the chip itself, not just in the per-message disclosure —
+    // it's the difference between "nothing happened" and "something was
+    // caught and handled."
+    const redactedCount = [input, context, output]
+      .filter(Boolean)
+      .reduce((n, c) => n + (c.pii?.length || 0) + (c.sensitive_data?.length || 0), 0);
     const parts = ["input", context ? "context" : null, "output"].filter(Boolean);
-    chip.textContent = `Guardrails: ${parts.join(", ")} allowed`;
-    chip.style.color = "";
-    chip.style.borderColor = "";
+    chip.textContent = redactedCount
+      ? `Guardrails: ${parts.join(", ")} allowed · ${redactedCount} item(s) redacted`
+      : `Guardrails: ${parts.join(", ")} allowed`;
+    chip.style.color = redactedCount ? "var(--warning)" : "";
+    chip.style.borderColor = redactedCount ? "var(--warning)" : "";
   }
 }
 
@@ -898,6 +955,12 @@ function updateLastRunPanel(data) {
   const providerLabel = data.provider
     ? `${data.model ? `${data.provider}/${data.model}` : data.provider}${data.used_fallback ? " (fallback)" : ""}`
     : "— (no model call)";
+  const g = data.guardrails;
+  const redactedCount = [g?.input, g?.context, g?.output]
+    .filter(Boolean)
+    .reduce((n, c) => n + (c.pii?.length || 0) + (c.sensitive_data?.length || 0), 0);
+  const blocked = [g?.input, g?.context, g?.output].some((c) => c && !c.allowed);
+  const guardrailSummary = blocked ? "Blocked" : redactedCount ? `${redactedCount} item(s) redacted` : "Clean";
   const rows = [
     ["Provider", providerLabel],
     ["Agent", data.agent || "— (direct call)"],
@@ -905,12 +968,15 @@ function updateLastRunPanel(data) {
     ["Tools called", data.tool_calls?.length ? data.tool_calls.join(", ") : "—"],
     ["Sources", data.sources?.length ? `${data.sources.length} document(s)` : "—"],
     ["Pending approvals", data.hitl_pending?.length ? String(data.hitl_pending.length) : "0"],
+    ["Guardrail activity", guardrailSummary],
   ];
+  const guardrailDetail = guardrailActivityHtml({ guardrails: g });
   $("lastRunPanel").innerHTML = `
     <div class="d-flex flex-column gap-2">
-      ${rows.map(([k, v]) => `<div class="d-flex justify-content-between small"><span style="color:var(--text-faint)">${k}</span><span class="text-end">${escapeHtml(v)}</span></div>`).join("")}
+      ${rows.map(([k, v]) => `<div class="d-flex justify-content-between small"><span style="color:var(--text-faint)">${k}</span><span class="text-end"${k === "Guardrail activity" ? ` style="color:${blocked ? "var(--danger)" : redactedCount ? "var(--warning)" : ""}"` : ""}>${escapeHtml(v)}</span></div>`).join("")}
       ${data.sources?.length ? `<hr class="divider my-1"><div class="d-flex flex-wrap gap-1">${data.sources.map((s) => `<span class="chip" title="vector ${s.vector_score ?? "—"} · bm25 ${s.bm25_score ?? "—"} · rerank ${s.rerank_score ?? "—"}${s.embedding_model ? ` · embed ${s.embedding_model}` : ""}">${escapeHtml(s.filename)}${s.chunk_index != null ? `#${s.chunk_index}` : ""}</span>`).join("")}</div>` : ""}
       ${data.web_sources?.length ? `<hr class="divider my-1"><div class="small mb-1" style="color:var(--text-faint)">Web sources — what the agent actually read</div>${webSourcesHtml(data.web_sources)}` : ""}
+      ${guardrailDetail ? `<hr class="divider my-1">${guardrailDetail}` : ""}
     </div>`;
   const modePill = $("modePill");
   if (!data.provider) {
@@ -1066,9 +1132,10 @@ function docStatusPill(status) {
   return `<span class="pill pill-neutral"><span class="pill-dot"></span>${escapeHtml(status || "unknown")}</span>`;
 }
 
-// What embedding model is actually indexing/searching this knowledge base
-// (see app/routes.py POST /rag/status) — "configured" is static, "last_used"
-// reflects the most recent ingest/query and can differ if a provider fell back.
+// What embedding model is actually indexing/searching this knowledge base,
+// plus which vector-store backend is live (see app/routes.py POST
+// /rag/status) — "configured" is static, "last_used" reflects the most
+// recent ingest/query and can differ if a provider fell back.
 async function loadKnowledgeEmbeddingStatus() {
   const el = $("knowledgeEmbeddingStatus");
   if (!el) return;
@@ -1080,7 +1147,13 @@ async function loadKnowledgeEmbeddingStatus() {
     const lastUsedLabel = lastUsed
       ? ` · last used: ${lastUsed.model ? `${lastUsed.provider}/${lastUsed.model}` : lastUsed.provider}${lastUsed.used_fallback ? " (fallback)" : ""}`
       : "";
-    el.textContent = `Embedding: ${configuredLabel}${lastUsedLabel}`;
+    const vs = data.vector_store;
+    const backendLabel = vs
+      ? vs.backend === "qdrant"
+        ? ` · Backend: Qdrant Cloud${vs.reachable ? ` (${vs.point_count ?? "?"} pts)` : " (unreachable)"}`
+        : ` · Backend: in-memory (${vs.point_count ?? 0} pts)`
+      : "";
+    el.textContent = `Embedding: ${configuredLabel}${lastUsedLabel}${backendLabel}`;
   } catch (e) {
     el.textContent = "Embedding: couldn't load status.";
   }
@@ -1258,8 +1331,15 @@ function readFileAsBase64(file) {
   });
 }
 
-function isPdfFile(file) {
-  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+// Binary uploads (base64, extracted server-side, see app/extraction.py) vs.
+// text uploads (read directly in the browser) — .csv/.html/.json/.log/.md/
+// .txt have no binary container so they stay text-encoded even though the
+// server does real structural parsing on some of them.
+const BINARY_UPLOAD_EXTENSIONS = [".pdf", ".docx", ".xlsx"];
+
+function isBinaryUploadFile(file) {
+  const name = file.name.toLowerCase();
+  return BINARY_UPLOAD_EXTENSIONS.some((ext) => name.endsWith(ext));
 }
 
 async function handleFile(file) {
@@ -1269,9 +1349,9 @@ async function handleFile(file) {
     return;
   }
   try {
-    const pdf = isPdfFile(file);
-    pendingFileContent = pdf ? await readFileAsBase64(file) : await readFileAsText(file);
-    pendingFileEncoding = pdf ? "base64" : "text";
+    const binary = isBinaryUploadFile(file);
+    pendingFileContent = binary ? await readFileAsBase64(file) : await readFileAsText(file);
+    pendingFileEncoding = binary ? "base64" : "text";
     pendingFileName = file.name;
     $("docFileName").textContent = file.name;
     $("docFileSize").textContent = formatBytes(file.size);
@@ -1287,8 +1367,13 @@ async function handleFile(file) {
    snaps to "done" the moment the real request resolves — better than an
    opaque spinner, honest that it's not literal server progress. --- */
 
-const DOC_SAVE_STAGES_PDF = ["Uploading file", "Extracting text from PDF", "Cleaning & chunking", "Generating embeddings", "Indexing"];
-const DOC_SAVE_STAGES_TEXT = ["Cleaning & chunking", "Generating embeddings", "Indexing"];
+function docSaveStages(filename, contentEncoding) {
+  const base = ["Cleaning & chunking", "Generating embeddings", "Indexing"];
+  if (contentEncoding !== "base64") return base;
+  const name = (filename || "").toLowerCase();
+  const format = name.endsWith(".docx") ? "DOCX" : name.endsWith(".xlsx") ? "Excel" : "PDF";
+  return ["Uploading file", `Extracting text from ${format}`, ...base];
+}
 
 // Generalized over container/steps element ids so both the document-save modal
 // and the skill-run modal (see initSkillsView) can drive their own progress UI
@@ -1370,7 +1455,7 @@ function initDocModal() {
     cancelBtn.disabled = true;
     closeBtn.disabled = true;
     btn.innerHTML = `<span class="spinner-mini dark"></span>`;
-    const stages = payload.content_encoding === "base64" ? DOC_SAVE_STAGES_PDF : DOC_SAVE_STAGES_TEXT;
+    const stages = docSaveStages(payload.filename, payload.content_encoding);
     const progress = startProgress("docSaveProgress", "docSaveProgressSteps", stages);
     try {
       if (id) {

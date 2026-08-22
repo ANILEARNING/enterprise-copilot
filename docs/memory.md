@@ -44,3 +44,31 @@ mechanism used for the in-progress skill Q&A state — updated at the end of
 every turn that touched context management, loaded once at the start of the
 next one. This mirrors `ChatCompletionContext.save_state()`/`load_state()`'s
 own naming and shape on purpose.
+
+## Visibility: "View context sent to model"
+
+`render_memory_preview()` renders exactly what a turn's buffered/summarized
+context resolved to (the synthetic summary turn, if any, plus the raw
+buffered recent turns) as flat text, and every call site that talks to a
+model attaches it to that turn's `model_call`/`model_call_started` event as
+`memory_preview` — alongside the existing `system_preview`/`prompt_preview`.
+The frontend (`static/app.js` `contextDisclosureHtml`) shows it in its own
+block inside the per-message "🔍 View context sent to model" disclosure, so
+what prior-turn context actually reached the model is visible, not just the
+current turn's prompt.
+
+Three call sites, three different ways of getting there (same
+`compact_history()` math underneath in every case):
+
+- **Plain completion** (`AutoGenOrchestrator.run`, direct-chat fallback) —
+  `compact_history()`'s own return value is rendered directly; no extra work.
+- **Tool-calling** (`AutoGenOrchestrator._run_with_tools`) — the real
+  `CompactingChatCompletionContext` the `AssistantAgent` used is asked for
+  its messages again after the turn completes; by then its internal state
+  already accounts for any overflow, so this second `get_messages()` call
+  makes no extra provider call, it only reads back what was actually sent.
+- **Direct streaming** (`app/streaming.py` `stream_chat`) — the context is
+  built and asked for its messages *before* the `model_call_started` event
+  fires (moved earlier specifically for this), rather than after the turn
+  like the other two paths — streaming has no "after the response" moment
+  to piggyback on, since the response only exists as deltas.

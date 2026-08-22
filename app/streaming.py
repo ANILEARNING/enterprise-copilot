@@ -38,7 +38,10 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_core import CancellationToken, Image
 
 from .config import settings
-from .memory import BUFFER_SIZE, CompactingChatCompletionContext, CompactMemoryState, history_to_llm_messages
+from .memory import (
+    BUFFER_SIZE, CompactingChatCompletionContext, CompactMemoryState,
+    history_to_llm_messages, llm_messages_to_plain, render_memory_preview,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +217,19 @@ async def stream_chat(
     # generic "autogen-stream" placeholder the caller previously had to guess
     # a label from.
     yield {"type": "model_info", "provider": resolved_provider, "model": resolved_model}
+
+    context = CompactingChatCompletionContext(
+        BUFFER_SIZE, memory_provider, initial_messages=history_to_llm_messages(history),
+        initial_state=CompactMemoryState.from_dict(memory_state),
+    )
+    # Built early (before the agent/team below) specifically so this turn's
+    # buffered-recent-turns + summary can be previewed up front, alongside
+    # the system/prompt preview — get_messages() runs compact_history()
+    # itself (one provider call only if new turns just overflowed the
+    # buffer); the agent's own internal get_messages() call later in this
+    # same turn finds nothing new to summarize and makes no second call.
+    memory_preview = render_memory_preview(llm_messages_to_plain(await context.get_messages()))
+
     # The exact system + user message about to be sent — known up front here
     # (unlike AutoGenOrchestrator's tool-calling/plain-completion paths,
     # which only know prompt_preview once a response comes back), so this
@@ -224,13 +240,9 @@ async def stream_chat(
     yield {
         "type": "status", "stage": "model_call_started",
         "system_preview": SYSTEM_MESSAGE, "prompt_preview": message[:2000],
+        "memory_preview": memory_preview,
     }
     yield {"type": "status", "stage": "thinking", "label": "Thinking…"}
-
-    context = CompactingChatCompletionContext(
-        BUFFER_SIZE, memory_provider, initial_messages=history_to_llm_messages(history),
-        initial_state=CompactMemoryState.from_dict(memory_state),
-    )
     try:
         agent = AssistantAgent(
             "copilot", model_client=model_client, model_client_stream=True,

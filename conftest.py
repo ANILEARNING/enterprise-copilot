@@ -14,9 +14,22 @@ tests that want their OWN isolated store (not sharing the one process-wide
 singleton) should still pass an explicit data_dir=tmp_path, same as
 tests/test_storage.py and tests/test_skills.py already do — this fixture
 only covers the module-level `service` singleton other tests import.
+
+Also forcing AI_MODE=mock here for the same reason: build_ai_provider(),
+build_embedding_provider(), and build_vector_store() (app/providers.py,
+app/vector_store.py) all treat AI_MODE=configured as the one switch that
+turns on live network calls (Gemini/Ollama/Qdrant), independent of whether
+API keys happen to be present in the environment. A developer's real .env
+may legitimately carry live QDRANT_URL/QDRANT_API_KEY/GEMINI_API_KEY for
+running the app — the test suite must never pick those up and start making
+real network calls just because they're present. Tests that specifically
+want to exercise the "configured" path already do so explicitly via
+monkeypatch.setattr(settings, "ai_mode", "configured") plus a fake/injected
+provider, never by relying on real credentials from the environment.
 """
 import os
 import tempfile
 
 _data_dir = tempfile.mkdtemp(prefix="copilot-test-data-")
 os.environ.setdefault("DATA_DIR", _data_dir)
+os.environ["AI_MODE"] = "mock"

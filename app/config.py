@@ -102,6 +102,25 @@ class Settings(BaseSettings):
     # default, and never logged (see get_mcp_tools(web_search=...)).
     tavily_api_key: str = ""
 
+    # --- RAG v2 vector store (Qdrant Cloud) — optional, see app/vector_store.py ---
+    #
+    # Unset (either empty) means RAGStore uses InMemoryVectorStore — today's exhaustive
+    # in-memory cosine scan, extracted verbatim behind the same VectorStore interface —
+    # so mock-mode/offline dev and the test suite need zero Qdrant credentials. Both
+    # must be set for QdrantVectorStore to be selected; the collection is created
+    # on first use if it doesn't exist yet (idempotent, no manual provisioning step).
+    qdrant_url: str = ""
+    qdrant_api_key: str = ""
+    qdrant_collection: str = "enterprise_copilot_chunks"
+    # Single fixed tenant carried through every chunk's payload/metadata from day
+    # one (RAGStore, DocumentStore) — not real multi-tenant isolation yet, just the
+    # schema shape a second tenant later slots into without a migration/backfill.
+    rag_tenant_id: str = "default"
+    # Character-based proxy for a token budget (consistent with this app's existing
+    # prompt[:2000]-style char-budgeting elsewhere — no tokenizer dependency added).
+    # Caps how much retrieved context compress_context() packs into one prompt.
+    rag_context_token_budget: int = 4000
+
     # --- Observability — optional, see app/observability.py ---
     #
     # No-op tracer unless both keys are set; never required for the app to run.
