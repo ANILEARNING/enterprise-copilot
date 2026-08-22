@@ -133,7 +133,6 @@ Deliberate, documented v1 choices — each sits behind the interface its replace
 - **Default embedder is a hashing-trick bag-of-words**, not a semantic model — it runs offline
   with no download. It will not match "car" to "automobile". Set `AI_MODE=configured` to use
   a real embedding model (`nomic-embed-text` via Ollama, or Gemini).
-- **The reranker is a lexical coverage/density heuristic**, standing in for a cross-encoder.
 - **Local code execution is a development convenience, not a security boundary.** Do not expose
   it to untrusted input.
 - **Single-process only** — in-memory state does not survive multiple workers.
