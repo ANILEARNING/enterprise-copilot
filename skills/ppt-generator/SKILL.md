@@ -5,18 +5,15 @@ description: >
   user about content, tone, and design before generating it.
 trigger: >
   The user asks to create/build/generate a presentation, slide deck, or PPT/PowerPoint.
-# Precise phrases for chat-message routing (CopilotService._match_chat_skill) —
-# see docx-generator/SKILL.md's chat_triggers comment for why this is narrower
-# than `trigger` above.
-chat_triggers:
-  - "ppt"
-  - "pptx"
-  - "powerpoint"
-  - "presentation"
-  - "slide deck"
-  - "create slides"
-  - "make slides"
-  - "generate slides"
+# Chat-routing for deck requests now belongs to skills/pptx/SKILL.md (a
+# richer generator — native charts, more layouts, a larger palette set).
+# Deliberately empty, not just narrowed: select_for_chat (app/skills.py) is a
+# plain first-match-wins substring scan over a dict, so this skill's own
+# phrases would otherwise collide with pptx's near-identical ones ("ppt",
+# "pptx", "powerpoint", "slide deck", ...), leaving it accidental rather than
+# deliberate which one actually answers a chat message. This skill is still
+# reachable directly from the Skills tab — it just no longer intercepts chat.
+chat_triggers: []
 output: pptx
 questions:
   - id: topic

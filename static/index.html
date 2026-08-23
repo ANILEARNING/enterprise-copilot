@@ -102,10 +102,19 @@
               <input type="checkbox" id="webSearch" class="form-check-input" style="margin:0">
               🔎 Web Search
             </label>
+            <label class="composer-toggle" id="autoGenerateToggleWrap" title="Only applies to deck-building requests. OFF (default): a drafted deck is queued for your approval in Pending approvals before it's generated. ON: generates immediately, no approval step.">
+              <input type="checkbox" id="autoGenerate" class="form-check-input" style="margin:0">
+              ⚡ Auto-generate
+            </label>
+            <button class="btn btn-ghost btn-sm" id="saveCheckpointBtn" title="Save a named checkpoint you can restore this session to later">💾 Save checkpoint</button>
             <button class="btn btn-ghost btn-sm" id="clearChat" title="Clear conversation">Clear</button>
           </div>
 
           <div class="chat-scroll" id="chatScroll">
+            <div class="alert-banner d-none" id="interruptedTurnBanner">
+              <span id="interruptedTurnText"></span>
+              <button type="button" class="btn-icon btn-ghost btn btn-sm" id="dismissInterruptedTurn" title="Dismiss">✕</button>
+            </div>
             <div class="chat-welcome" id="chatWelcome">
               <div class="brand-mark">EC</div>
               <h2>How can I help today?</h2>
@@ -306,6 +315,18 @@
       <div class="d-flex gap-2 mb-3">
         <button class="btn btn-outline-primary" id="startNewSessionBtn">Start new session</button>
         <button class="btn btn-outline-secondary" data-view-link="copilot">Go to Copilot</button>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header">
+          <h2>Checkpoints</h2>
+          <span class="muted">Named save points for the active session — restore rolls back the transcript</span>
+        </div>
+        <div class="panel-body p-3" id="checkpointsContainer">
+          <div class="state-block" style="padding:28px 16px;">
+            <p style="margin:0;">No checkpoints saved yet. Use "Save checkpoint" in Copilot to create one.</p>
+          </div>
+        </div>
       </div>
 
       <div class="panel">

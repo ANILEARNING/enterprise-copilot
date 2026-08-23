@@ -24,6 +24,14 @@ class ChatRequest(BaseModel):
     # TAVILY_API_KEY is configured; otherwise a strictly additive no-op.
     web_search: bool = False
     images: list[ImageAttachment] = Field(default_factory=list)
+    # UI "Auto-generate" toggle (see static/app.js) — only meaningful for the
+    # Deck Builder flow (a "pptx" chat-trigger match, see CopilotService.chat).
+    # False (default, the safer state): a drafted deck spec is queued through
+    # HitlService for approval before generate_pptx.py runs, same review flow
+    # as the coding skill's code-execution HITL gate. True: generates
+    # immediately once the spec is ready, no approval step. No effect on any
+    # other chat path.
+    auto_generate: bool = False
 
 class ChatResponse(BaseModel):
     response: str
@@ -64,6 +72,40 @@ class SessionStartResponse(BaseModel):
 
 class SessionGet(BaseModel):
     session_id: str = Field(min_length=1)
+
+class SessionGetResponse(BaseModel):
+    """Full session state — see app/storage.py's module docstring for the
+    on-disk shape this mirrors. `turn_checkpoint`/`checkpoints` are the
+    Checkpointer feature's fields: `turn_checkpoint` is non-null only when
+    the last turn on this session was interrupted before completing (a
+    resume UI can show "your last turn didn't finish"); `checkpoints` is
+    this session's user-saved named restore points (see POST
+    /session/checkpoint/*). `pending_deck_builder`/`last_deck_spec` are the
+    Deck Builder flow's fields (see app/services.py:DeckBuilderService) —
+    `pending_deck_builder` is non-null only mid-clarification (before a spec
+    is ready); `last_deck_spec` is the most recently generated/approved
+    deck's spec, used to seed an "enhance this" follow-up."""
+    session_id: str
+    created_at: str
+    updated_at: str
+    messages: list[dict] = Field(default_factory=list)
+    memory_state: dict | None = None
+    pending_skill_run: dict | None = None
+    turn_checkpoint: dict | None = None
+    checkpoints: list[dict] = Field(default_factory=list)
+    pending_deck_builder: dict | None = None
+    last_deck_spec: dict | None = None
+
+class CheckpointSaveRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    label: str = Field(min_length=1, max_length=200)
+
+class CheckpointListRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+
+class CheckpointRestoreRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    checkpoint_id: str = Field(min_length=1)
 
 class CodeExecuteSubmitRequest(BaseModel):
     code: str = Field(min_length=1, max_length=20000)

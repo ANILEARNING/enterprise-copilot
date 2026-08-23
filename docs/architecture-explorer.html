@@ -1,0 +1,1202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Enterprise Copilot — Architecture Explorer</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fragment+Mono:ital@0;1&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&display=swap">
+<style>
+:root {
+  --paper: #faf9f6;
+  --paper-raised: #ffffff;
+  --ink: #1b1e1c;
+  --ink-soft: #4a5049;
+  --ink-faint: #7c8279;
+  --line: #dfdcd3;
+  --line-soft: #ebe9e2;
+  --teal: #0e6b64;
+  --teal-deep: #0a4f4a;
+  --teal-soft: #e3efed;
+  --amber: #9a6a1f;
+  --amber-soft: #f6ecd9;
+  --rose: #9a3a3a;
+  --rose-soft: #f6e6e4;
+  --code-bg: #f2f0e9;
+  --code-ink: #2c3e3c;
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --mono: "Fragment Mono", "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #14171a;
+    --paper-raised: #1b1f22;
+    --ink: #e8e6e0;
+    --ink-soft: #b7bcb4;
+    --ink-faint: #7d8580;
+    --line: #2c312e;
+    --line-soft: #232724;
+    --teal: #4fb3a8;
+    --teal-deep: #7ecdc3;
+    --teal-soft: #17302c;
+    --amber: #d9a94f;
+    --amber-soft: #2e2716;
+    --rose: #d97a7a;
+    --rose-soft: #2e1e1c;
+    --code-bg: #1e2220;
+    --code-ink: #cfe6e2;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #14171a; --paper-raised: #1b1f22; --ink: #e8e6e0; --ink-soft: #b7bcb4; --ink-faint: #7d8580;
+  --line: #2c312e; --line-soft: #232724; --teal: #4fb3a8; --teal-deep: #7ecdc3; --teal-soft: #17302c;
+  --amber: #d9a94f; --amber-soft: #2e2716; --rose: #d97a7a; --rose-soft: #2e1e1c;
+  --code-bg: #1e2220; --code-ink: #cfe6e2;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--paper); color: var(--ink); font-family: var(--serif);
+  font-size: 16px; line-height: 1.6; margin: 0; -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--teal-soft); color: var(--teal-deep); }
+a { color: var(--teal-deep); }
+code, pre { font-family: var(--mono); }
+
+.shell {
+  max-width: 1320px; margin: 0 auto; padding: 0 28px 140px;
+  display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 48px;
+}
+@media (max-width: 920px) { .shell { grid-template-columns: 1fr; } .toc { display: none; } }
+
+/* ---- masthead ---- */
+.masthead {
+  grid-column: 1 / -1; padding: 56px 0 36px; border-bottom: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 16px;
+}
+.eyebrow {
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--teal); display: flex; align-items: center; gap: 10px;
+}
+.eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); }
+h1 {
+  font-family: var(--serif); font-weight: 600; font-size: clamp(30px, 4vw, 42px);
+  line-height: 1.1; margin: 0; letter-spacing: -0.01em; text-wrap: balance; max-width: 20ch;
+}
+.masthead-sub { color: var(--ink-soft); font-size: 16.5px; max-width: 68ch; margin: 0; }
+.masthead-meta {
+  display: flex; gap: 24px; flex-wrap: wrap; margin-top: 4px;
+  font-family: var(--mono); font-size: 12px; color: var(--ink-faint);
+}
+.masthead-meta strong { color: var(--ink); font-weight: 500; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; }
+.legend-item { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.legend-swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+/* ---- toc ---- */
+.toc {
+  position: sticky; top: 32px; align-self: start; padding-top: 44px;
+  display: flex; flex-direction: column; gap: 1px; max-height: calc(100vh - 70px); overflow-y: auto;
+}
+.toc-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-faint); margin: 0 0 8px; }
+.toc a {
+  font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); text-decoration: none;
+  padding: 5px 9px; border-radius: 6px; display: flex; align-items: baseline; gap: 8px;
+}
+.toc a:hover { background: var(--line-soft); color: var(--ink); }
+.toc a .n { color: var(--ink-faint); font-size: 10.5px; min-width: 16px; }
+.toc-flag { margin-top: 18px; padding: 10px 12px; border-radius: 8px; background: var(--amber-soft); border: 1px solid var(--amber); font-family: var(--mono); font-size: 11px; color: var(--amber); line-height: 1.5; }
+
+/* ---- main ---- */
+.main { padding-top: 40px; min-width: 0; }
+.lede { font-size: 17.5px; color: var(--ink-soft); max-width: 70ch; margin: 0 0 6px; }
+
+/* ---- section cards (top-level, click to expand) ---- */
+section.topic { margin-top: 20px; scroll-margin-top: 20px; }
+details.card {
+  background: var(--paper-raised); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+details.card + details.card { margin-top: 0; }
+details.card > summary {
+  list-style: none; cursor: pointer; padding: 18px 22px; display: flex; align-items: center; gap: 14px;
+  user-select: none;
+}
+details.card > summary::-webkit-details-marker { display: none; }
+.summary-num { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); min-width: 22px; }
+.summary-chevron {
+  margin-left: auto; font-family: var(--mono); font-size: 13px; color: var(--ink-faint);
+  transition: transform 0.15s ease; flex-shrink: 0;
+}
+details.card[open] > summary .summary-chevron { transform: rotate(90deg); }
+.summary-title { font-family: var(--serif); font-weight: 600; font-size: 19.5px; color: var(--ink); }
+.summary-sub { font-size: 13px; color: var(--ink-faint); font-family: var(--mono); }
+.summary-tags { display: flex; gap: 6px; margin-left: 10px; flex-wrap: wrap; }
+.tag {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-faint); white-space: nowrap;
+}
+.tag.autogen { color: var(--teal-deep); border-color: var(--teal); background: var(--teal-soft); }
+.tag.regex { color: var(--amber); border-color: var(--amber); background: var(--amber-soft); }
+.tag.stale { color: var(--rose); border-color: var(--rose); background: var(--rose-soft); }
+
+.card-body { padding: 4px 22px 22px; border-top: 1px solid var(--line-soft); }
+.card-intro { color: var(--ink-soft); font-size: 15px; max-width: 74ch; margin: 16px 0 18px; }
+
+/* ---- nested expandables (the "click Guardrail -> click PII redaction" layer) ---- */
+details.sub {
+  border: 1px solid var(--line-soft); border-radius: 8px; margin-bottom: 10px; background: var(--paper);
+}
+details.sub > summary {
+  list-style: none; cursor: pointer; padding: 12px 16px; display: flex; align-items: center; gap: 10px;
+  font-family: var(--mono); font-size: 13.5px; color: var(--ink); user-select: none;
+}
+details.sub > summary::-webkit-details-marker { display: none; }
+details.sub > summary::before { content: "▸"; color: var(--teal); flex-shrink: 0; transition: transform 0.15s ease; font-size: 11px; }
+details.sub[open] > summary::before { transform: rotate(90deg); }
+details.sub .sub-body { padding: 2px 16px 16px 34px; }
+details.sub .sub-desc { color: var(--ink-soft); font-size: 14px; margin: 4px 0 12px; max-width: 72ch; }
+
+/* ---- §13 diagram nodes ---- */
+#flowSvg text { fill: currentColor; }
+#flowSvg .node rect { transition: fill 0.12s ease, stroke-width 0.12s ease; }
+#flowSvg .node:hover rect, #flowSvg .node:focus-visible rect { stroke-width: 2; }
+#flowSvg .node:focus-visible { outline: none; }
+#flowSvg .node[aria-expanded="true"] rect { fill: var(--teal-soft); stroke: var(--teal); stroke-width: 2; }
+#flowSvg .node[aria-expanded="true"] text { fill: var(--teal-deep); }
+
+/* ---- code blocks ---- */
+.code-wrap { position: relative; margin: 10px 0; }
+.code-src {
+  font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint); margin-bottom: 4px;
+  display: flex; align-items: center; gap: 6px;
+}
+.code-src::before { content: "◇"; color: var(--teal); }
+pre.code {
+  background: var(--code-bg); color: var(--code-ink); border-radius: 8px; padding: 14px 16px;
+  overflow-x: auto; font-size: 12.5px; line-height: 1.65; margin: 0; border: 1px solid var(--line-soft);
+}
+pre.code .c { color: var(--ink-faint); font-style: italic; }
+pre.code .k { color: var(--teal-deep); font-weight: 600; }
+pre.code .s { color: var(--amber); }
+pre.code .f { color: var(--rose); }
+
+/* ---- signature callout (library method/constructor being used) ---- */
+.sig {
+  border-left: 3px solid var(--teal); background: var(--teal-soft); border-radius: 0 8px 8px 0;
+  padding: 10px 14px; margin: 10px 0; font-size: 13px;
+}
+.sig-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--teal-deep); margin-bottom: 4px; }
+.sig code { font-size: 12px; color: var(--ink); }
+
+/* ---- flow steps ---- */
+.flow { display: flex; flex-direction: column; gap: 0; margin: 14px 0; }
+.flow-step { display: flex; gap: 12px; padding: 8px 0; }
+.flow-step:not(:last-child) { border-bottom: 1px dashed var(--line-soft); }
+.flow-idx {
+  font-family: var(--mono); font-size: 11px; color: var(--paper); background: var(--teal);
+  width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; margin-top: 1px;
+}
+.flow-text { font-size: 14px; color: var(--ink-soft); }
+.flow-text strong { color: var(--ink); font-family: var(--mono); font-size: 13px; font-weight: 500; }
+
+/* ---- callouts ---- */
+.note { display: flex; gap: 10px; padding: 12px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--paper); font-size: 13.5px; color: var(--ink-soft); margin: 12px 0; }
+.note.amber { border-color: var(--amber); background: var(--amber-soft); }
+.note.rose { border-color: var(--rose); background: var(--rose-soft); }
+.note .glyph { font-family: var(--mono); font-weight: 700; font-size: 13px; flex-shrink: 0; }
+.note.amber .glyph { color: var(--amber); }
+.note.rose .glyph { color: var(--rose); }
+.note strong { color: var(--ink); font-weight: 600; }
+.note code { font-family: var(--mono); background: rgba(127,127,127,0.14); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+/* ---- small table ---- */
+table.ref { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 10px 0; }
+table.ref th { text-align: left; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); padding: 6px 12px 6px 0; border-bottom: 1px solid var(--line); }
+table.ref td { padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line-soft); vertical-align: top; color: var(--ink-soft); }
+table.ref td:first-child { font-family: var(--mono); color: var(--ink); white-space: nowrap; font-size: 12.5px; }
+table.ref code { font-family: var(--mono); font-size: 12px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+.chiprow { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.chip { font-family: var(--mono); font-size: 11.5px; padding: 5px 10px; border-radius: 6px; background: var(--code-bg); color: var(--ink-soft); border: 1px solid var(--line); }
+.chip b { color: var(--ink); font-weight: 600; }
+
+.docref { font-size: 12.5px; color: var(--ink-faint); margin-top: 4px; }
+.docref code { font-family: var(--mono); background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+
+footer {
+  grid-column: 1 / -1; margin-top: 70px; padding-top: 22px; border-top: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint);
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <header class="masthead">
+    <div class="eyebrow"><span class="dot"></span>Enterprise Copilot &nbsp;·&nbsp; Internal Reference</div>
+    <h1>Architecture Explorer</h1>
+    <p class="masthead-sub">Every subsystem in this codebase, click to expand — what it does, which library method or AutoGen class actually does the work, and the real code that calls it. Cross-references the existing <code style="font-family:var(--mono); background:var(--code-bg); padding:1px 6px; border-radius:4px;">docs/*.md</code> files rather than repeating them.</p>
+    <div class="masthead-meta">
+      <span><strong>12</strong> subsystems</span>
+      <span><strong>1</strong> diagram</span>
+      <span>Backend: <strong>FastAPI + AutoGen</strong></span>
+      <span>Frontend: <strong>vanilla SPA</strong></span>
+      <span>Generated from the codebase as of <strong>2026-08-23</strong></span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-swatch" style="background:var(--teal-soft); border:1px solid var(--teal);"></span>AutoGen / real library call</span>
+      <span class="legend-item"><span class="legend-swatch" style="background:var(--amber-soft); border:1px solid var(--amber);"></span>Regex / pattern-matching</span>
+      <span class="legend-item"><span class="legend-swatch" style="background:var(--rose-soft); border:1px solid var(--rose);"></span>Docs known to be stale</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <p class="toc-label">Subsystems</p>
+    <a href="#s1"><span class="n">01</span>Architecture &amp; models</a>
+    <a href="#s2"><span class="n">02</span>Guardrails</a>
+    <a href="#s3"><span class="n">03</span>RAG &amp; Qdrant</a>
+    <a href="#s4"><span class="n">04</span>Agents (AutoGen)</a>
+    <a href="#s5"><span class="n">05</span>Deck Builder</a>
+    <a href="#s6"><span class="n">06</span>HITL</a>
+    <a href="#s7"><span class="n">07</span>Sandbox</a>
+    <a href="#s8"><span class="n">08</span>Sessions &amp; Memory</a>
+    <a href="#s9"><span class="n">09</span>Skills system</a>
+    <a href="#s10"><span class="n">10</span>Artifacts</a>
+    <a href="#s11"><span class="n">11</span>Frontend</a>
+    <a href="#s12"><span class="n">12</span>docs/*.md index</a>
+    <a href="#s13"><span class="n">13</span>Request flow diagram</a>
+    <div class="toc-flag">⚠ 3 known gaps flagged inline — see §6 and §4</div>
+  </nav>
+
+  <main class="main">
+    <p class="lede">Click any section to expand it; click a nested row to go one level deeper. Every code block names the exact file — nothing here is paraphrased from memory.</p>
+
+    <!-- ============================= 1. ARCHITECTURE ============================= -->
+    <section class="topic" id="s1">
+      <details class="card" open>
+        <summary>
+          <span class="summary-num">01</span>
+          <span class="summary-title">Architecture &amp; models</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">One FastAPI app, one SPA, one hard boundary between application code and AutoGen. Every route is POST except two navigable-URL exceptions.</p>
+
+          <details class="sub">
+            <summary>Request flow — SPA → routes → CopilotService → orchestrators</summary>
+            <div class="sub-body">
+              <p class="sub-desc">The whole request lifecycle in one line: <code>static/app.js</code> (fetch/SSE) → <code>app/routes.py</code> (all POST) → <code>app/services.py:CopilotService</code> (guardrails, routing, session persistence) → an orchestrator in <code>app/agents.py</code>, or a plain <code>AIProvider.complete()</code> call for direct chat.</p>
+              <div class="flow">
+                <div class="flow-step"><span class="flow-idx">1</span><span class="flow-text"><strong>static/app.js</strong> — POSTs to <code>/api/chat/stream</code>, consumes SSE deltas</span></div>
+                <div class="flow-step"><span class="flow-idx">2</span><span class="flow-text"><strong>app/routes.py</strong> — every route <code>@router.post(...)</code> except <code>GET /artifacts/{id}</code> and the static mount</span></div>
+                <div class="flow-step"><span class="flow-idx">3</span><span class="flow-text"><strong>CopilotService.chat()</strong> — guardrail input check, then routes: pending skill Q&amp;A → pending Deck Builder → skill-package trigger match → agent mode → direct completion</span></div>
+                <div class="flow-step"><span class="flow-idx">4</span><span class="flow-text"><strong>AutoGenOrchestrator / DeckBuilderOrchestrator</strong> (app/agents.py) — the only two places raw AutoGen types are touched</span></div>
+              </div>
+              <div class="code-wrap">
+                <div class="code-src">app/main.py — entire app assembly</div>
+                <pre class="code"><span class="k">app</span> = FastAPI(title=<span class="s">"Enterprise Copilot"</span>)
+<span class="k">app</span>.include_router(router)        <span class="c"># /api/* — everything POST</span>
+<span class="k">app</span>.include_router(public_router) <span class="c"># GET /artifacts/{id} only</span>
+
+<span class="k">@app</span>.exception_handler(Exception)
+<span class="k">async def</span> <span class="f">unhandled_exception_handler</span>(request, exc):
+    <span class="c"># strips stack traces from every unhandled 500</span>
+    return JSONResponse(status_code=<span class="s">500</span>, content={<span class="s">"detail"</span>: <span class="s">"Internal server error."</span>})
+
+<span class="k">app</span>.mount(<span class="s">"/"</span>, StaticFiles(directory=<span class="s">"static"</span>, html=<span class="k">True</span>), name=<span class="s">"static"</span>)</pre>
+              </div>
+              <p class="docref">See <code>docs/architecture.md</code>, <code>docs/api.md</code> for the POST-only rule's rationale.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>The AgentOrchestrator boundary — why AutoGen lives in exactly one class</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>.claude/rules/autogen-maf.md</code>: <em>"Application → AgentOrchestrator → AutoGenOrchestrator. Do not scatter AutoGen-specific types or calls across routes/services."</em> This is enforced in practice, not just by convention — <code>autogen_agentchat</code> is imported in exactly three files in the whole repo: <code>app/agents.py</code>, <code>app/hitl_agents.py</code>, <code>app/streaming.py</code>.</p>
+              <div class="code-wrap">
+                <div class="code-src">app/agents.py:508-516</div>
+                <pre class="code"><span class="k">class</span> <span class="f">AgentOrchestrator</span>:
+    <span class="c">"""Application contract. Framework-independent by design."""</span>
+    <span class="k">async def</span> <span class="f">run</span>(self, task: str, context: dict, on_event=None) -&gt; OrchestrationResult:
+        raise NotImplementedError
+
+<span class="k">class</span> <span class="f">AutoGenOrchestrator</span>(AgentOrchestrator):
+    <span class="c">"""v1 implementation. Every AutoGen-specific type/call stays in this class."""</span></pre>
+              </div>
+              <p class="sub-desc">A future MAF (Microsoft Agent Framework) migration replaces <code>AutoGenOrchestrator</code>'s internals only — the contract other code depends on never changes. <code>app/memory.py</code> and parts of <code>app/routes.py</code> import <code>autogen_core</code> (CancellationToken, model-context types) — explicitly <em>not</em> restricted by this rule, since those are framework-agnostic building blocks, not the orchestration types the boundary actually cares about.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Providers — MockProvider, GeminiProvider, OllamaProvider, FallbackProvider</summary>
+            <div class="sub-body">
+              <p class="sub-desc">One abstract contract, four implementations. <code>settings.ai_mode</code> ("mock"|"configured") is the master offline switch; <code>settings.model_provider</code> ("gemini"|"ollama") picks which live provider when configured — both are read fresh on every call and changeable at runtime via <code>POST /api/settings/models/update</code>.</p>
+              <table class="ref">
+                <thead><tr><th>Class</th><th>File</th><th>What it does</th></tr></thead>
+                <tbody>
+                  <tr><td>AIProvider</td><td>providers.py:35</td><td>Abstract — <code>async complete(prompt, history, max_tokens, json_mode, images)</code></td></tr>
+                  <tr><td>MockProvider</td><td>providers.py:64</td><td>Deterministic echo, zero credentials — the whole app works offline against this</td></tr>
+                  <tr><td>GeminiProvider</td><td>providers.py:86</td><td>Real call to <code>generativelanguage.googleapis.com</code>; handles Gemma's forced-thinking token floor</td></tr>
+                  <tr><td>OllamaProvider</td><td>providers.py:167</td><td>Local daemon or Ollama Cloud (Bearer auth) via <code>/api/generate</code></td></tr>
+                  <tr><td>FallbackProvider</td><td>providers.py:224</td><td>Wraps a primary; any failure degrades to MockProvider, sets <code>used_fallback=True</code></td></tr>
+                </tbody>
+              </table>
+              <p class="sub-desc">Embedding providers mirror this exact shape one-for-one: <code>HashEmbeddingProvider</code> (offline), <code>GeminiEmbeddingProvider</code>, <code>OllamaEmbeddingProvider</code>, <code>ChainEmbeddingProvider</code> — see §3.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Registered agents — what "coding-agent" / "research-agent" actually mean</summary>
+            <div class="sub-body">
+              <p class="sub-desc">Distinct from the two orchestrator <em>classes</em> above — these are <code>AgentDefinition</code> entries the router picks between for a single agent-mode turn. Registered by <code>default_agent_registry()</code> (agents.py:404).</p>
+              <div class="chiprow">
+                <span class="chip"><b>general</b> — no keywords, the fallback</span>
+                <span class="chip"><b>coding-agent</b> — "code","bug","dashboard","report","download"</span>
+                <span class="chip"><b>research-agent</b> — "document","cite","source"</span>
+                <span class="chip"><b>data-analysis-agent</b> — "csv","dataset","analyze","chart"</span>
+              </div>
+              <p class="sub-desc">Selection is LLM-based first (<code>AgentRegistry.select_llm</code>, a cached Gemini/Gemma call independent of the main chat provider), falling back to plain keyword matching on any router failure — see §4.</p>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 2. GUARDRAILS ============================= -->
+    <section class="topic" id="s2">
+      <details class="card">
+        <summary>
+          <span class="summary-num">02</span>
+          <span class="summary-title">Guardrails</span>
+          <span class="summary-tags"><span class="tag regex">pure regex</span></span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro"><code>GuardrailService</code> (services.py:277) is <strong>pure pattern-matching — zero LLM or AutoGen calls</strong>. Its own docstring says so explicitly: <em>"Detection here is pattern/regex-based by design, matching the rest of v1's 'always-available, no external dependency' posture."</em> Runs on every turn, four checkpoints in the request lifecycle.</p>
+
+          <div class="flow">
+            <div class="flow-step"><span class="flow-idx">1</span><span class="flow-text"><strong>check_input()</strong> — raw user message, before the model ever sees it</span></div>
+            <div class="flow-step"><span class="flow-idx">2</span><span class="flow-text"><strong>check_context()</strong> + <strong>redact_context_pii()</strong> — retrieved RAG chunks, before they enter the prompt</span></div>
+            <div class="flow-step"><span class="flow-idx">3</span><span class="flow-text"><strong>check_output()</strong> — model's reply, before the user sees it</span></div>
+          </div>
+
+          <details class="sub">
+            <summary>PII redaction — 5 regex patterns, mask-and-keep</summary>
+            <div class="sub-body">
+              <p class="sub-desc">Lives in <code>app/retrieval.py</code>, not <code>services.py</code> — moved there so <code>app/memory.py</code>'s compact-summary redactor can call it directly without a circular import back to <code>GuardrailService</code>.</p>
+              <div class="code-wrap">
+                <div class="code-src">app/retrieval.py:48-54</div>
+                <pre class="code">_PII_PATTERNS = (
+    (<span class="s">"email"</span>, re.compile(<span class="s">r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"</span>), <span class="s">"[REDACTED_EMAIL]"</span>),
+    (<span class="s">"credit_card"</span>, re.compile(<span class="s">r"\b\d(?:[ -]?\d){12,15}\b"</span>), <span class="s">"[REDACTED_CARD]"</span>),
+    (<span class="s">"ssn"</span>, re.compile(<span class="s">r"\b\d{3}-\d{2}-\d{4}\b"</span>), <span class="s">"[REDACTED_SSN]"</span>),
+    (<span class="s">"phone"</span>, re.compile(<span class="s">r"\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]\d{3}[ -]\d{4}\b"</span>), <span class="s">"[REDACTED_PHONE]"</span>),
+    (<span class="s">"ip_address"</span>, re.compile(<span class="s">r"\b(?:\d{1,3}\.){3}\d{1,3}\b"</span>), <span class="s">"[REDACTED_IP]"</span>),
+)</pre>
+              </div>
+              <p class="sub-desc">Redacted, never blocked — the turn proceeds with the masked text. Applied at three sites: chat input/output (<code>check_input</code>/<code>check_output</code>), retrieved RAG snippets (<code>redact_context_pii</code>), and defensively on the compact-memory running summary (<code>app/memory.py</code>) in case something upstream missed it.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Secrets &amp; sensitive data — API keys, passwords, tokens</summary>
+            <div class="sub-body">
+              <div class="code-wrap">
+                <div class="code-src">app/services.py:299-308</div>
+                <pre class="code">_SECRET_PATTERNS = (
+    (<span class="s">"api_key"</span>, re.compile(<span class="s">r"(?i)\b(api[_-]?key|apikey)\s*[:=]\s*\S+"</span>)),
+    (<span class="s">"password"</span>, re.compile(<span class="s">r"(?i)\b(password|passwd|pwd)\s*[:=]\s*\S+"</span>)),
+    (<span class="s">"bearer_token"</span>, re.compile(<span class="s">r"(?i)\bbearer\s+[a-z0-9._-]{10,}"</span>)),
+    (<span class="s">"private_key_block"</span>, re.compile(<span class="s">r"-----BEGIN [A-Z ]*PRIVATE KEY-----"</span>)),
+    (<span class="s">"aws_access_key"</span>, re.compile(<span class="s">r"\bAKIA[0-9A-Z]{16}\b"</span>)),
+    (<span class="s">"openai_key"</span>, re.compile(<span class="s">r"\bsk-[A-Za-z0-9]{20,}\b"</span>)),
+)</pre>
+              </div>
+              <p class="sub-desc">Note the last two: provider-shaped literal patterns catch a pasted/echoed real key even with no <code>key=</code> label in front of it.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Prompt injection &amp; unsafe content — blocked outright, not redacted</summary>
+            <div class="sub-body">
+              <div class="code-wrap">
+                <div class="code-src">app/services.py:291-296, 314-319</div>
+                <pre class="code">BLOCKED_PATTERNS = (   <span class="c"># plain substrings, not regex</span>
+    <span class="s">"ignore previous instructions"</span>, <span class="s">"reveal system prompt"</span>,
+    <span class="s">"show me your api key"</span>, <span class="s">"print environment variables"</span>,
+)
+_UNSAFE_TERM_GROUPS = {  <span class="c"># keyword-family policy, not an ML classifier</span>
+    <span class="s">"violence"</span>: (...), <span class="s">"self_harm"</span>: (...),
+    <span class="s">"hate_harassment"</span>: (...), <span class="s">"illegal_activity"</span>: (...),
+}</pre>
+              </div>
+              <p class="sub-desc">A hit on either blocks the turn entirely — <code>check_input</code>/<code>check_output</code> return <code>allowed: False</code>. The matched category is surfaced to the UI; the matched phrase itself never is, per <code>.claude/rules/guardrails.md</code>'s "never expose hidden policies" rule.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Context screening — indirect prompt injection in retrieved documents</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>check_context(chunks)</code> re-scans <code>BLOCKED_PATTERNS</code> against every RAG chunk before it reaches the prompt — a compromised document trying to smuggle "ignore previous instructions" through retrieval gets dropped from <code>sources</code> entirely, distinct from <code>redact_context_pii</code> (which masks and keeps).</p>
+            </div>
+          </details>
+
+          <p class="docref">Full detail (UI surfaces, streaming caveat) in <code>docs/guardrails.md</code> — not duplicated here. That doc predates the <code>_PII_PATTERNS</code> move to <code>app/retrieval.py</code>.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 3. RAG / QDRANT ============================= -->
+    <section class="topic" id="s3">
+      <details class="card">
+        <summary>
+          <span class="summary-num">03</span>
+          <span class="summary-title">RAG &amp; Qdrant</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro"><code>RAGStore</code> (services.py:468): <em>"Ingestion: extract → clean → chunk (structure-aware, parent-child) → metadata → embed → index. Retrieval: understand → hybrid retrieve → RRF fusion → rerank → dedupe → context compression → citation."</em></p>
+
+          <div class="flow">
+            <div class="flow-step"><span class="flow-idx">1</span><span class="flow-text"><strong>extract</strong> — <code>app/extraction.py:extract_document()</code>, format-aware</span></div>
+            <div class="flow-step"><span class="flow-idx">2</span><span class="flow-text"><strong>clean → chunk</strong> — <code>retrieval.py:clean_text()</code>, <code>chunk_blocks()</code> (structure-aware) / <code>chunk_text()</code> (flat fallback)</span></div>
+            <div class="flow-step"><span class="flow-idx">3</span><span class="flow-text"><strong>embed → index</strong> — <code>provider.embed(text)</code>, then <code>vector_store.upsert()</code> + <code>bm25.add()</code></span></div>
+            <div class="flow-step"><span class="flow-idx">4</span><span class="flow-text"><strong>understand → hybrid retrieve</strong> — <code>tokenize(query)</code>, then <code>vector_store.search()</code> + <code>bm25.search()</code> in parallel</span></div>
+            <div class="flow-step"><span class="flow-idx">5</span><span class="flow-text"><strong>fuse → rerank → dedupe → compress</strong> — <code>reciprocal_rank_fusion()</code> → <code>lexical_rerank_score()</code> → <code>dedupe_results()</code> → <code>compress_context()</code></span></div>
+          </div>
+
+          <details class="sub">
+            <summary>Qdrant — collection setup, upsert, tenant-filtered search</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>QdrantVectorStore</code> (vector_store.py:104). The async client is built lazily on first use, not in <code>__init__</code> — binding it too early risks the wrong event loop, since <code>RAGStore</code>'s bootstrap document seeding runs synchronously at import time.</p>
+              <div class="sig">
+                <div class="sig-label">qdrant_client — real calls made</div>
+                <code>AsyncQdrantClient(url, api_key, check_compatibility=False)</code><br>
+                <code>client.create_payload_index(collection, field_name="tenant_id", field_schema=PayloadSchemaType.KEYWORD)</code><br>
+                <code>client.upsert(collection, points=[PointStruct(id, vector, payload), ...])</code><br>
+                <code>client.query_points(collection, query=vector, query_filter=Filter(must=[FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id))]), limit)</code>
+              </div>
+              <p class="sub-desc">Every point carries a <code>tenant_id</code> payload field, indexed and filtered on every query — the multi-tenancy seam already exists at the vector-store layer, even though there's only one tenant in v1 (<code>settings.rag_tenant_id = "default"</code>).</p>
+              <div class="note">
+                <span class="glyph">i</span>
+                <div>Installed: <code>qdrant-client==1.19.0</code>. Uses <code>query_points</code>, not the deprecated <code>search</code> method.</div>
+              </div>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>In-memory fallback &amp; the ai_mode switch</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>InMemoryVectorStore</code> (vector_store.py:67) — exhaustive cosine scan over a plain dict, dimension-guarded so a chunk embedded by a different provider (incomparable vector space) can't silently corrupt a comparison.</p>
+              <div class="code-wrap">
+                <div class="code-src">app/vector_store.py:234 — build_vector_store()</div>
+                <pre class="code"><span class="k">if</span> settings.ai_mode == <span class="s">"configured"</span> <span class="k">and</span> settings.qdrant_url <span class="k">and</span> settings.qdrant_api_key:
+    <span class="k">try</span>: <span class="k">return</span> QdrantVectorStore(...)
+    <span class="k">except</span> Exception: <span class="k">pass</span>  <span class="c"># any construction failure degrades silently</span>
+<span class="k">return</span> InMemoryVectorStore()</pre>
+              </div>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>BM25 &amp; hybrid fusion</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>BM25Index</code> (retrieval.py:299) — minimal BM25Okapi (<code>K1=1.5</code>, <code>B=0.75</code>), stats recomputed per <code>search()</code> call rather than maintained incrementally (fine at v1's in-memory scale). The vector leg and BM25 leg are fused via Reciprocal Rank Fusion, not a weighted score blend — rank position matters more than raw score magnitude across two very differently-scaled search methods.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Embedding providers — Hash / Gemini / Ollama</summary>
+            <div class="sub-body">
+              <table class="ref">
+                <thead><tr><th>Class</th><th>What it does</th></tr></thead>
+                <tbody>
+                  <tr><td>HashEmbeddingProvider</td><td>Offline, sha1 hashing-trick, 256-dim — always available, no credentials</td></tr>
+                  <tr><td>GeminiEmbeddingProvider</td><td>Real <code>embedContent</code> API call</td></tr>
+                  <tr><td>OllamaEmbeddingProvider</td><td><code>/api/embed</code>, tries a fallback-model list (nomic-embed-text, mxbai-embed-large, ...)</td></tr>
+                  <tr><td>ChainEmbeddingProvider</td><td>Tries each in order, hash last — the guaranteed-to-work floor</td></tr>
+                </tbody>
+              </table>
+              <div class="note amber">
+                <span class="glyph">△</span>
+                <div><strong>Retrieval-quality caveat</strong> — most explicitly stated as a code comment, not in <code>docs/rag.md</code> itself: <em>"the hash-embedding vector leg alone is too noisy to trust on its own"</em> (<code>app/agents.py:525</code>). <code>docs/agent-overview.md:204</code> softens this to <em>"the embedder and reranker are lightweight stand-ins, not trained models."</em> The relevance gate compensates by requiring genuine BM25 lexical overlap (<code>bm25_score &gt; 0</code>) <em>and</em> a reranker score above 0.15 before auto-grounding a turn — vector similarity alone is never trusted to decide relevance.</div>
+              </div>
+            </div>
+          </details>
+
+          <p class="docref">Full pipeline table (implementation status per stage) in <code>docs/rag.md</code>.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 4. AGENTS (AUTOGEN) ============================= -->
+    <section class="topic" id="s4">
+      <details class="card">
+        <summary>
+          <span class="summary-num">04</span>
+          <span class="summary-title">Agents (AutoGen)</span>
+          <span class="summary-tags"><span class="tag autogen">autogen_agentchat</span></span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro"><code>AutoGenOrchestrator.run()</code> (agents.py:545) — the agent-mode entry point. LLM-based routing, RAG grounding, guardrail screening, MCP tool-calling, and the coding-agent's HITL gate, in that order.</p>
+
+          <div class="flow">
+            <div class="flow-step"><span class="flow-idx">1</span><span class="flow-text"><strong>select_llm()</strong> — a cached, always-Gemini/Gemma router call decides which registered agent handles this turn; falls back to keyword match on any failure</span></div>
+            <div class="flow-step"><span class="flow-idx">2</span><span class="flow-text"><strong>RAG grounding</strong> — always checked, relevance-gated for non-research agents (§3)</span></div>
+            <div class="flow-step"><span class="flow-idx">3</span><span class="flow-text"><strong>Guardrail screen + PII redact</strong> on retrieved context (§2)</span></div>
+            <div class="flow-step"><span class="flow-idx">4</span><span class="flow-text"><strong>_run_with_tools()</strong> — real MCP tool-calling via a live AssistantAgent, when tools are available and a model client exists</span></div>
+            <div class="flow-step"><span class="flow-idx">5</span><span class="flow-text"><strong>_queue_generated_code()</strong> — for the coding agent, extracts a fenced code block from the model's own answer and queues it for HITL approval (§6)</span></div>
+          </div>
+
+          <details class="sub">
+            <summary>The real AutoGen imports &amp; a live tool-calling loop</summary>
+            <div class="sub-body">
+              <div class="code-wrap">
+                <div class="code-src">app/agents.py:16-20</div>
+                <pre class="code"><span class="k">from</span> autogen_agentchat.agents <span class="k">import</span> AssistantAgent
+<span class="k">from</span> autogen_agentchat.base <span class="k">import</span> Response, TaskResult
+<span class="k">from</span> autogen_agentchat.messages <span class="k">import</span> TextMessage, ToolCallExecutionEvent, ToolCallRequestEvent
+<span class="k">from</span> autogen_agentchat.teams <span class="k">import</span> MagenticOneGroupChat
+<span class="k">from</span> autogen_core <span class="k">import</span> CancellationToken</pre>
+              </div>
+              <div class="sig">
+                <div class="sig-label">AssistantAgent — constructor used in _run_with_tools (agents.py:917)</div>
+                <code>AssistantAgent(name, model_client, tools, model_context, system_message, reflect_on_tool_use=True, max_tool_iterations=4)</code>
+              </div>
+              <div class="code-wrap">
+                <div class="code-src">app/agents.py:1015-1023 — the actual consumption loop</div>
+                <pre class="code">token = CancellationToken()
+<span class="k">async for</span> event <span class="k">in</span> agent.on_messages_stream([task_message], token):
+    <span class="k">if</span> isinstance(event, ToolCallRequestEvent):
+        <span class="k">for</span> call <span class="k">in</span> event.content: called.append(call.name)
+    <span class="k">elif</span> isinstance(event, ToolCallExecutionEvent):
+        <span class="k">for</span> result <span class="k">in</span> event.content: ...
+    <span class="k">elif</span> isinstance(event, Response):
+        final_text = event.chat_message.content</pre>
+              </div>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>CancellationToken — where the Stop button actually reaches (and where it doesn't)</summary>
+            <div class="sub-body">
+              <p class="sub-desc">One real, wired-up token starts the chain — <code>app/routes.py:107</code> in <code>chat_stream</code>. <code>POST /api/chat/cancel</code> calls <code>token.cancel()</code> on it.</p>
+              <div class="code-wrap">
+                <div class="code-src">app/services.py:1444 — linked to the delegate path</div>
+                <pre class="code">cancellation_token.link_future(chat_task)  <span class="c"># agent-mode / skill-routed turns</span></pre>
+              </div>
+              <div class="note rose">
+                <span class="glyph">△</span>
+                <div><strong>Verified gap:</strong> <code>_run_with_tools()</code> (agents.py:974) and <code>DeckBuilderOrchestrator._run_magentic_one()</code> (agents.py:1127) each construct their <em>own</em> fresh, unlinked <code>CancellationToken()</code> — not the outer routes.py token. Clicking Stop mid-tool-call or mid-Deck-Builder-run abandons the outer task cleanly (from <code>CopilotService</code>'s side), but does not propagate into AutoGen's own <code>on_messages_stream</code>/<code>run_stream</code> call underneath. Only the plain direct-chat streaming path (<code>app/streaming.py</code>) has verified real mid-flight cancellation — its own comment says so: <em>"verified: it interrupts the underlying HTTPS connection mid-read."</em></div>
+              </div>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Coding-agent HITL gate — code is extracted from the answer, not the question</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>_queue_generated_code()</code> (agents.py:824) pulls a fenced code block out of the <em>model's own answer</em> via <code>extract_code_block()</code>, with <code>_looks_like_unfenced_code()</code> as a belt-and-suspenders fallback for a model that ignores the fence instruction — then calls <code>hitl_service.submit_code_execution(code, session_id)</code>. See §6 for the approval flow.</p>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 5. DECK BUILDER ============================= -->
+    <section class="topic" id="s5">
+      <details class="card">
+        <summary>
+          <span class="summary-num">05</span>
+          <span class="summary-title">Deck Builder</span>
+          <span class="summary-tags"><span class="tag autogen">Magentic-One</span></span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">A single-participant <code>MagenticOneGroupChat</code> that plans, asks clarifying questions, calls web search, and drafts a deck spec conversationally — replacing the old fixed-question flow for deck requests specifically.</p>
+
+          <details class="sub">
+            <summary>MagenticOneGroupChat — the single-participant pattern</summary>
+            <div class="sub-body">
+              <div class="sig">
+                <div class="sig-label">autogen_agentchat.teams.MagenticOneGroupChat — real constructor (autogen-agentchat==0.7.5)</div>
+                <code>MagenticOneGroupChat(participants: List[ChatAgent], model_client, *, termination_condition=None, max_turns=20, max_stalls=3, emit_team_events=False)</code>
+              </div>
+              <div class="code-wrap">
+                <div class="code-src">app/agents.py:1089-1094</div>
+                <pre class="code">agent = AssistantAgent(
+    <span class="s">"deck_builder"</span>, model_client=model_client, tools=tools,
+    system_message=_build_deck_builder_system_message(self.skill.instructions),
+    reflect_on_tool_use=<span class="k">True</span>,
+)
+team = MagenticOneGroupChat([agent], model_client=model_client, max_turns=<span class="s">8</span>)</pre>
+              </div>
+              <p class="sub-desc">One participant is fully supported — Magentic-One's own internal orchestrator special-cases <code>len(participants) == 1</code> to skip speaker-selection entirely. The lead "Orchestrator" agent (plans, delegates, tracks a progress ledger) is built <em>automatically</em> by <code>MagenticOneGroupChat</code> itself — application code never constructs it. <code>max_turns=8</code> is deliberately short: each chat turn launches a fresh, bounded run, not one long-lived 20-turn conversation.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>JSON-final-answer, not tool-based generation</summary>
+            <div class="sub-body">
+              <p class="sub-desc">The model's only job is to produce a spec; it never calls a "generate the file" tool itself. Once ready, its final message must be nothing but the JSON spec — parsed via <code>_extract_json()</code> (reused from <code>app/skills.py</code>). If it doesn't parse, the text is treated as a clarifying question instead, and the conversation continues. This mirrors the same split used everywhere else in the app — see §9's <code>draft_spec()</code> → <code>run_generation_script()</code> pattern.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>generate_pptx.py — 6 layouts, real python-pptx calls</summary>
+            <div class="sub-body">
+              <div class="code-wrap">
+                <div class="code-src">skills/pptx/scripts/generate_pptx.py — python-pptx==1.0.2</div>
+                <pre class="code">slide = prs.slides.add_slide(prs.slide_layouts[<span class="s">6</span>])          <span class="c"># blank layout, every layout below positions manually</span>
+box = slide.shapes.add_textbox(left, top, width, height)
+shape = slide.shapes.add_shape(MSO_SHAPE.OVAL, left, top, d, d)          <span class="c"># icon circles</span>
+card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, ...)          <span class="c"># stat cards</span>
+
+chart_data = CategoryChartData()
+chart_data.categories = categories
+chart_data.add_series(name, values)
+frame = slide.shapes.add_chart(chart_type, left, top, w, h, chart_data)  <span class="c"># native, editable</span></pre>
+              </div>
+              <div class="chiprow">
+                <span class="chip"><b>title</b></span><span class="chip"><b>bullets</b></span><span class="chip"><b>two_column</b></span>
+                <span class="chip"><b>stat_callout</b></span><span class="chip"><b>chart</b></span><span class="chip"><b>section_divider</b></span>
+              </div>
+              <p class="sub-desc">An unrecognized <code>layout</code> or chart <code>type</code> value degrades to <code>bullets</code> / <code>COLUMN_CLUSTERED</code> rather than raising — verified live: a real model once returned layout values <code>"overview"</code> and <code>"blank"</code> (not in the documented enum) and the generator still produced a valid, reopenable file.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Auto-generate toggle — HITL-gated by default</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>ChatRequest.auto_generate: bool = False</code> — the safer default. <code>False</code>: the drafted spec is queued via <code>HitlService.submit_deck_generation()</code> and waits in Pending Approvals. <code>True</code>: <code>run_generation_script()</code> runs immediately, no approval step. See §6 for the shared approval mechanism.</p>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 6. HITL ============================= -->
+    <section class="topic" id="s6">
+      <details class="card">
+        <summary>
+          <span class="summary-num">06</span>
+          <span class="summary-title">Human-in-the-loop (HITL)</span>
+          <span class="summary-tags"><span class="tag autogen">UserProxyAgent</span><span class="tag stale">docs stale</span></span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro"><code>HitlService</code> (services.py:66) — one state machine, two "kinds" of risky action gated behind it, both represented as real AutoGen agents, not a bespoke approval mechanism.</p>
+
+          <div class="flow">
+            <div class="flow-step"><span class="flow-idx">1</span><span class="flow-text"><strong>WAITING_FOR_APPROVAL</strong> — a request is queued, visible in the Pending Approvals panel</span></div>
+            <div class="flow-step"><span class="flow-idx">2</span><span class="flow-text"><strong>APPROVED / REJECTED</strong> — a human decides, via <code>decide(request_id, approved)</code></span></div>
+            <div class="flow-step"><span class="flow-idx">3</span><span class="flow-text"><strong>COMPLETED</strong> — on approval, the gated action actually runs and its output is captured</span></div>
+          </div>
+
+          <details class="sub">
+            <summary>Two kinds — code_execution and deck_generation</summary>
+            <div class="sub-body">
+              <table class="ref">
+                <thead><tr><th>kind</th><th>Triggered by</th><th>decide() runs</th></tr></thead>
+                <tbody>
+                  <tr><td>code_execution</td><td><code>AutoGenOrchestrator._queue_generated_code</code></td><td><code>run_approved_code(sandbox, code)</code> — a real CodeExecutorAgent</td></tr>
+                  <tr><td>deck_generation</td><td><code>DeckBuilderService</code> when <code>auto_generate=False</code></td><td><code>run_generation_script(skill, spec)</code> — a plain subprocess call, no agent involved</td></tr>
+                </tbody>
+              </table>
+              <p class="sub-desc">Why deck generation isn't wrapped in an AutoGen agent the way code execution is, straight from the code comment: <em>"generate_pptx.py is a fixed, already-reviewed script; the only thing this approval actually gates is WHEN it runs, not whether the script itself is safe to execute."</em> (services.py:239-246)</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>The real AutoGen agents behind approval &amp; execution</summary>
+            <div class="sub-body">
+              <div class="code-wrap">
+                <div class="code-src">app/hitl_agents.py:33</div>
+                <pre class="code"><span class="k">from</span> autogen_agentchat.agents <span class="k">import</span> ApprovalRequest, ApprovalResponse, CodeExecutorAgent, UserProxyAgent</pre>
+              </div>
+              <p class="sub-desc"><strong>run_approved_code()</strong> — wraps <code>SandboxCodeExecutor</code> (adapts <code>CodeSandbox</code> to AutoGen's <code>CodeExecutor</code> protocol) in a real <code>CodeExecutorAgent("coding_agent", code_executor=executor, approval_func=_already_approved)</code>, then <code>agent.on_messages([TextMessage(...)], CancellationToken())</code>.</p>
+              <p class="sub-desc"><strong>await_human_decision()</strong> — a <code>UserProxyAgent("human_reviewer", input_func=wait_for_decision)</code> whose <code>input_func</code> bridges to <code>hitl_service.await_decision(request_id)</code>, an <code>asyncio.Future</code> — the documented FastAPI/web integration pattern for <code>UserProxyAgent</code>, adapted to this app's queue-then-decide-later REST flow instead of a synchronous terminal prompt.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>File persistence — why it's a fixed directory, not per-instance</summary>
+            <div class="sub-body">
+              <p class="sub-desc">Every request persists to <code>data/hitl-requests/&lt;id&gt;.json</code>. The exact reasoning, from the code comment (services.py:112-128):</p>
+              <div class="note">
+                <span class="glyph">"</span>
+                <div>A FIXED default ... deliberately NOT a fresh uuid-per-instance directory ... <strong>the whole point of persisting HITL requests is that the real CopilotService singleton's data survives a process restart</strong>, and a restart constructs a brand new HitlService with data_dir=None — a per-instance uuid default would silently start that singleton's real, in-production storage over from empty on every single restart, defeating this feature entirely.</div>
+              </div>
+            </div>
+          </details>
+
+          <div class="note rose">
+            <span class="glyph">✕</span>
+            <div><strong>Docs are stale here.</strong> Both <code>docs/hitl.md:17</code> and <code>.claude/skills/hitl.md:59</code> still say <em>"The HITL queue and decisions are in-memory for v1"</em> — untrue since the file-persistence change above landed, and neither doc mentions the <code>deck_generation</code> kind at all. <code>.claude/skills/hitl.md</code>'s own framing does anticipate this though: <em>"Today that's exactly one thing: local code execution... a future tool with real side effects gets gated the same way, not given a separate approval mechanism"</em> — which is exactly what happened.</div>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 7. SANDBOX ============================= -->
+    <section class="topic" id="s7">
+      <details class="card">
+        <summary>
+          <span class="summary-num">07</span>
+          <span class="summary-title">Sandbox / code execution</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro"><code>LocalSubprocessSandbox</code> (sandbox.py:117) — explicitly, by its own module docstring, <strong>not a secure sandbox</strong>. A development-only trade-off, not an oversight.</p>
+          <div class="code-wrap">
+            <div class="code-src">app/sandbox.py — the real mechanism</div>
+            <pre class="code">workspace = tempfile.mkdtemp(prefix=<span class="s">"copilot-exec-"</span>)
+safe_env = {<span class="s">"PATH"</span>: ..., <span class="s">"SYSTEMROOT"</span>: ...}  <span class="c"># no .env / secrets passthrough</span>
+subprocess.run([sys.executable, script_path], cwd=workspace, capture_output=<span class="k">True</span>,
+               timeout=settings.max_code_execution_seconds, env=safe_env)
+<span class="c"># output capped at 10,000 chars per stream; workspace shutil.rmtree'd in a finally block</span></pre>
+          </div>
+          <p class="card-intro" style="margin-top:14px;">A best-effort static guard scans for <code>.env</code>, <code>os.environ</code>, absolute-path <code>open()</code>, <code>subprocess.</code>, <code>socket.</code> before running — the module explicitly disclaims this as real security, trivially bypassed by string concatenation, encoding, or <code>exec(compile(...))</code>.</p>
+          <p class="docref"><code>.claude/rules/security.md</code>: <em>"Treat local subprocess execution as development-only, not a production sandbox."</em></p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 8. SESSIONS & MEMORY ============================= -->
+    <section class="topic" id="s8">
+      <details class="card">
+        <summary>
+          <span class="summary-num">08</span>
+          <span class="summary-title">Sessions, Memory &amp; Checkpointer</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">One JSON file per session, a bounded buffer of raw turns, and a running LLM-summarized tail for everything older.</p>
+
+          <details class="sub">
+            <summary>SessionStore — file-backed, cache-fronted</summary>
+            <div class="sub-body">
+              <p class="sub-desc">One file per session at <code>data/sessions/&lt;id&gt;.json</code>. An in-memory cache avoids re-reads within a process, but every write goes straight to disk. A monotonic per-session write counter breaks <code>list()</code>'s sort ties — <code>mtime_ns</code> alone proved insufficient (two writes microseconds apart can land on the identical value).</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Compact memory — buffered turns + a running summary</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><code>BUFFER_SIZE = 5</code> — the last 5 raw turns stay verbatim; anything older is folded into a running summary via <code>_extend_summary()</code>, itself defensively PII-redacted before persisting (belt-and-suspenders — every message should already be clean by the time it reaches history). Two flavors share this logic: <code>compact_history()</code> (plain dict in/out, for direct <code>AIProvider.complete()</code> calls) and <code>CompactingChatCompletionContext</code>, a real <code>autogen_core.model_context.BufferedChatCompletionContext</code> subclass used wherever an actual <code>AssistantAgent</code> is built.</p>
+              <p class="docref">Full design in <code>docs/memory.md</code>.</p>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>Checkpointer — automatic vs. named checkpoints</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><strong>turn_checkpoint</strong> — automatic, step-boundary progress marker, set on every <code>on_event</code> stage during a turn, cleared in a <code>finally:</code> block so it never survives past that turn. Lets a resumed UI say "your last turn didn't finish, here's where it got to."</p>
+              <p class="sub-desc"><strong>Named checkpoints</strong> (user-triggered) — <code>SessionStore.add_checkpoint()</code>, <code>list_checkpoints()</code>, <code>restore_checkpoint()</code>. Restore is truncation, not branching: it cuts <code>messages</code> back to the checkpoint's saved length, resets <code>memory_state</code>, and clears any pending workflow markers — deliberately not a tree of alternate futures.</p>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 9. SKILLS SYSTEM ============================= -->
+    <section class="topic" id="s9">
+      <details class="card">
+        <summary>
+          <span class="summary-num">09</span>
+          <span class="summary-title">Skills system</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">Every generation skill (docx, pptx, ppt, BRD/PRD) follows one contract: a <code>SKILL.md</code> with YAML frontmatter plus a fixed generation script. This is also the pattern Deck Builder reuses for its own generation step (§5).</p>
+
+          <details class="sub">
+            <summary>SKILL.md contract — questions, show_if, output, chat_triggers</summary>
+            <div class="sub-body">
+              <table class="ref">
+                <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+                <tbody>
+                  <tr><td>questions</td><td>Pre-flight form — id/prompt/type ("text"|"select"|"file"|"multiselect")/required</td></tr>
+                  <tr><td>show_if</td><td>Conditional visibility — <code>{question_id, includes|equals}</code></td></tr>
+                  <tr><td>output</td><td>File extension, or <code>"docx+pdf"</code> (the MULTI_FORMAT_OUTPUT sentinel)</td></tr>
+                  <tr><td>chat_triggers</td><td>Precise phrases for chat-message routing — narrower than the prose <code>trigger</code> field, to avoid false-positiving on common words</td></tr>
+                </tbody>
+              </table>
+              <div class="chiprow">
+                <span class="chip"><b>ppt-generator</b></span><span class="chip"><b>docx-generator</b></span>
+                <span class="chip"><b>pptx</b> — used by Deck Builder</span><span class="chip"><b>brd-prd-generator</b> — multi-format</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="sub">
+            <summary>The recurring pattern: model drafts JSON, app code runs it deterministically</summary>
+            <div class="sub-body">
+              <p class="sub-desc">This split appears everywhere generation happens in this app — worth recognizing as one idea, not four separate designs:</p>
+              <div class="flow">
+                <div class="flow-step"><span class="flow-idx">1</span><span class="flow-text"><strong>draft_spec()</strong> — the model produces a JSON object matching a documented shape (<code>json_mode=True</code>); a deterministic <code>_fallback_spec()</code> template covers the no-credentials/unparseable case</span></div>
+                <div class="flow-step"><span class="flow-idx">2</span><span class="flow-text"><strong>run_generation_script()</strong> — a fixed, pre-authored Python script turns that JSON into a real file via a scrubbed-env subprocess — the model never runs code itself</span></div>
+              </div>
+              <p class="sub-desc">Deck Builder's <code>_fallback_deck_spec()</code> is the same guarantee applied to the conversational flow: every generation path in this app works end-to-end with zero credentials configured.</p>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 10. ARTIFACTS ============================= -->
+    <section class="topic" id="s10">
+      <details class="card">
+        <summary>
+          <span class="summary-num">10</span>
+          <span class="summary-title">Artifacts &amp; downloads</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro"><code>ArtifactStore</code> (artifacts.py:62) — every downloadable file the app produces (approved code output, generated decks/docs), in one in-memory store. Explicitly <em>not</em> file-backed, by design: a process restart clears it — same posture as the rest of v1's in-memory-first infrastructure.</p>
+          <table class="ref">
+            <thead><tr><th>Route</th><th>Disposition</th><th>Use</th></tr></thead>
+            <tbody>
+              <tr><td>GET /artifacts/{id}</td><td>inline</td><td>Iframe embed / new-tab view — the one navigable-URL exception to POST-only</td></tr>
+              <tr><td>POST /api/artifacts/download</td><td>attachment</td><td>Explicit download, POST+blob per the API convention</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 11. FRONTEND ============================= -->
+    <section class="topic" id="s11">
+      <details class="card">
+        <summary>
+          <span class="summary-num">11</span>
+          <span class="summary-title">Frontend</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">A vanilla SPA — no framework, no build step. <code>static/index.html</code> + <code>static/app.js</code>.</p>
+          <div class="chiprow">
+            <span class="chip"><b>Copilot</b></span><span class="chip"><b>Knowledge</b></span><span class="chip"><b>Skills</b></span>
+            <span class="chip"><b>Sessions</b></span><span class="chip"><b>Agents &amp; Tools</b></span><span class="chip"><b>Settings</b></span>
+          </div>
+          <details class="sub">
+            <summary>Composer toggles — Agent mode, Web Search, Auto-generate</summary>
+            <div class="sub-body">
+              <p class="sub-desc">Three independent checkboxes. Web Search is gated behind Agent mode (only sent when both are on); Auto-generate is deliberately <em>not</em> gated behind Agent mode, since Deck Builder fires on a chat-trigger match regardless of that toggle (§5).</p>
+            </div>
+          </details>
+          <details class="sub">
+            <summary>Rendering — timelineChipsHtml, contextDisclosureHtml, guardrailActivityHtml</summary>
+            <div class="sub-body">
+              <p class="sub-desc"><strong>timelineChipsHtml</strong> — provider/model, agent, skill, source count, tool calls, and (via nested <code>artifactsHtml</code>) any generated file's real view/download links, built straight from what the backend actually returned. <strong>contextDisclosureHtml</strong> — the "🔍 View context sent to model" panel: system prompt, buffered memory, grounded prompt, raw response — captured from real backend events, never reconstructed client-side. <strong>guardrailActivityHtml</strong> — one line per finding, category and count only, never the matched text (§2).</p>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 12. DOCS INDEX ============================= -->
+    <section class="topic" id="s12">
+      <details class="card">
+        <summary>
+          <span class="summary-num">12</span>
+          <span class="summary-title">docs/*.md index</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">What already exists, so this page doesn't repeat it. Full-depth versions of most §1-§11 topics live here; this page adds the code-level "how," Deck Builder (no dedicated doc yet), and the gaps flagged above.</p>
+          <table class="ref">
+            <thead><tr><th>File</th><th>Covers</th></tr></thead>
+            <tbody>
+              <tr><td>agent-architecture.md</td><td>AgentOrchestrator/AutoGenOrchestrator boundary design</td></tr>
+              <tr><td>agent-overview.md</td><td>Broad agent-system overview, embedder/reranker caveat</td></tr>
+              <tr><td>agent-routing.md</td><td>AgentRegistry.select/select_llm routing detail</td></tr>
+              <tr><td>rag.md</td><td>Full RAG pipeline table, multi-tenancy, v2 status</td></tr>
+              <tr><td>guardrails.md</td><td>Checks list, redact-vs-block, UI surfaces</td></tr>
+              <tr><td>hitl.md</td><td>State machine, AutoGen agents — <span style="color:var(--rose);">stale on persistence</span></td></tr>
+              <tr><td>memory.md</td><td>Compact memory / buffered context design</td></tr>
+              <tr><td>observability.md</td><td>Langfuse tracing integration</td></tr>
+              <tr><td>multimodal.md</td><td>Image/vision attachment support</td></tr>
+              <tr><td>api.md</td><td>POST-only convention and rationale</td></tr>
+              <tr><td>runtime-settings.md</td><td>Live settings updates, reload_providers()</td></tr>
+              <tr><td>tools.md</td><td>MCP tool servers (general_tools, tavily_search)</td></tr>
+              <tr><td>acceptance-tests.md</td><td>Acceptance-test checklist</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================= 13. DIAGRAM ============================= -->
+    <section class="topic" id="s13">
+      <details class="card" id="diagram-card">
+        <summary>
+          <span class="summary-num">13</span>
+          <span class="summary-title">Request flow diagram</span>
+          <span class="summary-chevron">▸</span>
+        </summary>
+        <div class="card-body">
+          <p class="card-intro">The one fork every chat request actually goes through, and what each branch touches. Click any node for the file:line detail — same click-to-expand pattern as every section above, now spatial instead of a list.</p>
+
+          <figure style="margin:16px 0 4px;">
+            <svg id="flowSvg" viewBox="0 0 1180 760" role="img"
+                 aria-label="Enterprise Copilot request flow: a chat message passes the input guardrail, then CopilotService.chat routes it in strict order to an in-progress skill Q&A, an in-progress Deck Builder conversation, a fresh pptx trigger match into Deck Builder, a fresh skill-package trigger match into the fixed-question flow, agent mode into AutoGenOrchestrator, or a direct provider call — every path converges on the output guardrail before the response returns."
+                 style="max-width:100%; height:auto; font-family: var(--mono); user-select:none;">
+              <defs>
+                <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+                </marker>
+              </defs>
+              <g stroke="currentColor" fill="none" opacity="0.55">
+                <line x1="590" y1="60" x2="590" y2="142" marker-end="url(#arrow)"/>
+                <line x1="590" y1="232" x2="590" y2="266" marker-end="url(#arrow)"/>
+                <path d="M 480,300 L 130,300 L 130,340" marker-end="url(#arrow)"/>
+                <path d="M 520,300 L 340,300 L 340,340" marker-end="url(#arrow)"/>
+                <path d="M 660,300 L 840,300 L 840,340" marker-end="url(#arrow)"/>
+                <path d="M 700,300 L 1050,300 L 1050,340" marker-end="url(#arrow)"/>
+                <line x1="130" y1="390" x2="130" y2="430" marker-end="url(#arrow)"/>
+                <line x1="340" y1="390" x2="340" y2="430" marker-end="url(#arrow)"/>
+                <line x1="840" y1="390" x2="840" y2="430" marker-end="url(#arrow)"/>
+                <line x1="1050" y1="390" x2="1050" y2="430" marker-end="url(#arrow)"/>
+                <path d="M 130,480 L 130,560 L 560,560" marker-end="url(#arrow)"/>
+                <path d="M 340,480 L 340,560 L 560,560" marker-end="url(#arrow)" stroke-dasharray="4 3"/>
+                <path d="M 840,480 L 840,560 L 620,560" marker-end="url(#arrow)"/>
+                <path d="M 1050,480 L 1050,560 L 620,560" marker-end="url(#arrow)" stroke-dasharray="4 3"/>
+                <line x1="590" y1="610" x2="590" y2="646" marker-end="url(#arrow)"/>
+              </g>
+
+              <!-- edge labels -->
+              <g font-size="11" fill="currentColor" opacity="0.75">
+                <text x="600" y="80" text-anchor="start">allowed</text>
+                <text x="600" y="105" text-anchor="start">skill-Q&amp;A → Deck Builder →</text>
+                <text x="600" y="120" text-anchor="start">agent_mode → direct</text>
+                <text x="330" y="540" text-anchor="middle" font-style="italic">queued, resumes on approval</text>
+                <text x="1010" y="540" text-anchor="middle" font-style="italic">queued, resumes on approval</text>
+                <text x="605" y="630" text-anchor="start">redact / block</text>
+              </g>
+
+              <!-- gate: input guardrail -->
+              <g class="node" data-node="gate-in" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="470" y="12" width="240" height="48" rx="8" fill="none" stroke="currentColor"/>
+                <text x="590" y="31" text-anchor="middle" font-size="12" font-weight="600">check_input()</text>
+                <text x="590" y="47" text-anchor="middle" font-size="10" opacity="0.65">GuardrailService — regex only</text>
+              </g>
+
+              <!-- router -->
+              <g class="node" data-node="router" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="440" y="146" width="300" height="86" rx="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <text x="590" y="170" text-anchor="middle" font-size="13" font-weight="600">CopilotService.chat()</text>
+                <text x="590" y="188" text-anchor="middle" font-size="10.5" opacity="0.75">routing — checked in this exact order:</text>
+                <text x="590" y="204" text-anchor="middle" font-size="10" opacity="0.65">skill-Q&amp;A → Deck Builder → agent_mode → direct</text>
+                <text x="590" y="220" text-anchor="middle" font-size="9.5" opacity="0.55">services.py:1135</text>
+              </g>
+
+              <!-- 4 branch entry nodes -->
+              <g class="node" data-node="branch-skillqa" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="20" y="266" width="220" height="34" rx="7" fill="none" stroke="currentColor"/>
+                <text x="130" y="288" text-anchor="middle" font-size="11.5">pending_skill_run?</text>
+              </g>
+              <g class="node" data-node="branch-deckpending" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="260" y="266" width="220" height="34" rx="7" fill="none" stroke="currentColor"/>
+                <text x="370" y="288" text-anchor="middle" font-size="11.5">pending_deck_builder?</text>
+              </g>
+              <g class="node" data-node="branch-agentmode" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="740" y="266" width="200" height="34" rx="7" fill="none" stroke="currentColor"/>
+                <text x="840" y="288" text-anchor="middle" font-size="11.5">agent_mode on?</text>
+              </g>
+              <g class="node" data-node="branch-direct" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="960" y="266" width="200" height="34" rx="7" fill="none" stroke="currentColor"/>
+                <text x="1060" y="288" text-anchor="middle" font-size="11.5">nothing matched</text>
+              </g>
+
+              <!-- 4 subsystem destinations -->
+              <g class="node" data-node="dest-skillrun" data-jump="s9" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="20" y="340" width="220" height="50" rx="8" fill="none" stroke="currentColor"/>
+                <text x="130" y="360" text-anchor="middle" font-size="12" font-weight="600">SkillRunService</text>
+                <text x="130" y="376" text-anchor="middle" font-size="10" opacity="0.65">fixed Q&amp;A → draft_spec → §9</text>
+              </g>
+              <g class="node" data-node="dest-deckbuilder" data-jump="s5" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="260" y="340" width="220" height="50" rx="8" fill="var(--teal-soft)" stroke="var(--teal)" stroke-width="1.5"/>
+                <text x="370" y="360" text-anchor="middle" font-size="12" font-weight="600" fill="var(--teal-deep)">DeckBuilderOrchestrator</text>
+                <text x="370" y="376" text-anchor="middle" font-size="10" fill="var(--teal-deep)" opacity="0.85">MagenticOneGroupChat → §5</text>
+              </g>
+              <g class="node" data-node="dest-autogen" data-jump="s4" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="730" y="340" width="220" height="50" rx="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <text x="840" y="360" text-anchor="middle" font-size="12" font-weight="600">AutoGenOrchestrator</text>
+                <text x="840" y="376" text-anchor="middle" font-size="10" opacity="0.65">RAG + tools + HITL → §3 §4</text>
+              </g>
+              <g class="node" data-node="dest-provider" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="950" y="340" width="220" height="50" rx="8" fill="none" stroke="currentColor"/>
+                <text x="1060" y="360" text-anchor="middle" font-size="12" font-weight="600">AIProvider.complete()</text>
+                <text x="1060" y="376" text-anchor="middle" font-size="10" opacity="0.65">plain chat → §1</text>
+              </g>
+
+              <!-- second row: what each destination itself calls -->
+              <g class="node" data-node="sub-hitl-code" data-jump="s6" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="740" y="430" width="200" height="50" rx="8" fill="none" stroke="currentColor" stroke-dasharray="3 3"/>
+                <text x="840" y="450" text-anchor="middle" font-size="11.5" font-weight="600">HitlService</text>
+                <text x="840" y="466" text-anchor="middle" font-size="10" opacity="0.65">code_execution → §6</text>
+              </g>
+              <g class="node" data-node="sub-hitl-deck" data-jump="s6" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="960" y="430" width="200" height="50" rx="8" fill="none" stroke="currentColor" stroke-dasharray="3 3"/>
+                <text x="1060" y="450" text-anchor="middle" font-size="11.5" font-weight="600">HitlService</text>
+                <text x="1060" y="466" text-anchor="middle" font-size="10" opacity="0.65">deck_generation → §6</text>
+              </g>
+              <g class="node" data-node="sub-scriptrun" data-jump="s9" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="20" y="430" width="220" height="50" rx="8" fill="none" stroke="currentColor" stroke-dasharray="3 3"/>
+                <text x="130" y="450" text-anchor="middle" font-size="11.5" font-weight="600">run_generation_script()</text>
+                <text x="130" y="466" text-anchor="middle" font-size="10" opacity="0.65">scrubbed subprocess → §9</text>
+              </g>
+              <g class="node" data-node="sub-artifact" data-jump="s10" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="260" y="430" width="220" height="50" rx="8" fill="none" stroke="currentColor" stroke-dasharray="3 3"/>
+                <text x="370" y="450" text-anchor="middle" font-size="11.5" font-weight="600">ArtifactStore.add()</text>
+                <text x="370" y="466" text-anchor="middle" font-size="10" opacity="0.65">view/download → §10</text>
+              </g>
+
+              <!-- output gate -->
+              <g class="node" data-node="gate-out" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="470" y="560" width="240" height="50" rx="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <text x="590" y="581" text-anchor="middle" font-size="12" font-weight="600">check_output()</text>
+                <text x="590" y="598" text-anchor="middle" font-size="10" opacity="0.65">GuardrailService — every path reconverges here</text>
+              </g>
+
+              <!-- response -->
+              <g class="node" data-node="response" tabindex="0" role="button" aria-expanded="false" style="cursor:pointer;">
+                <rect x="490" y="646" width="200" height="42" rx="8" fill="none" stroke="currentColor"/>
+                <text x="590" y="672" text-anchor="middle" font-size="12" font-weight="600">SSE response</text>
+              </g>
+            </svg>
+            <figcaption style="font-size:12.5px; color:var(--ink-faint); margin-top:8px; max-width:76ch;">Solid arrows are the same-turn path; dashed arrows mark a hop that only happens after a separate, later HITL approval — that request returns immediately once queued, and the dashed continuation resumes asynchronously from <code style="font-family:var(--mono);">POST /api/hitl/decide</code>, not from this same request.</figcaption>
+          </figure>
+
+          <div id="diagram-detail" class="note" style="display:none; align-items:flex-start;">
+            <span class="glyph" id="diagram-detail-glyph">◇</span>
+            <div>
+              <strong id="diagram-detail-title"></strong>
+              <div id="diagram-detail-body" style="margin-top:4px;"></div>
+            </div>
+          </div>
+          <p id="diagram-hint" class="sub-desc" style="margin-top:14px;">Click a node above to see what it is and where it's defined.</p>
+        </div>
+      </details>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>Enterprise Copilot · Architecture Explorer</span>
+    <span>Generated from the codebase, not the other way around — verify against source before relying on any single claim here</span>
+  </footer>
+</div>
+
+<script>
+// Powers only the §13 diagram's click-to-expand nodes — every other
+// expand/collapse on this page is plain <details>/<summary>, no JS needed.
+// An SVG <g> can't be a <details> element, so this is the one place a
+// small script earns its keep, rather than reaching for it everywhere.
+(function () {
+  var NODE_INFO = {
+    "gate-in": {
+      title: "check_input() — GuardrailService.check_input()",
+      body: "Runs first, on every message, before anything else happens. Blocks on prompt-injection or unsafe-content patterns; redacts PII/secrets and lets the turn continue with the masked text. Pure regex — see §2.",
+    },
+    "router": {
+      title: "CopilotService.chat() — the routing decision",
+      body: "services.py:1135. Checked in this exact order on every allowed message: an in-progress skill Q&amp;A, then an in-progress Deck Builder conversation, then a fresh chat-trigger match (pptx → Deck Builder, anything else → skill Q&amp;A), then Agent Mode, then a direct provider call. Each branch below is one of those checks.",
+    },
+    "branch-skillqa": {
+      title: "pending_skill_run — an in-progress fixed-question flow",
+      body: "Set by SkillPackageStore.select_for_chat() matching any skill except pptx (docx-generator, ppt-generator, brd-prd-generator). Continues the existing Q&amp;A first if one is already underway on this session — see §9.",
+    },
+    "branch-deckpending": {
+      title: "pending_deck_builder — an in-progress conversational deck build",
+      body: "Set once a \"pptx\" chat-trigger match diverts into Deck Builder instead of the fixed-question form. Checked before a fresh trigger match, so a mid-conversation reply continues the same Magentic-One flow rather than restarting it — see §5.",
+    },
+    "branch-agentmode": {
+      title: "agent_mode — the Agent Mode toggle",
+      body: "Only reached once neither pending flow nor a fresh skill-package trigger matched. Routes into AutoGenOrchestrator.run() for LLM-based agent selection, RAG grounding, and MCP tool-calling — see §4.",
+    },
+    "branch-direct": {
+      title: "else — nothing matched",
+      body: "No pending flow, no skill trigger, Agent Mode off. Falls straight through to a plain AIProvider.complete() call — the cheapest path, still guardrail-checked on both sides.",
+    },
+    "dest-skillrun": {
+      title: "SkillRunService — fixed pre-flight Q&A",
+      body: "app/skills.py. Asks each skill's declared questions one at a time, then draft_spec() drafts a JSON spec (or falls back to a deterministic template with zero credentials) and hands it to run_generation_script(). See §9.",
+    },
+    "dest-deckbuilder": {
+      title: "DeckBuilderOrchestrator — Magentic-One conversational flow",
+      body: "app/agents.py:1063. A single-participant MagenticOneGroupChat that plans, asks clarifying questions, calls web_search, and produces a JSON spec as its final answer — no fixed question list. See §5.",
+    },
+    "dest-autogen": {
+      title: "AutoGenOrchestrator.run() — agent-mode routing",
+      body: "app/agents.py:545. LLM-based agent selection, RAG grounding with guardrail screening, real MCP tool-calling via AssistantAgent, and the coding-agent's HITL gate. See §3 and §4.",
+    },
+    "dest-provider": {
+      title: "AIProvider.complete() — plain chat",
+      body: "No agent, no skill, no tools — one call to whichever provider is configured (Mock / Gemini / Ollama, wrapped in FallbackProvider). See §1.",
+    },
+    "sub-hitl-code": {
+      title: "HitlService — kind: code_execution",
+      body: "The coding agent's own answer contains a fenced code block → queued for approval. On APPROVED, a real CodeExecutorAgent runs it in LocalSubprocessSandbox. See §6 and §7.",
+    },
+    "sub-hitl-deck": {
+      title: "HitlService — kind: deck_generation",
+      body: "Only reached when the Auto-generate toggle is off (the default). The drafted deck spec is queued; approval runs run_generation_script() directly — no agent involved, since the script itself is fixed and pre-reviewed. See §6.",
+    },
+    "sub-scriptrun": {
+      title: "run_generation_script() — deterministic file generation",
+      body: "A fixed, pre-authored script (never model-written code) turns a JSON spec into a real file via a scrubbed-env subprocess — the same split used by every generator in this app. See §9.",
+    },
+    "sub-artifact": {
+      title: "ArtifactStore.add() — the produced file becomes downloadable",
+      body: "In-memory store; the resulting StoredArtifact is what static/app.js's artifactsHtml() renders as View/Download links in the chat. See §10.",
+    },
+    "gate-out": {
+      title: "check_output() — GuardrailService.check_output()",
+      body: "Every path above reconverges here before the user ever sees a reply — PII/secrets redacted, unsafe content blocked outright. The one exception noted in §2: real token-by-token streaming has already sent deltas live by the time this runs, so a redaction here can only fix what's stored, not what was already rendered.",
+    },
+    "response": {
+      title: "SSE response",
+      body: "Delivered to static/app.js over /api/chat/stream — see §11 for how timelineChipsHtml/contextDisclosureHtml/guardrailActivityHtml render whatever came back.",
+    },
+  };
+
+  var panel = document.getElementById("diagram-detail");
+  var title = document.getElementById("diagram-detail-title");
+  var body = document.getElementById("diagram-detail-body");
+  var hint = document.getElementById("diagram-hint");
+  var svg = document.getElementById("flowSvg");
+  if (!svg) return;
+
+  var activeNode = null;
+
+  function selectNode(g) {
+    if (activeNode) activeNode.setAttribute("aria-expanded", "false");
+    var key = g.getAttribute("data-node");
+    var info = NODE_INFO[key];
+    if (!info) return;
+    activeNode = g;
+    g.setAttribute("aria-expanded", "true");
+    title.textContent = info.title;
+    var jump = g.getAttribute("data-jump");
+    body.innerHTML = info.body + (jump ? ' <a href="#' + jump + '" style="font-family:var(--mono); font-size:12px;">jump to §' + jump.replace("s", "") + " ↓</a>" : "");
+    panel.style.display = "flex";
+    hint.style.display = "none";
+  }
+
+  svg.querySelectorAll(".node").forEach(function (g) {
+    g.addEventListener("click", function () { selectNode(g); });
+    g.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectNode(g); }
+    });
+  });
+})();
+</script>
+</body>
+</html>
