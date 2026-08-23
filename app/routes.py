@@ -13,7 +13,8 @@ from .extraction import ExtractionError, extract_document, sanitize_filename
 from .models import (
     HealthResponse, ChatRequest, ChatResponse, ChatCancelRequest,
     DocumentCreate, DocumentUpdate, DocumentDelete, DocumentGet,
-    SessionStartRequest, SessionStartResponse, SessionGet,
+    SessionStartRequest, SessionStartResponse, SessionGet, SessionGetResponse,
+    CheckpointSaveRequest, CheckpointListRequest, CheckpointRestoreRequest,
     CodeExecuteSubmitRequest, HitlDecisionRequest, HitlRequestGet,
     SkillUpload, SkillDelete, SkillRunStart, SkillRunAnswer, SkillRunGet, SkillRunRegenerate,
     SkillRunUploadAnswerFile, SettingsModelsUpdate, ArtifactGet,
@@ -68,6 +69,7 @@ async def chat(request: ChatRequest):
     result = await service.chat(
         request.message, request.agent_mode, request.session_id,
         images=_images_payload(request), web_search=request.web_search,
+        auto_generate=request.auto_generate,
     )
     return ChatResponse(
         response=result["response"],
@@ -110,6 +112,7 @@ async def chat_stream(request: ChatRequest):
             async for event in service.chat_stream(
                 request.message, request.agent_mode, request.session_id, token, request.model,
                 images=_images_payload(request), web_search=request.web_search,
+                auto_generate=request.auto_generate,
             ):
                 await queue.put(event)
         except asyncio.CancelledError:
@@ -170,10 +173,44 @@ async def session_start():
 async def session_list():
     return {"sessions": service.sessions.list()}
 
-@router.post("/session/get")
+@router.post("/session/get", response_model=SessionGetResponse)
 async def session_get(request: SessionGet):
     try:
         return service.sessions.get(request.session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+# --- checkpoints: user-named save points a session can be rolled back to ---
+# (see app/storage.py:SessionStore.add_checkpoint/list_checkpoints/
+# restore_checkpoint and its module docstring). Distinct from
+# turn_checkpoint (automatic, one per in-flight turn, surfaced via plain
+# GET .../session/get above) — these are explicit, user-triggered, and
+# persist until deleted or restored past.
+
+@router.post("/session/checkpoint/save")
+async def session_checkpoint_save(request: CheckpointSaveRequest):
+    checkpoint = service.sessions.add_checkpoint(request.session_id, request.label)
+    if checkpoint is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return checkpoint
+
+@router.post("/session/checkpoint/list")
+async def session_checkpoint_list(request: CheckpointListRequest):
+    try:
+        return {"checkpoints": service.sessions.list_checkpoints(request.session_id)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+@router.post("/session/checkpoint/restore")
+async def session_checkpoint_restore(request: CheckpointRestoreRequest):
+    """Rolls the session back to a saved checkpoint — truncates messages,
+    resets memory_state, clears any pending_skill_run/turn_checkpoint. This
+    is destructive (messages after the checkpoint are discarded, not kept on
+    a branch); the client is expected to confirm with the user before
+    calling this. Returns the full updated session, same shape as
+    POST /session/get."""
+    try:
+        return service.sessions.restore_checkpoint(request.session_id, request.checkpoint_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 

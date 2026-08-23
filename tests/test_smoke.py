@@ -36,6 +36,63 @@ def test_session_start():
     assert r.status_code == 200
     assert r.json()["session_id"]
 
+def test_session_get_surfaces_turn_checkpoint_field():
+    r = client.post("/api/chat", json={"message": "hello checkpoint field"})
+    sid = r.json()["session_id"]
+    got = client.post("/api/session/get", json={"session_id": sid})
+    assert got.status_code == 200
+    data = got.json()
+    # No in-flight turn by the time the request returns — null, not absent.
+    assert data["turn_checkpoint"] is None
+    assert data["checkpoints"] == []
+    # Regression: SessionGetResponse (Pydantic response_model) must declare
+    # every field SessionStore.get() can actually return, or FastAPI
+    # silently filters it out of the JSON response even though the session
+    # file on disk has it — caught via live manual testing when
+    # pending_deck_builder was missing from this response despite being set
+    # correctly server-side (see app/services.py:DeckBuilderService).
+    assert "pending_deck_builder" in data
+    assert "last_deck_spec" in data
+    assert data["pending_deck_builder"] is None
+    assert data["last_deck_spec"] is None
+
+def test_checkpoint_save_list_restore_round_trip():
+    r1 = client.post("/api/chat", json={"message": "first turn"})
+    sid = r1.json()["session_id"]
+    client.post("/api/chat", json={"message": "second turn", "session_id": sid})
+
+    saved = client.post("/api/session/checkpoint/save", json={"session_id": sid, "label": "midpoint"})
+    assert saved.status_code == 200
+    checkpoint = saved.json()
+    assert checkpoint["label"] == "midpoint"
+
+    listed = client.post("/api/session/checkpoint/list", json={"session_id": sid})
+    assert listed.status_code == 200
+    assert any(c["checkpoint_id"] == checkpoint["checkpoint_id"] for c in listed.json()["checkpoints"])
+
+    client.post("/api/chat", json={"message": "third turn (should be discarded)", "session_id": sid})
+    restored = client.post(
+        "/api/session/checkpoint/restore",
+        json={"session_id": sid, "checkpoint_id": checkpoint["checkpoint_id"]},
+    )
+    assert restored.status_code == 200
+    assert len(restored.json()["messages"]) == checkpoint["message_count"]
+
+    got = client.post("/api/session/get", json={"session_id": sid})
+    assert len(got.json()["messages"]) == checkpoint["message_count"]
+
+def test_checkpoint_save_unknown_session_404():
+    r = client.post("/api/session/checkpoint/save", json={"session_id": "does-not-exist", "label": "x"})
+    assert r.status_code == 404
+
+def test_checkpoint_restore_unknown_checkpoint_404():
+    started = client.post("/api/session/start")
+    sid = started.json()["session_id"]
+    r = client.post(
+        "/api/session/checkpoint/restore", json={"session_id": sid, "checkpoint_id": "does-not-exist"},
+    )
+    assert r.status_code == 404
+
 def test_guardrails_status():
     r = client.post("/api/guardrails/status")
     assert r.status_code == 200
@@ -313,12 +370,30 @@ def test_chat_cancel_unknown_stream_404():
     assert r.status_code == 404
 
 def test_chat_stream_routes_to_skill_qa():
-    r = client.post("/api/chat/stream", json={"message": "make me a powerpoint about our roadmap"})
+    # docx-generator still uses the plain fixed-question flow — deck
+    # requests are the one skill that now diverts to Deck Builder instead
+    # (see test_chat_stream_routes_to_deck_builder below).
+    r = client.post("/api/chat/stream", json={"message": "write a proposal for the new tool"})
     events = _parse_sse_events(r.text)
     done = events[-1]
     assert done["type"] == "done"
     assert done["skill_run"]["status"] == "AWAITING_ANSWERS"
-    assert done["skill_run"]["skill_id"] == "ppt-generator"
+    assert done["skill_run"]["skill_id"] == "docx-generator"
+
+def test_chat_stream_routes_to_deck_builder():
+    # Deck requests now route to the richer `pptx` skill's conversational
+    # Deck Builder flow, not the fixed-question form — see
+    # skills/ppt-generator/SKILL.md's cleared chat_triggers. No skill_run is
+    # populated (that's the fixed-form mechanism); with no real model
+    # configured (MockProvider in tests), the turn degrades via
+    # _fallback_deck_spec and (auto_generate defaults False) queues a HITL
+    # approval rather than generating immediately.
+    r = client.post("/api/chat/stream", json={"message": "make me a powerpoint about our roadmap"})
+    events = _parse_sse_events(r.text)
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["skill_run"] is None
+    assert done["agent"] == "deck-builder"
 
 def test_hitl_double_decide_conflict():
     submit = client.post("/api/tools/code/submit", json={"code": "1+1"})

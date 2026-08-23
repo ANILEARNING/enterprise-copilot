@@ -16,6 +16,32 @@ SessionStore's method surface (create/get_or_create/append/list/get) is the
 contract the rest of the app depends on — a future DB-backed implementation
 swaps in behind the same methods, matching the AIProvider/CodeSandbox-style
 seams already used elsewhere (see app/providers.py, app/sandbox.py).
+
+Session-scoped in-progress-workflow markers — set via set_field(), read back
+as plain dict keys, both cleared once whatever they describe finishes:
+
+- "pending_skill_run": the chat-integrated skill Q&A flow's own progress
+  (run_id, skill_id, question_ids, index) — spans several distinct chat()
+  calls, gates routing itself (see CopilotService.chat). Unrelated in shape
+  to turn_checkpoint below; kept separate rather than unified since nothing
+  in this app treats them polymorphically as "the same kind of thing."
+- "turn_checkpoint": one in-flight chat()/agent-mode turn's last-known
+  stage — set by CopilotService.chat()'s emit() closure as
+  AutoGenOrchestrator.run()'s on_event stages fire, cleared the instant the
+  turn completes (every return path, including a guardrail-blocked input).
+  Advisory only: a stale marker (left behind by a crash) never gates a new
+  chat() call — it exists purely so a resumed UI can say "your last turn
+  didn't finish, here's where it got to," including a hitl_request_id
+  pointer when the interruption happened right at a code-execution approval
+  (see app/services.py:HitlService, now itself file-backed for exactly this
+  case — data/hitl-requests/<request_id>.json).
+- "checkpoints": user-triggered named save points (see add_checkpoint/
+  list_checkpoints/restore_checkpoint below) — a reference into `messages`
+  (message_count) plus a memory_state snapshot, not a duplicated transcript.
+  Restoring truncates back to that point; this is deliberately not branching
+  (no tree of alternate futures) — the minimal version of "let a user roll
+  back to a point they chose," consistent with this app's "keep files and
+  abstractions minimal" architecture rule.
 """
 from __future__ import annotations
 
@@ -115,6 +141,59 @@ class SessionStore:
             return
         session[key] = value
         self._write(session)
+
+    def add_checkpoint(self, session_id: str, label: str) -> dict | None:
+        """Snapshots the session's current message_count + memory_state as a
+        new named checkpoint the user can restore to later (see
+        restore_checkpoint). Returns the created checkpoint dict, or None for
+        an unknown session — same no-op-on-unknown posture as append()/
+        set_field(), since there's nothing meaningful to snapshot."""
+        session = self._load(session_id)
+        if session is None:
+            return None
+        checkpoint = {
+            "checkpoint_id": str(uuid4()),
+            "label": label,
+            "created_at": _now_iso(),
+            "message_count": len(session.get("messages", [])),
+            "memory_state": session.get("memory_state"),
+        }
+        checkpoints = session.setdefault("checkpoints", [])
+        checkpoints.append(checkpoint)
+        self._write(session)
+        return checkpoint
+
+    def list_checkpoints(self, session_id: str) -> list[dict]:
+        """This session's saved checkpoints, oldest first (creation order).
+        Raises KeyError for an unknown session, matching get()'s contract —
+        unlike add_checkpoint's no-op posture, listing implies the caller
+        already believes the session exists."""
+        return list(self.get(session_id).get("checkpoints", []))
+
+    def restore_checkpoint(self, session_id: str, checkpoint_id: str) -> dict:
+        """Rolls the session back to a previously saved checkpoint: truncates
+        `messages` to the checkpoint's message_count, resets `memory_state`
+        to its snapshot, and clears any pending_skill_run/turn_checkpoint
+        marker (both describe in-progress work that no longer applies once
+        history has been rewound under it). Every field changes in one
+        _write() call so the on-disk file never has a torn intermediate
+        state. This is truncation, not branching — messages after the
+        checkpoint are discarded, not preserved on some side branch; callers
+        (the UI) must confirm this destructively before calling.
+
+        Raises KeyError if the session or the checkpoint_id doesn't exist."""
+        session = self.get(session_id)  # raises KeyError if unknown
+        checkpoint = next(
+            (c for c in session.get("checkpoints", []) if c["checkpoint_id"] == checkpoint_id), None,
+        )
+        if checkpoint is None:
+            raise KeyError("Checkpoint not found")
+        session["messages"] = session.get("messages", [])[: checkpoint["message_count"]]
+        session["memory_state"] = checkpoint["memory_state"]
+        session["pending_skill_run"] = None
+        session["turn_checkpoint"] = None
+        self._write(session)
+        return session
 
     def list(self) -> list[dict]:
         """Summaries (no message bodies) for a session picker — newest first.

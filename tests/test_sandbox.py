@@ -133,6 +133,21 @@ def test_artifact_content_not_captured_when_script_fails():
 
 
 # --- HitlService integration: approval gates execution, result is captured -----
+#
+# HitlService(sandbox) below (no explicit data_dir=) now persists to disk at
+# a FIXED default path (settings.data_dir/hitl-requests when configured,
+# else the real repo data/ — see app/services.py, same pattern as
+# SessionStore.DEFAULT_DATA_DIR) so the real singleton keeps using the same
+# directory across a restart. This autouse fixture redirects settings.data_dir
+# to a fresh tmp_path per test instead, so this file's several bare
+# constructions don't share one real directory across test runs — same
+# isolation tests/test_storage.py's SessionStore(data_dir=tmp_path) gets.
+
+@pytest.fixture(autouse=True)
+def _isolate_hitl_requests(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    yield
+
 
 @pytest.mark.asyncio
 async def test_hitl_public_result_shape_matches_execution_result():

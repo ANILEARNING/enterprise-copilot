@@ -14,8 +14,9 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.base import Response
-from autogen_agentchat.messages import ToolCallExecutionEvent, ToolCallRequestEvent
+from autogen_agentchat.base import Response, TaskResult
+from autogen_agentchat.messages import TextMessage, ToolCallExecutionEvent, ToolCallRequestEvent
+from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_core import CancellationToken
 
 from .config import settings
@@ -26,6 +27,7 @@ from .memory import (
     history_to_llm_messages, llm_messages_to_plain, render_memory_preview,
 )
 from .providers import AIProvider, GeminiProvider, MockProvider, describe_embedding_config
+from .skills import _extract_json
 from .streaming import build_streaming_model_client, build_user_message
 
 logger = logging.getLogger(__name__)
@@ -148,6 +150,38 @@ _WEB_SEARCH_SYSTEM_ADDENDUM = (
     "outdated. If web_search returns no useful result, say so explicitly "
     "instead of falling back to a guess."
 )
+
+
+# --- Deck Builder system prompt ----------------------------------------------
+#
+# Distinct from _build_agent_mode_system_message above: this drives a
+# MagenticOneGroupChat's single participant (DeckBuilderOrchestrator, near
+# the bottom of this file), not the plain agent-mode AssistantAgent. Embeds
+# the pptx skill's own SKILL.md body (skill.instructions) directly, since
+# Deck Builder bypasses SkillRunService/draft_spec entirely (app/skills.py)
+# — that skill's Workflow/design-principles content has to reach the model
+# through this call site instead.
+_DECK_BUILDER_BASE_INSTRUCTIONS = (
+    "You are Enterprise Copilot's Deck Builder — a conversational assistant "
+    "that plans, researches, and drafts PowerPoint presentations. You have a "
+    "web_search tool: use it whenever the deck needs real, current, or "
+    "specific factual data (numbers, dates, named facts) rather than "
+    "guessing or inventing plausible-sounding figures.\n\n"
+    "If the user's request is genuinely underspecified — you don't know the "
+    "topic, audience, or tone — ask ONE short clarifying question and stop; "
+    "do not ask more than a couple of questions total across the "
+    "conversation, and never ask about something the user already told you.\n\n"
+    "Once you have enough to build the deck (topic, audience, and tone, at "
+    "minimum), respond with ONLY a single JSON object matching the spec "
+    "shape documented in the skill instructions below — no prose, no "
+    "markdown code fence, no explanation before or after it. If you are "
+    "still gathering information or asking a question, respond with plain "
+    "prose instead (never partial or placeholder JSON)."
+)
+
+
+def _build_deck_builder_system_message(skill_instructions: str) -> str:
+    return f"{_DECK_BUILDER_BASE_INSTRUCTIONS}\n\n---\n\n{skill_instructions}"
 
 
 def _build_agent_mode_system_message(agent_name: str, tool_names: set[str]) -> str:
@@ -574,6 +608,21 @@ class AutoGenOrchestrator(AgentOrchestrator):
                     "stage": "context_guardrail_blocked",
                     "label": f"Guardrails filtered {len(blocked)} retrieved chunk(s) before use.",
                 })
+            # PII redaction — a distinct concern from the injection screen
+            # above (which drops a chunk outright); this one masks and
+            # KEEPS every remaining chunk, so it runs after that screen has
+            # already settled which chunks survive. Covers both what goes
+            # into the prompt (`joined`, below) and what's returned as
+            # citations (OrchestrationResult.sources -> ChatResponse.sources
+            # -> the UI's "Sources" panel) — retrieval-time only, per
+            # docs/rag.md: the documents themselves stay stored unredacted.
+            sources, pii_findings = self.guardrails.redact_context_pii(sources)
+            if pii_findings["redacted_count"]:
+                await _emit(on_event, {
+                    "stage": "context_pii_redacted",
+                    "label": f"Guardrails redacted PII in {pii_findings['redacted_count']} retrieved chunk(s).",
+                })
+            context_guardrail = {**context_guardrail, **pii_findings}
         if sources:
             # The retrieval gate is a cheap lexical/vector heuristic (see docs/rag.md's
             # caveat) — on a small corpus it will sometimes surface a weak/irrelevant
@@ -972,3 +1021,136 @@ class AutoGenOrchestrator(AgentOrchestrator):
         sent_messages = await model_context.get_messages()
         memory_preview = render_memory_preview(llm_messages_to_plain(sent_messages))
         return final_text, called, deduped_sources, model_context.state, memory_preview
+
+
+# --- Deck Builder: a Magentic-One-driven conversational deck-building flow ---
+#
+# Structurally distinct from AutoGenOrchestrator above (open-ended
+# conversational loop, JSON-final-answer, no agent/skill/RAG routing), so
+# this is a separate class, not a method on it. Exposes one narrow method —
+# run_turn() — matching AgentOrchestrator's own narrow-contract discipline:
+# app/services.py only ever calls this, never touches raw autogen_agentchat
+# types directly (see .claude/rules/autogen-maf.md).
+
+_DECK_BUILDER_MAX_TURNS = 8  # each chat turn launches a FRESH, bounded run — not one long-lived 20-turn conversation
+
+
+def _fallback_deck_spec(task_brief: str) -> dict:
+    """Deterministic, LLM-free spec builder — engaged whenever no real model
+    client is available (mirrors app/skills.py:_fallback_spec's "every skill
+    works end-to-end with zero credentials" guarantee, and
+    _run_with_tools' model_client is None skip). Never raises; always
+    produces a usable, if generic, single-slide deck from whatever brief
+    text accumulated so far."""
+    title = (task_brief.strip().splitlines()[0] if task_brief.strip() else "Untitled Presentation")[:80]
+    return {
+        "title": title, "subtitle": "", "theme": "midnight_executive",
+        "slides": [{"layout": "bullets", "title": "Overview", "bullets": [task_brief.strip()[:300] or title]}],
+    }
+
+
+@dataclass
+class DeckBuilderResult:
+    # Exactly one of these is meaningful, depending on what the Magentic-One
+    # run's final answer turned out to be this turn.
+    clarifying_text: str | None = None   # a question/status to show the user; spec is None, phase stays "clarifying"
+    spec: dict | None = None              # a parsed, ready-to-generate deck spec; clarifying_text is None
+    used_fallback: bool = False           # True whenever _fallback_deck_spec ran (no model client, or unparseable JSON)
+    provider: str | None = None
+    model: str | None = None
+
+
+class DeckBuilderOrchestrator:
+    """Runs one Magentic-One turn for the Deck Builder flow. See
+    app/services.py:DeckBuilderService for the session-state machinery
+    (accumulating task_brief across turns, HITL hand-off) that calls this."""
+
+    def __init__(self, skill):
+        # `skill`: the pptx SkillPackage (app/skills.py) — its `instructions`
+        # (SKILL.md body) is embedded in the system message so this flow's
+        # Workflow/design guidance reaches the model even though it bypasses
+        # SkillRunService/draft_spec entirely.
+        self.skill = skill
+
+    async def run_turn(self, task: str, context: dict, on_event: EventSink | None = None) -> DeckBuilderResult:
+        """`task`: the accumulated task_brief (original request + prior
+        clarifying Q&A) plus this turn's new user message, already merged by
+        the caller. `context`: currently unused beyond being available for
+        future extension (mirrors AutoGenOrchestrator.run()'s signature
+        shape) — session_id/etc. aren't needed here since this method is
+        stateless per call."""
+        model_client, provider_name, model_name = build_streaming_model_client(function_calling=True)
+        if model_client is None:
+            await _emit(on_event, {"stage": "drafting_spec", "label": "No model configured — using a basic deck."})
+            return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True)
+
+        try:
+            tools = await get_mcp_tools(web_search=True)
+            agent = AssistantAgent(
+                "deck_builder", model_client=model_client, tools=tools,
+                system_message=_build_deck_builder_system_message(self.skill.instructions),
+                reflect_on_tool_use=True,
+            )
+            team = MagenticOneGroupChat([agent], model_client=model_client, max_turns=_DECK_BUILDER_MAX_TURNS)
+            final_text = await self._run_magentic_one(team, task, on_event)
+        except Exception as exc:  # noqa: BLE001 - a Magentic-One failure must degrade, never break the turn
+            logger.warning("Deck Builder Magentic-One run failed, falling back to a basic deck: %s", exc)
+            return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True)
+        finally:
+            await model_client.close()
+
+        if not (final_text or "").strip():
+            return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True)
+
+        spec = _extract_json(final_text)
+        if spec is None or not isinstance(spec, dict) or not spec.get("title"):
+            # Doesn't parse as a spec-shaped JSON object -> treat as a
+            # clarifying question/status, not a failure. The caller keeps
+            # the session in "clarifying" phase and shows this text as the
+            # chat response.
+            return DeckBuilderResult(clarifying_text=final_text.strip(), provider=provider_name, model=model_name)
+
+        return DeckBuilderResult(spec=spec, provider=provider_name, model=model_name)
+
+    async def _run_magentic_one(self, team: MagenticOneGroupChat, task: str, on_event: EventSink | None) -> str:
+        """Consumes MagenticOneGroupChat.run_stream()'s event shape — DIFFERENT
+        from AutoGenOrchestrator._run_with_tools' on_messages_stream/Response
+        (MagenticOneGroupChat has no on_messages_stream; it's a BaseGroupChat,
+        not a ChatAgent). The final event is a TaskResult, not a Response.
+        Reuses the exact same ToolCallRequestEvent/ToolCallExecutionEvent
+        classes _run_with_tools already consumes for the participant agent's
+        own tool calls (these fold into the group's event stream unchanged),
+        plus a new "planning" stage for the orchestrator's own plan/ledger
+        TextMessages — there is no dedicated plan/progress-ledger event type
+        in this AutoGen version, confirmed by inspecting the installed
+        package: the orchestrator only ever emits plain TextMessage."""
+        token = CancellationToken()
+        final_text = ""
+        async for event in team.run_stream(task=task, cancellation_token=token):
+            if isinstance(event, ToolCallRequestEvent):
+                for call in event.content:
+                    await _emit(on_event, {
+                        "stage": "researching", "label": f"Calling {call.name}…",
+                        "tool": call.name, "arguments": call.arguments,
+                    })
+            elif isinstance(event, ToolCallExecutionEvent):
+                for result in event.content:
+                    await _emit(on_event, {
+                        "stage": "researching",
+                        "label": f"{result.name} failed." if result.is_error else f"{result.name} → done.",
+                        "tool": result.name, "is_error": result.is_error,
+                    })
+                    if result.name == "web_search" and not result.is_error:
+                        parsed = _parse_web_search_result(result.content)
+                        if parsed:
+                            await _emit(on_event, {
+                                "stage": "web_sources", "label": f"{len(parsed)} web source(s) found.",
+                                "sources": parsed,
+                            })
+            elif isinstance(event, TextMessage) and event.source == "MagenticOneOrchestrator":
+                await _emit(on_event, {"stage": "planning", "label": str(event.content)[:200]})
+            elif isinstance(event, TaskResult):
+                final_text = event.messages[-1].content if event.messages else ""
+                if not isinstance(final_text, str):
+                    final_text = str(final_text)
+        return final_text

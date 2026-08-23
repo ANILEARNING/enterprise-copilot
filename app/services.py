@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from uuid import uuid4
 from autogen_core import CancellationToken
 
 from .agents import (
-    AgentOrchestrator, AutoGenOrchestrator,
+    AgentOrchestrator, AutoGenOrchestrator, DeckBuilderOrchestrator,
     default_agent_registry, default_skill_registry, reset_router_provider_cache,
 )
 from .artifacts import ArtifactStore
@@ -27,10 +28,10 @@ from .providers import (
 )
 from .retrieval import (
     BM25Index, ParentChildChunk, chunk_blocks, chunk_text, compress_context, cosine_similarity,
-    dedupe_results, embed, lexical_rerank_score, reciprocal_rank_fusion, tokenize,
+    dedupe_results, embed, lexical_rerank_score, reciprocal_rank_fusion, redact_pii, tokenize,
 )
 from .sandbox import CodeSandbox, build_sandbox
-from .skills import SkillPackageStore, SkillRunService
+from .skills import SkillPackageError, SkillPackageStore, SkillRunService, run_generation_script
 from .storage import SessionStore
 from .streaming import stream_chat
 from .vector_store import VectorPoint, VectorStore, build_vector_store
@@ -71,10 +72,31 @@ class HitlService:
     record bookkeeping and the REST surface, plus (await_decision below) a
     way for a live agent-mode turn to genuinely wait for a decision instead
     of only ever polling.
+
+    Persisted to disk (data/hitl-requests/<request_id>.json), one file per
+    request — same file-backed + in-memory-cache + write-through pattern as
+    SessionStore (app/storage.py) and SkillRunService (app/skills.py), added
+    so a WAITING_FOR_APPROVAL request survives a process restart instead of
+    silently vanishing (a session's turn_checkpoint can reference a
+    request_id that must still resolve after a restart — see
+    app/storage.py's module docstring). _decision_futures stays in-memory
+    only: a Future can't survive a restart regardless, so a live SSE wait
+    that was in progress during a crash simply reads back as "queued"
+    afterward, same as the already-existing non-live path.
     """
 
-    def __init__(self, sandbox: CodeSandbox, artifacts: ArtifactStore | None = None):
+    def __init__(
+        self, sandbox: CodeSandbox, artifacts: ArtifactStore | None = None, data_dir: Path | None = None,
+        skill_store: "SkillPackageStore | None" = None,
+    ):
         self.sandbox = sandbox
+        # Needed only for kind == "deck_generation" records' decide() branch
+        # (resolves record["skill_id"] -> the real SkillPackage to invoke
+        # run_generation_script against). Optional/defaulted so existing
+        # direct HitlService(sandbox) construction (tests, and any call site
+        # that never submits a deck-generation request) keeps working —
+        # decide() only dereferences this when it actually needs to.
+        self._skill_store = skill_store
         self.requests: dict[str, dict] = {}
         # request_id -> every Future currently awaiting this request's
         # decision (see await_decision/await_human_decision in
@@ -87,6 +109,49 @@ class HitlService:
         # persisted — see decide() below. Optional/defaulted so existing
         # direct HitlService(sandbox) construction (tests) keeps working.
         self.artifacts = artifacts or ArtifactStore()
+        # A FIXED default (settings.data_dir/hitl-requests when configured,
+        # else this repo's real data/hitl-requests/) — same pattern as
+        # SessionStore.DEFAULT_DATA_DIR (app/storage.py), deliberately NOT a
+        # fresh uuid-per-instance directory like RAGStore.__init__'s bare-
+        # construction default: the whole point of persisting HITL requests
+        # is that the real CopilotService singleton's data survives a
+        # process restart, and a restart constructs a brand new HitlService
+        # with data_dir=None — a per-instance uuid default would silently
+        # start that singleton's real, in-production storage over from
+        # empty on every single restart, defeating this feature entirely.
+        # Tests that construct HitlService(sandbox) directly and need
+        # isolation from each other pass their own data_dir=tmp_path, same
+        # convention already used by SessionStore/SkillPackageStore tests.
+        self.data_dir = data_dir or (
+            Path(settings.data_dir) / "hitl-requests" if settings.data_dir
+            else Path(__file__).resolve().parent.parent / "data" / "hitl-requests"
+        )
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._load_requests()
+
+    def _record_path(self, request_id: str) -> Path:
+        return self.data_dir / f"{request_id}.json"
+
+    def _persist(self, record: dict) -> None:
+        try:
+            self._record_path(record["request_id"]).write_text(json.dumps(record, indent=2), encoding="utf-8")
+        except OSError as exc:
+            # A disk-write failure shouldn't take the request down — the
+            # in-memory copy still has this record, it just won't survive a
+            # restart, same posture as SessionStore._write/SkillRunService._write.
+            logger.warning("Could not persist HITL request %s: %s", record["request_id"], exc)
+        self.requests[record["request_id"]] = record
+
+    def _load_requests(self) -> None:
+        if not self.data_dir.is_dir():
+            return
+        for path in sorted(self.data_dir.glob("*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Could not read HITL request file %s: %s", path, exc)
+                continue
+            self.requests[record["request_id"]] = record
 
     def submit_code_execution(self, code: str, session_id: str | None) -> dict:
         request_id = str(uuid4())
@@ -101,7 +166,31 @@ class HitlService:
             "created_at": now_iso(),
             "decided_at": None,
         }
-        self.requests[request_id] = record
+        self._persist(record)
+        return record
+
+    def submit_deck_generation(self, spec: dict, skill_id: str, session_id: str | None) -> dict:
+        """Queues a drafted Deck Builder spec for approval — the Auto-generate
+        OFF path (app/services.py:DeckBuilderService, app/models.py:
+        ChatRequest.auto_generate). Mirrors submit_code_execution's shape;
+        `deck_spec`/`skill_id` are what decide() needs below to actually run
+        generate_pptx.py once approved, since (unlike code_execution) there's
+        no arbitrary code here to re-extract from the request — the spec
+        itself IS the payload."""
+        request_id = str(uuid4())
+        record = {
+            "request_id": request_id,
+            "kind": "deck_generation",
+            "session_id": session_id,
+            "deck_spec": spec,
+            "skill_id": skill_id,
+            "status": "WAITING_FOR_APPROVAL",
+            "result": None,
+            "downloadable_artifacts": [],
+            "created_at": now_iso(),
+            "decided_at": None,
+        }
+        self._persist(record)
         return record
 
     def await_decision(self, request_id: str) -> asyncio.Future:
@@ -146,6 +235,32 @@ class HitlService:
                     for filename, content in result.artifact_files.items()
                 ]
                 record["status"] = "COMPLETED"
+            elif record["kind"] == "deck_generation":
+                # Unlike code_execution, there's no arbitrary code to run
+                # here — generate_pptx.py is a fixed, already-reviewed
+                # script; the only thing this approval actually gates is
+                # WHEN it runs, not whether the script itself is safe to
+                # execute (same category as every other skill's generation
+                # script, none of which are HITL-gated at all — see
+                # DeckBuilderService for the Auto-generate ON path that
+                # skips this record/approval entirely).
+                try:
+                    skill = self._skill_store.get(record["skill_id"])
+                    output_paths = run_generation_script(skill, record["deck_spec"])
+                    record["downloadable_artifacts"] = [
+                        self.artifacts.add(
+                            f"{skill.name}.{skill.output}", output_paths[0].read_bytes(),
+                            session_id=record.get("session_id"), hitl_request_id=request_id,
+                        ).public()
+                    ]
+                    record["status"] = "COMPLETED"
+                except (SkillPackageError, KeyError, OSError) as exc:
+                    # Approval was already granted — a generation failure is
+                    # a result detail to show the user, not a reason to undo
+                    # the decision or leave the request stuck WAITING.
+                    record["status"] = "COMPLETED"
+                    record["result"] = {"ok": False, "error": str(exc)}
+        self._persist(record)
         for future in self._decision_futures.pop(request_id, []):
             if not future.done():
                 future.set_result(record)
@@ -180,18 +295,6 @@ class GuardrailService:
         "print environment variables",
     )
 
-    # --- PII: detected AND redacted, not just flagged ---------------------
-    # Each pattern is (category, compiled regex, mask). Order matters: card
-    # before phone (both are digit runs) so a 16-digit card number, once
-    # redacted, can't also get partially eaten by the phone pattern.
-    _PII_PATTERNS: tuple[tuple[str, re.Pattern, str], ...] = (
-        ("email", re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"), "[REDACTED_EMAIL]"),
-        ("credit_card", re.compile(r"\b\d(?:[ -]?\d){12,15}\b"), "[REDACTED_CARD]"),
-        ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[REDACTED_SSN]"),
-        ("phone", re.compile(r"\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]\d{3}[ -]\d{4}\b"), "[REDACTED_PHONE]"),
-        ("ip_address", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
-    )
-
     # --- Sensitive data / secrets: config-shaped key=value & token literals
     _SECRET_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         ("api_key", re.compile(r"(?i)\b(api[_-]?key|apikey)\s*[:=]\s*\S+")),
@@ -216,18 +319,47 @@ class GuardrailService:
     }
 
     def _redact_pii(self, text: str) -> tuple[str, list[dict]]:
-        findings: list[dict] = []
-        redacted = text
-        for category, pattern, mask in self._PII_PATTERNS:
-            count = 0
-            def _sub(m: re.Match, _mask=mask) -> str:
-                nonlocal count
-                count += 1
-                return _mask
-            redacted = pattern.sub(_sub, redacted)
-            if count:
-                findings.append({"category": category, "count": count})
-        return redacted, findings
+        # Delegates to the shared primitive in app/retrieval.py — see that
+        # module's "PII redaction" section for why it lives there (needed by
+        # app/memory.py too, which can't import GuardrailService without a
+        # circular import). Kept as a thin instance-method wrapper so
+        # check_input/check_output below (and any other GuardrailService
+        # caller) don't need to change.
+        return redact_pii(text)
+
+    def redact_context_pii(self, chunks: list[dict]) -> tuple[list[dict], dict]:
+        """Redacts PII in each retrieved RAG chunk's `snippet` field — see
+        AutoGenOrchestrator.run() (app/agents.py), which calls this on
+        `sources` right after the existing check_context() indirect-
+        prompt-injection screen and before they're joined into the prompt /
+        returned as citations (OrchestrationResult.sources ->
+        ChatResponse.sources). Unlike check_context, a chunk is NEVER
+        dropped here — a PII-bearing snippet is still relevant grounding
+        content once masked, so this redacts and keeps every chunk, in the
+        same order, returning fresh dicts (the caller's list/dicts are never
+        mutated in place).
+
+        Returns (chunks_with_redacted_snippets, findings) where findings
+        mirrors check_input/check_output's shape: {"pii": [{"category",
+        "count"}, ...], "redacted_count": N} — N is how many chunks actually
+        had something redacted (not how many PII matches total), so the UI
+        can say "PII redacted in 2 retrieved chunk(s)."."""
+        redacted_chunks: list[dict] = []
+        all_pii: list[dict] = []
+        redacted_count = 0
+        for chunk in chunks:
+            redacted_snippet, pii = self._redact_pii(chunk.get("snippet", ""))
+            if pii:
+                chunk = dict(chunk)
+                chunk["snippet"] = redacted_snippet
+                redacted_count += 1
+                all_pii.extend(pii)
+            redacted_chunks.append(chunk)
+        merged: dict[str, int] = {}
+        for finding in all_pii:
+            merged[finding["category"]] = merged.get(finding["category"], 0) + finding["count"]
+        findings = {"pii": [{"category": k, "count": v} for k, v in merged.items()], "redacted_count": redacted_count}
+        return redacted_chunks, findings
 
     def _detect_secrets(self, text: str) -> list[dict]:
         findings = []
@@ -697,6 +829,111 @@ class RAGStore:
         VectorStore.health()."""
         return await self.vector_store.health()
 
+
+async def _deck_emit(on_event, event: dict) -> None:
+    if on_event is not None:
+        await on_event(event)
+
+
+class DeckBuilderService:
+    """Owns the Deck Builder session-state machinery — a conversational,
+    web-search-capable alternative to SkillRunService's fixed-question flow,
+    specifically for the "pptx" skill (app/agents.py:DeckBuilderOrchestrator
+    does the actual Magentic-One run; this class owns what happens around
+    it: accumulating the running task_brief across chat turns, and the
+    Auto-generate ON (generate immediately) vs. OFF (queue through
+    HitlService) split — see app/models.py:ChatRequest.auto_generate).
+
+    Mirrors SkillRunService's shape (start/continue, a small owned bit of
+    session state) but for an open-ended loop rather than a fixed question
+    list — deliberately NOT built on SkillRunSession/pending_skill_run,
+    which is shaped for exactly-linear Q&A, a poor fit here.
+    """
+
+    def __init__(self, skill_packages: SkillPackageStore, hitl: HitlService,
+                 artifacts: ArtifactStore, sessions: SessionStore):
+        self.skill_packages = skill_packages
+        self.hitl = hitl
+        self.artifacts = artifacts
+        self.sessions = sessions
+
+    def _orchestrator_for(self, skill) -> DeckBuilderOrchestrator:
+        return DeckBuilderOrchestrator(skill)
+
+    async def _run_and_handle(
+        self, session_id: str, skill_id: str, task_brief: str, auto_generate: bool,
+        on_event=None,
+    ) -> tuple[str, dict]:
+        """Runs one Deck Builder turn and applies its result: a clarifying
+        question keeps `pending_deck_builder` set (phase stays "clarifying"),
+        a ready spec either generates immediately (auto_generate=True) or is
+        queued through HitlService (False, the default). Always clears
+        `pending_deck_builder` except on the clarifying-question path.
+        Returns (chat response text, meta dict for CopilotService.chat's
+        `meta`/`skill_run`-equivalent surface)."""
+        skill = self.skill_packages.get(skill_id)
+        orchestrator = self._orchestrator_for(skill)
+        result = await orchestrator.run_turn(task_brief, {"session_id": session_id}, on_event=on_event)
+
+        if result.spec is None:
+            # Still clarifying — keep the conversation going.
+            self.sessions.set_field(session_id, "pending_deck_builder", {
+                "skill_id": skill_id, "phase": "clarifying", "auto_generate": auto_generate,
+                "task_brief": task_brief, "hitl_request_id": None,
+            })
+            return result.clarifying_text or "Could you tell me a bit more about the deck you want?", {
+                "deck_builder": {"phase": "clarifying"}, "downloadable_artifacts": [],
+            }
+
+        if auto_generate:
+            try:
+                output_paths = run_generation_script(skill, result.spec)
+                artifact = self.artifacts.add(
+                    f"{skill.name}.{skill.output}", output_paths[0].read_bytes(), session_id=session_id,
+                ).public()
+                self.sessions.set_field(session_id, "pending_deck_builder", None)
+                self.sessions.set_field(session_id, "last_deck_spec", result.spec)
+                return (
+                    f"Done! Generated **{artifact['filename']}** — view or download it below.",
+                    {"deck_builder": {"phase": "completed"}, "downloadable_artifacts": [artifact]},
+                )
+            except SkillPackageError as exc:
+                self.sessions.set_field(session_id, "pending_deck_builder", None)
+                return f"Couldn't generate the deck: {exc}", {
+                    "deck_builder": {"phase": "failed"}, "downloadable_artifacts": [],
+                }
+
+        # Auto-generate OFF (default): queue for approval, don't run yet.
+        record = self.hitl.submit_deck_generation(result.spec, skill_id, session_id)
+        self.sessions.set_field(session_id, "pending_deck_builder", None)
+        self.sessions.set_field(session_id, "last_deck_spec", result.spec)
+        await _deck_emit(on_event, {
+            "stage": "queued_for_approval",
+            "label": "Deck spec ready — waiting for your approval in Agents & Tools.",
+            "request_id": record["request_id"],
+        })
+        return (
+            f"I've drafted the deck (**{result.spec.get('title', 'Untitled')}**) and queued it for your "
+            "approval — check Pending approvals to review and generate it.",
+            {"deck_builder": {"phase": "awaiting_approval", "hitl_request_id": record["request_id"]},
+             "downloadable_artifacts": []},
+        )
+
+    async def start(self, session_id: str, skill, message: str, auto_generate: bool, on_event=None) -> tuple[str, dict]:
+        last_spec = self.sessions.get(session_id).get("last_deck_spec")
+        task_brief = (
+            f"The user previously had this deck generated:\n{json.dumps(last_spec)}\n\n"
+            f"They now want this change: {message}"
+        ) if last_spec else message
+        return await self._run_and_handle(session_id, skill.skill_id, task_brief, auto_generate, on_event=on_event)
+
+    async def continue_turn(self, session_id: str, pending: dict, message: str, on_event=None) -> tuple[str, dict]:
+        task_brief = f"{pending['task_brief']}\n\nUser: {message}"
+        return await self._run_and_handle(
+            session_id, pending["skill_id"], task_brief, pending["auto_generate"], on_event=on_event,
+        )
+
+
 class CopilotService:
     def __init__(self, data_dir: Path | str | None = None):
         """`data_dir`: root directory for every file-backed store this
@@ -718,17 +955,28 @@ class CopilotService:
         self.sessions = SessionStore(data_dir=resolved_dir / "sessions" if resolved_dir else None)
         self.sandbox = build_sandbox()
         self.artifacts = ArtifactStore()
-        self.hitl = HitlService(self.sandbox, artifacts=self.artifacts)
+        self.skill_packages = SkillPackageStore(data_dir=resolved_dir / "skills" if resolved_dir else None)
+        self.hitl = HitlService(
+            self.sandbox, artifacts=self.artifacts,
+            data_dir=resolved_dir / "hitl-requests" if resolved_dir else None,
+            skill_store=self.skill_packages,
+        )
         self.agent_registry = default_agent_registry()
         self.skill_registry = default_skill_registry()
         self.orchestrator: AgentOrchestrator = AutoGenOrchestrator(
             self.provider, self.agent_registry, self.skill_registry, self.rag, self.hitl,
             guardrails=self.guardrails,
         )
-        self.skill_packages = SkillPackageStore(data_dir=resolved_dir / "skills" if resolved_dir else None)
         self.skill_runs = SkillRunService(
             self.skill_packages, self.provider, data_dir=resolved_dir / "skill-runs" if resolved_dir else None,
         )
+        # Deck Builder: a conversational, research-capable alternative to the
+        # fixed-question skill-run flow, specifically for the "pptx" skill —
+        # see CopilotService.chat()'s routing and _start_deck_builder/
+        # _continue_deck_builder below. DeckBuilderOrchestrator itself is
+        # stateless (app/agents.py) — this service owns the session-state
+        # machinery (pending_deck_builder) and the HITL/auto-generate split.
+        self.deck_builder = DeckBuilderService(self.skill_packages, self.hitl, self.artifacts, self.sessions)
 
     def reload_providers(self) -> None:
         """Rebuilds every provider instance derived from `settings` after a
@@ -761,7 +1009,7 @@ class CopilotService:
         self, message: str, agent_mode: bool, session_id: str | None,
         on_event: Callable[[dict], Awaitable[None]] | None = None,
         images: list[dict] | None = None, allow_live_hitl_wait: bool = False,
-        web_search: bool = False,
+        web_search: bool = False, auto_generate: bool = False,
     ) -> dict:
         """`on_event`, when given, receives live progress events for the
         multi-step paths below (skill drafting/generation, agent-mode
@@ -783,6 +1031,12 @@ class CopilotService:
         is also on. No effect otherwise (only agent-mode turns tool-call at
         all) — see AutoGenOrchestrator.run's `context["web_search"]`.
 
+        `auto_generate`: the turn's "Auto-generate" UI toggle — only
+        meaningful for the Deck Builder flow (a "pptx" chat-trigger match,
+        see DeckBuilderService). False (default): a drafted deck spec is
+        queued through HitlService for approval before it's generated. True:
+        generates immediately, no approval step. No effect on any other path.
+
         `allow_live_hitl_wait`: only CopilotService.chat_stream's real-time
         SSE delegate branch sets this — a long-lived connection that can
         genuinely wait for a human's HITL decision (app/hitl_agents.py) mid-
@@ -794,11 +1048,20 @@ class CopilotService:
         app/memory.py) persists across restarts via
         SessionStore.set_field(session_id, "memory_state", ...) — loaded
         once at the top of this method, updated by whichever branch below
-        actually talks to a model, and always persisted before returning."""
+        actually talks to a model, and always persisted before returning.
+
+        This turn's progress is also mirrored, stage by stage, into the
+        session's "turn_checkpoint" field (see emit() below and
+        app/storage.py's module docstring) — a step-boundary checkpoint that
+        survives a process restart, cleared again the instant this method
+        returns on ANY path. It's advisory only: it never gates this or any
+        future call to chat(), it just lets a resumed UI say "your last turn
+        didn't finish, here's where it got to.\""""
         session = self.sessions.get_or_create(session_id)
         sid = session["session_id"]
         history = list(session["messages"])  # snapshot before appending this turn
         memory_state = CompactMemoryState.from_dict(session.get("memory_state"))
+        turn_id = str(uuid4())
 
         # PII/secrets are redacted BEFORE anything (session history, the trace,
         # the model prompt) ever stores or forwards the raw value — check_input
@@ -810,128 +1073,186 @@ class CopilotService:
             message = input_check["redacted_text"]
         self.sessions.append(sid, "user", message)
 
-        async with tracer.turn(
-            "chat_turn", input=message, metadata={"agent_mode": agent_mode, "session_id": sid},
-        ) as turn:
-            async def emit(event: dict) -> None:
-                if event.get("stage") == "model_call":
-                    turn.generation(
-                        event.get("provider") or "model", model=event.get("model"), provider=event.get("provider"),
-                        input=event.get("prompt_preview"), output=event.get("response_preview"),
-                        metadata={"used_fallback": event.get("used_fallback"), "tool_calls": event.get("tool_calls")},
+        try:
+            async with tracer.turn(
+                "chat_turn", input=message, metadata={"agent_mode": agent_mode, "session_id": sid},
+            ) as turn:
+                async def emit(event: dict) -> None:
+                    if event.get("stage") == "model_call":
+                        turn.generation(
+                            event.get("provider") or "model", model=event.get("model"), provider=event.get("provider"),
+                            input=event.get("prompt_preview"), output=event.get("response_preview"),
+                            metadata={"used_fallback": event.get("used_fallback"), "tool_calls": event.get("tool_calls")},
+                        )
+                    else:
+                        turn.event(event.get("stage") or "progress", **{k: v for k, v in event.items() if k != "stage"})
+                    stage = event.get("stage")
+                    if stage:
+                        # Merge, don't replace — later stages (e.g. code_queued
+                        # after agent_selected) add fields without discarding
+                        # what an earlier stage already recorded this turn.
+                        existing = self.sessions.get(sid).get("turn_checkpoint") or {}
+                        checkpoint = {
+                            **({} if existing.get("turn_id") != turn_id else existing),
+                            "turn_id": turn_id, "stage": stage, "label": event.get("label"),
+                            "started_at": existing.get("started_at") or now_iso(), "updated_at": now_iso(),
+                            "user_message": message, "agent_mode": agent_mode,
+                            "agent": event.get("agent", existing.get("agent")),
+                            "skills": event.get("tools", existing.get("skills")),
+                            "sources_count": event.get("count", existing.get("sources_count")),
+                            "hitl_request_id": event.get("request_id", existing.get("hitl_request_id")),
+                            "tool_calls": event.get("tool_calls", existing.get("tool_calls")),
+                        }
+                        self.sessions.set_field(sid, "turn_checkpoint", checkpoint)
+                    if on_event is not None:
+                        await on_event(event)
+
+                if not input_check["allowed"]:
+                    response = input_check["message"]
+                    self.sessions.append(sid, "assistant", response)
+                    self.sessions.set_field(sid, "turn_checkpoint", None)
+                    turn.set_output(response, metadata={"blocked": "input"})
+                    return {
+                        "response": response, "session_id": sid,
+                        "guardrails": {"input": input_check, "context": None, "output": None},
+                        "agent": None, "skills": [], "provider": None, "model": None,
+                        "used_fallback": False, "hitl_pending": [], "sources": [], "skill_run": None,
+                        "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
+                    }
+
+                # Skill routing: checked before agent_mode, regardless of its toggle state —
+                # "create a docx about X" is a tool-dispatch decision, not a chat-generation
+                # one. An in-progress skill Q&A (pending_skill_run) always continues first;
+                # only once nothing is pending do we check for a *new* skill trigger.
+                #
+                # Deck Builder (pending_deck_builder / the "pptx" skill match below) sits
+                # in the same precedence slot as pending_skill_run/select_for_chat — an
+                # in-progress conversational deck-building exchange always continues
+                # first, and a fresh "pptx" chat-trigger match diverts to the Deck
+                # Builder's conversational/research flow instead of the fixed-question
+                # form every other skill uses. See DeckBuilderService.
+                skill_run_meta = None
+                pending_skill_run = session.get("pending_skill_run")
+                pending_deck_builder = session.get("pending_deck_builder")
+                if pending_skill_run:
+                    response, skill_run_meta = await self._continue_chat_skill_run(
+                        sid, pending_skill_run, message, on_event=emit,
                     )
-                else:
-                    turn.event(event.get("stage") or "progress", **{k: v for k, v in event.items() if k != "stage"})
-                if on_event is not None:
-                    await on_event(event)
-
-            if not input_check["allowed"]:
-                response = input_check["message"]
-                self.sessions.append(sid, "assistant", response)
-                turn.set_output(response, metadata={"blocked": "input"})
-                return {
-                    "response": response, "session_id": sid,
-                    "guardrails": {"input": input_check, "context": None, "output": None},
-                    "agent": None, "skills": [], "provider": None, "model": None,
-                    "used_fallback": False, "hitl_pending": [], "sources": [], "skill_run": None,
-                    "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
-                }
-
-            # Skill routing: checked before agent_mode, regardless of its toggle state —
-            # "create a docx about X" is a tool-dispatch decision, not a chat-generation
-            # one. An in-progress skill Q&A (pending_skill_run) always continues first;
-            # only once nothing is pending do we check for a *new* skill trigger.
-            skill_run_meta = None
-            pending_skill_run = session.get("pending_skill_run")
-            if pending_skill_run:
-                response, skill_run_meta = await self._continue_chat_skill_run(
-                    sid, pending_skill_run, message, on_event=emit,
-                )
-                context_check = None
-                meta = {
-                    "agent": "skill", "skills": [pending_skill_run["skill_id"]],
-                    # Only the finish turn actually calls a provider (to draft the
-                    # spec) — skill_run_meta carries provider/used_fallback then
-                    # (see SkillRunSession.public()); mid-flow Q&A turns leave
-                    # both unset, which correctly renders as "no model call" in
-                    # the UI rather than a misleading "mock".
-                    "provider": (skill_run_meta or {}).get("provider"), "model": None,
-                    "used_fallback": (skill_run_meta or {}).get("used_fallback", False),
-                    "hitl_pending": [], "sources": [], "tool_calls": [], "web_sources": [],
-                    "downloadable_artifacts": [],
-                }
-            else:
-                matched_skill = self.skill_packages.select_for_chat(message)
-                if matched_skill:
-                    response, skill_run_meta = await self._start_chat_skill_run(sid, matched_skill, on_event=emit)
                     context_check = None
                     meta = {
-                        "agent": "skill", "skills": [matched_skill.skill_id],
+                        "agent": "skill", "skills": [pending_skill_run["skill_id"]],
+                        # Only the finish turn actually calls a provider (to draft the
+                        # spec) — skill_run_meta carries provider/used_fallback then
+                        # (see SkillRunSession.public()); mid-flow Q&A turns leave
+                        # both unset, which correctly renders as "no model call" in
+                        # the UI rather than a misleading "mock".
                         "provider": (skill_run_meta or {}).get("provider"), "model": None,
                         "used_fallback": (skill_run_meta or {}).get("used_fallback", False),
                         "hitl_pending": [], "sources": [], "tool_calls": [], "web_sources": [],
                         "downloadable_artifacts": [],
                     }
-                elif agent_mode:
-                    result = await self.orchestrator.run(message, {
-                        "session_id": sid, "history": history, "images": images,
-                        "memory_state": memory_state.to_dict(), "allow_live_hitl_wait": allow_live_hitl_wait,
-                        "web_search": web_search,
-                    }, on_event=emit)
-                    response = result.text
-                    context_check = result.context_guardrail
-                    if result.memory_state is not None:
-                        memory_state = CompactMemoryState.from_dict(result.memory_state)
+                elif pending_deck_builder:
+                    response, deck_meta = await self.deck_builder.continue_turn(
+                        sid, pending_deck_builder, message, on_event=emit,
+                    )
+                    context_check = None
                     meta = {
-                        "agent": result.agent, "skills": result.skills, "provider": result.provider,
-                        "model": result.model,
-                        "used_fallback": result.used_fallback, "hitl_pending": result.hitl_pending,
-                        "sources": result.sources, "tool_calls": result.tool_calls,
-                        "web_sources": result.web_sources,
-                        "downloadable_artifacts": result.downloadable_artifacts,
+                        "agent": "deck-builder", "skills": ["pptx"], "provider": None, "model": None,
+                        "used_fallback": False, "hitl_pending": [], "sources": [], "tool_calls": [],
+                        "web_sources": [], "downloadable_artifacts": deck_meta["downloadable_artifacts"],
                     }
                 else:
-                    # Direct model call for simple, single-step requests (no agent/skill
-                    # selection, so there's no retrieved context for the context guardrail).
-                    context_check = None
-                    await emit({"stage": "thinking", "label": "Thinking…"})
-                    compacted, memory_state = await compact_history(self.provider, history, memory_state, BUFFER_SIZE)
-                    provider_result = await self.provider.complete(message, compacted, images=images)
-                    response = provider_result.text
-                    await emit({
-                        "stage": "model_call",
-                        "label": f"Answered ({provider_result.provider}"
-                                 f"{f'/{provider_result.model}' if provider_result.model else ''}).",
-                        "provider": provider_result.provider, "model": provider_result.model,
-                        "used_fallback": provider_result.used_fallback,
-                        "prompt_preview": message[:2000], "response_preview": response[:2000],
-                    })
-                    meta = {
-                        "agent": None, "skills": [], "provider": provider_result.provider,
-                        "model": provider_result.model,
-                        "used_fallback": provider_result.used_fallback, "hitl_pending": [], "sources": [],
-                        "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
-                    }
+                    matched_skill = self.skill_packages.select_for_chat(message)
+                    if matched_skill and matched_skill.skill_id == "pptx":
+                        response, deck_meta = await self.deck_builder.start(
+                            sid, matched_skill, message, auto_generate, on_event=emit,
+                        )
+                        context_check = None
+                        meta = {
+                            "agent": "deck-builder", "skills": ["pptx"], "provider": None, "model": None,
+                            "used_fallback": False, "hitl_pending": [], "sources": [], "tool_calls": [],
+                            "web_sources": [], "downloadable_artifacts": deck_meta["downloadable_artifacts"],
+                        }
+                    elif matched_skill:
+                        response, skill_run_meta = await self._start_chat_skill_run(sid, matched_skill, on_event=emit)
+                        context_check = None
+                        meta = {
+                            "agent": "skill", "skills": [matched_skill.skill_id],
+                            "provider": (skill_run_meta or {}).get("provider"), "model": None,
+                            "used_fallback": (skill_run_meta or {}).get("used_fallback", False),
+                            "hitl_pending": [], "sources": [], "tool_calls": [], "web_sources": [],
+                            "downloadable_artifacts": [],
+                        }
+                    elif agent_mode:
+                        result = await self.orchestrator.run(message, {
+                            "session_id": sid, "history": history, "images": images,
+                            "memory_state": memory_state.to_dict(), "allow_live_hitl_wait": allow_live_hitl_wait,
+                            "web_search": web_search,
+                        }, on_event=emit)
+                        response = result.text
+                        context_check = result.context_guardrail
+                        if result.memory_state is not None:
+                            memory_state = CompactMemoryState.from_dict(result.memory_state)
+                        meta = {
+                            "agent": result.agent, "skills": result.skills, "provider": result.provider,
+                            "model": result.model,
+                            "used_fallback": result.used_fallback, "hitl_pending": result.hitl_pending,
+                            "sources": result.sources, "tool_calls": result.tool_calls,
+                            "web_sources": result.web_sources,
+                            "downloadable_artifacts": result.downloadable_artifacts,
+                        }
+                    else:
+                        # Direct model call for simple, single-step requests (no agent/skill
+                        # selection, so there's no retrieved context for the context guardrail).
+                        context_check = None
+                        await emit({"stage": "thinking", "label": "Thinking…"})
+                        compacted, memory_state = await compact_history(self.provider, history, memory_state, BUFFER_SIZE)
+                        provider_result = await self.provider.complete(message, compacted, images=images)
+                        response = provider_result.text
+                        await emit({
+                            "stage": "model_call",
+                            "label": f"Answered ({provider_result.provider}"
+                                     f"{f'/{provider_result.model}' if provider_result.model else ''}).",
+                            "provider": provider_result.provider, "model": provider_result.model,
+                            "used_fallback": provider_result.used_fallback,
+                            "prompt_preview": message[:2000], "response_preview": response[:2000],
+                        })
+                        meta = {
+                            "agent": None, "skills": [], "provider": provider_result.provider,
+                            "model": provider_result.model,
+                            "used_fallback": provider_result.used_fallback, "hitl_pending": [], "sources": [],
+                            "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
+                        }
 
-            output_check = self.guardrails.check_output(response)
-            if not output_check["allowed"]:
-                response = "The response was blocked by the configured guardrails."
-            elif output_check["redacted_text"] is not None:
-                response = output_check["redacted_text"]
+                output_check = self.guardrails.check_output(response)
+                if not output_check["allowed"]:
+                    response = "The response was blocked by the configured guardrails."
+                elif output_check["redacted_text"] is not None:
+                    response = output_check["redacted_text"]
 
-            self.sessions.append(sid, "assistant", response)
-            self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
-            turn.set_output(response, metadata={
-                "agent": meta.get("agent"), "skills": meta.get("skills"),
-                "provider": meta.get("provider"), "model": meta.get("model"),
-                "used_fallback": meta.get("used_fallback"), "tool_calls": meta.get("tool_calls"),
-            })
-            return {
-                "response": response, "session_id": sid,
-                "guardrails": {"input": input_check, "context": context_check, "output": output_check},
-                "skill_run": skill_run_meta,
-                **meta,
-            }
+                self.sessions.append(sid, "assistant", response)
+                self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
+                turn.set_output(response, metadata={
+                    "agent": meta.get("agent"), "skills": meta.get("skills"),
+                    "provider": meta.get("provider"), "model": meta.get("model"),
+                    "used_fallback": meta.get("used_fallback"), "tool_calls": meta.get("tool_calls"),
+                })
+                return {
+                    "response": response, "session_id": sid,
+                    "guardrails": {"input": input_check, "context": context_check, "output": output_check},
+                    "skill_run": skill_run_meta,
+                    **meta,
+                }
+        finally:
+            # Belt-and-suspenders: the two return paths above already clear
+            # turn_checkpoint on their own successful completion, but a raised
+            # exception (an orchestrator bug, a provider call that escapes
+            # every existing degrade-gracefully guard) must not leave a stale
+            # "in progress" marker behind either — see this method's own
+            # docstring and app/storage.py's module docstring. A no-op if it
+            # was already cleared (set_field is idempotent for an unknown
+            # session too, so this is always safe to call).
+            self.sessions.set_field(sid, "turn_checkpoint", None)
 
     @staticmethod
     def _parse_model_choice(model: str | None) -> tuple[str | None, str | None]:
@@ -945,6 +1266,7 @@ class CopilotService:
     async def chat_stream(
         self, message: str, agent_mode: bool, session_id: str | None, cancellation_token: CancellationToken,
         model: str | None = None, images: list[dict] | None = None, web_search: bool = False,
+        auto_generate: bool = False,
     ) -> AsyncIterator[dict]:
         """SSE-friendly variant of chat(): yields incremental event dicts
         instead of returning one final dict.
@@ -983,7 +1305,8 @@ class CopilotService:
         if input_check["redacted_text"] is not None:
             message = input_check["redacted_text"]
         pending_skill_run = session.get("pending_skill_run")
-        would_skill_route = bool(pending_skill_run) or (
+        pending_deck_builder = session.get("pending_deck_builder")
+        would_skill_route = bool(pending_skill_run) or bool(pending_deck_builder) or (
             input_check["allowed"] and bool(self.skill_packages.select_for_chat(message))
         )
         attempt_real_stream = input_check["allowed"] and not would_skill_route and not agent_mode
@@ -1116,7 +1439,7 @@ class CopilotService:
         # skill section and app/hitl_agents.py.
         chat_task = asyncio.ensure_future(self.chat(
             message, agent_mode, sid, on_event=on_event, images=images, allow_live_hitl_wait=True,
-            web_search=web_search,
+            web_search=web_search, auto_generate=auto_generate,
         ))
         cancellation_token.link_future(chat_task)
         try:

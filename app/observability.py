@@ -121,14 +121,30 @@ class Tracer:
             # Sync context manager (OTel span start/stop is synchronous
             # bookkeeping, not I/O) used from inside this async generator —
             # `async with` isn't supported here, `with` is.
-            with self._client.start_as_current_observation(
+            span_cm = self._client.start_as_current_observation(
                 name=name, as_type="span", input=_trim(input),
                 metadata={k: _trim(v) for k, v in (metadata or {}).items()},
-            ) as span:
-                yield TurnHandle(span)
-        except Exception as exc:  # noqa: BLE001 - a trace failure must never break the turn it's tracing
+            )
+        except Exception as exc:  # noqa: BLE001 - a trace-setup failure must never break the turn it's tracing
+            # Genuinely a Langfuse/OTel-side failure (span creation itself
+            # raised, before the turn body ever ran) — degrade to untraced
+            # and let the turn proceed normally.
             logger.warning("Langfuse span failed, continuing untraced: %s", exc)
             yield TurnHandle(_NullSpan())
+            return
+        # Deliberately NOT wrapped in a try/except: whatever the turn body
+        # raises here must propagate to the caller completely unchanged. An
+        # @asynccontextmanager generator that catches an exception thrown
+        # into it at `yield` and then yields again violates PEP 342 (a
+        # generator may not yield after receiving athrow()) — the caller's
+        # `async with tracer.turn(...)` would raise "generator didn't stop
+        # after athrow()" instead of the turn's real exception (e.g. a
+        # genuine RAG/provider failure), masking it behind an unrelated
+        # RuntimeError. Only span *setup* (above) gets the degrade-gracefully
+        # treatment; a body failure is the caller's own business, not a
+        # tracing concern.
+        with span_cm as span:
+            yield TurnHandle(span)
 
 
 tracer = Tracer()

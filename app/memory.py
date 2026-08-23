@@ -39,6 +39,8 @@ from typing import Any, Mapping
 from autogen_core.model_context import BufferedChatCompletionContext
 from autogen_core.models import AssistantMessage, LLMMessage, SystemMessage, UserMessage
 
+from .retrieval import redact_pii
+
 logger = logging.getLogger(__name__)
 
 BUFFER_SIZE = 5
@@ -86,6 +88,28 @@ async def _extend_summary(provider, state: CompactMemoryState, new_overflow: lis
     summary = result.text.strip()
     if not summary:
         return state
+    # Defensive PII pass on the summarizer's OWN output — belt-and-
+    # suspenders, not the primary control: every message folded into
+    # `excerpt` above already passed through GuardrailService.check_input/
+    # check_output before ever reaching session history (see
+    # CopilotService.chat), so in the normal case there's nothing left to
+    # catch here. This exists so a value that ever slipped past that
+    # upstream redaction (a future new call site, a pattern gap) can't
+    # persist forward turn after turn inside the running compact summary —
+    # unlike a single turn's messages, this summary is carried into every
+    # subsequent turn's prompt for the rest of the session. Silent (logged,
+    # not surfaced to the UI): this is internal context-management state,
+    # not "the response," so it doesn't fit the existing input/context/
+    # output guardrails disclosure — see docs/rag.md and app/retrieval.py's
+    # "PII redaction" section for why this lives there, not in
+    # GuardrailService.
+    summary, pii = redact_pii(summary)
+    if pii:
+        logger.info(
+            "Compact-memory summary contained PII that slipped past upstream redaction (%s) — "
+            "redacted defensively before persisting.",
+            ", ".join(f"{f['category']}×{f['count']}" for f in pii),
+        )
     return CompactMemoryState(summary=summary, summarized_count=state.summarized_count + len(new_overflow))
 
 

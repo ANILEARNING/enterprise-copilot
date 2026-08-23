@@ -25,6 +25,59 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 EMBEDDING_DIM = 256
 
 
+# --- PII redaction --------------------------------------------------------
+#
+# Lives here (not app/services.py, where GuardrailService's check_input/
+# check_output originally defined this) because it needs to be callable from
+# app/memory.py too (the compact-memory summarizer's own defensive pass) —
+# app/services.py already imports app/memory.py (`from .memory import
+# BUFFER_SIZE, CompactMemoryState, compact_history`), so memory.py importing
+# GuardrailService back from services.py would be circular. app/retrieval.py
+# is this app's existing home for small, pure, dependency-free functions
+# already shared across modules (tokenize, cosine_similarity, ...) and has
+# no imports from services.py/memory.py/agents.py in either direction, so
+# it's the natural shared leaf for this primitive. GuardrailService
+# (app/services.py) delegates to this exact function for check_input/
+# check_output; AutoGenOrchestrator (app/agents.py) calls it via
+# GuardrailService.redact_context_pii for retrieved RAG chunks; app/memory.py
+# calls it directly (no GuardrailService instance available there by design).
+
+# Each pattern is (category, compiled regex, mask). Order matters: card
+# before phone (both are digit runs) so a 16-digit card number, once
+# redacted, can't also get partially eaten by the phone pattern.
+_PII_PATTERNS: tuple[tuple[str, re.Pattern, str], ...] = (
+    ("email", re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"), "[REDACTED_EMAIL]"),
+    ("credit_card", re.compile(r"\b\d(?:[ -]?\d){12,15}\b"), "[REDACTED_CARD]"),
+    ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[REDACTED_SSN]"),
+    ("phone", re.compile(r"\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]\d{3}[ -]\d{4}\b"), "[REDACTED_PHONE]"),
+    ("ip_address", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
+)
+
+
+def redact_pii(text: str) -> tuple[str, list[dict]]:
+    """Masks PII in `text`, returning (redacted_text, findings) where
+    findings is [{"category": "email", "count": 2}, ...] — one entry per
+    category that actually matched, never the raw matched value itself (see
+    .claude/rules/guardrails.md: never expose the sensitive value, only what
+    kind of thing was caught). Idempotent — running this again on
+    already-masked text finds nothing new, so redacting twice (e.g. once in
+    a retrieval-time pass, once defensively downstream) is always safe."""
+    findings: list[dict] = []
+    redacted = text
+    for category, pattern, mask in _PII_PATTERNS:
+        count = 0
+
+        def _sub(m: re.Match, _mask=mask) -> str:
+            nonlocal count
+            count += 1
+            return _mask
+
+        redacted = pattern.sub(_sub, redacted)
+        if count:
+            findings.append({"category": category, "count": count})
+    return redacted, findings
+
+
 # --- clean --------------------------------------------------------------
 
 def clean_text(text: str) -> str:

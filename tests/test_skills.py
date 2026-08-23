@@ -203,8 +203,11 @@ def test_select_for_chat_matches_precise_phrases(tmp_path):
     assert store.select_for_chat("can you create a docx for me").skill_id == "docx-generator"
     assert store.select_for_chat("I need a word document about onboarding").skill_id == "docx-generator"
     assert store.select_for_chat("write a proposal for the new tool").skill_id == "docx-generator"
-    assert store.select_for_chat("make me a powerpoint about Q3 results").skill_id == "ppt-generator"
-    assert store.select_for_chat("can you build a slide deck").skill_id == "ppt-generator"
+    # Deck requests now route to the richer `pptx` skill — ppt-generator's own
+    # chat_triggers are deliberately cleared (see skills/ppt-generator/SKILL.md)
+    # so this is deterministic, not first-match-wins over dict order.
+    assert store.select_for_chat("make me a powerpoint about Q3 results").skill_id == "pptx"
+    assert store.select_for_chat("can you build a slide deck").skill_id == "pptx"
 
 
 def test_select_for_chat_does_not_false_positive_on_common_words(tmp_path):
@@ -736,3 +739,102 @@ async def test_brd_prd_generator_full_flow_both_formats(tmp_path):
     table_texts = [[c.text for c in row.cells] for t in doc.tables for row in t.rows]
     assert any("Dev cost $10k; saves $5k/yr" in " ".join(row) for row in table_texts)
     assert any("REQ-001" in row for row in table_texts)
+
+
+# --- pptx built-in skill (richer deck generator) ------------------------------
+
+def test_pptx_skill_loads_correctly(tmp_path):
+    store = _store(tmp_path)
+    skill = store.get("pptx")
+    assert skill.builtin is True
+    assert skill.output == "pptx"
+    ids = {q.id for q in skill.questions}
+    assert {"topic", "audience", "tone", "design", "include_charts", "chart_data", "layout_style"} <= ids
+    chart_data_question = next(q for q in skill.questions if q.id == "chart_data")
+    assert chart_data_question.show_if == {"question_id": "include_charts", "equals": "Yes"}
+
+
+def test_select_for_chat_pptx_wins_over_ppt_generator(tmp_path):
+    store = _store(tmp_path)
+    # ppt-generator's chat_triggers are cleared (see skills/ppt-generator/SKILL.md) —
+    # the richer pptx skill is now the deterministic chat-routing target.
+    assert store.select_for_chat("make me a powerpoint about Q3").skill_id == "pptx"
+    assert store.select_for_chat("can you build a slide deck").skill_id == "pptx"
+    ppt = store.get("ppt-generator")
+    assert ppt.chat_triggers == []
+
+
+def _pptx_generate_script() -> Path:
+    return SKILLS_DIR / "pptx" / "scripts" / "generate_pptx.py"
+
+
+def test_generate_pptx_script_produces_real_file(tmp_path):
+    import subprocess
+    import sys
+
+    from pptx import Presentation
+
+    spec = {
+        "title": "Q3 Enterprise Readiness", "subtitle": "Executive Review",
+        "tone": "formal", "theme": "midnight_executive",
+        "slides": [
+            {"layout": "bullets", "title": "Overview", "bullets": ["Revenue up 22%", "Three new logos"], "icon": "check"},
+            {"layout": "two_column", "title": "Before vs After",
+             "left_heading": "Before", "left_bullets": ["Manual onboarding"],
+             "right_heading": "After", "right_bullets": ["Automated onboarding"]},
+            {"layout": "stat_callout", "title": "By the numbers",
+             "stats": [{"value": "42%", "label": "Faster onboarding"}, {"value": "$1.2M", "label": "New ARR"}]},
+            {"layout": "chart", "title": "Quarterly Revenue",
+             "chart": {"type": "column", "categories": ["Q1", "Q2", "Q3"], "series": [{"name": "Revenue", "values": [1.0, 1.5, 2.2]}]}},
+            {"layout": "section_divider", "title": "Looking Ahead", "subtitle": "Q4 Roadmap"},
+        ],
+    }
+    out_path = tmp_path / "out.pptx"
+    proc = subprocess.run(
+        [sys.executable, str(_pptx_generate_script()), "--output", str(out_path)],
+        input=json.dumps(spec), capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert out_path.exists() and out_path.stat().st_size > 0
+
+    prs = Presentation(str(out_path))
+    assert len(prs.slides) == 6  # title + 5 content slides — no corruption on reopen
+
+
+def test_generate_pptx_script_handles_missing_optional_fields(tmp_path):
+    import subprocess
+    import sys
+
+    from pptx import Presentation
+
+    spec = {"title": "Minimal Deck", "slides": [{"title": "Only slide", "bullets": ["one point"]}]}
+    out_path = tmp_path / "minimal.pptx"
+    proc = subprocess.run(
+        [sys.executable, str(_pptx_generate_script()), "--output", str(out_path)],
+        input=json.dumps(spec), capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    prs = Presentation(str(out_path))
+    assert len(prs.slides) == 2
+
+
+def test_generate_pptx_script_degrades_gracefully_on_unknown_values(tmp_path):
+    """Unknown layout/theme/icon values must never crash generation — same
+    never-raises contract as pptx_themes.resolve_palette/resolve_icon."""
+    import subprocess
+    import sys
+
+    from pptx import Presentation
+
+    spec = {
+        "title": "Weird Deck", "theme": "not_a_real_palette",
+        "slides": [{"layout": "not_a_real_layout", "title": "Test", "bullets": ["a"], "icon": "not_a_real_icon"}],
+    }
+    out_path = tmp_path / "unknown.pptx"
+    proc = subprocess.run(
+        [sys.executable, str(_pptx_generate_script()), "--output", str(out_path)],
+        input=json.dumps(spec), capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    prs = Presentation(str(out_path))
+    assert len(prs.slides) == 2

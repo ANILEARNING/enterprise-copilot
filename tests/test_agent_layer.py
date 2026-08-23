@@ -27,6 +27,23 @@ def _reset_router_provider_cache(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_hitl_requests(monkeypatch, tmp_path):
+    # HitlService(sandbox) (no explicit data_dir=) throughout this file now
+    # persists to disk at a FIXED default path (see app/services.py —
+    # settings.data_dir/hitl-requests when configured, matching
+    # SessionStore.DEFAULT_DATA_DIR's pattern; deliberately not a
+    # per-instance uuid dir, since the real singleton must keep using the
+    # SAME directory across a restart for persistence to mean anything).
+    # Every bare construction in this file would otherwise share ONE real
+    # directory across tests/runs — this points settings.data_dir at a
+    # fresh tmp_path per test instead, same isolation
+    # tests/test_storage.py's SessionStore(data_dir=tmp_path) gets, without
+    # editing every one of this file's ~15 call sites individually.
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    yield
+
+
 class AlwaysFailProvider:
     name = "broken"
 
@@ -593,6 +610,48 @@ async def test_orchestrator_screens_injected_content_out_of_context():
     assert result.context_guardrail is not None
     assert result.context_guardrail["allowed"] is False
     assert not any(s["filename"] == "poisoned.md" for s in result.sources)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_redacts_pii_in_rag_snippets_before_prompting():
+    rag = RAGStore()
+    await rag.add("contacts.md", "For pricing questions, email jane.doe@example.com or call 415-555-0199.")
+    hitl = HitlService(LocalSubprocessSandbox())
+    orchestrator = AutoGenOrchestrator(
+        MockProvider(), default_agent_registry(), default_skill_registry(), rag, hitl,
+        guardrails=GuardrailService(),
+    )
+    result = await orchestrator.run("what does the document say about pricing", {"session_id": "s1", "history": []})
+    assert result.context_guardrail is not None
+    assert result.context_guardrail["allowed"] is True  # PII redacts, doesn't block
+    assert result.context_guardrail["redacted_count"] >= 1
+    categories = {f["category"] for f in result.context_guardrail["pii"]}
+    assert "email" in categories and "phone" in categories
+    # The citation surfaced to the UI must be masked, never the raw value.
+    contacts_source = next(s for s in result.sources if s["filename"] == "contacts.md")
+    assert "jane.doe@example.com" not in contacts_source["snippet"]
+    assert "[REDACTED_EMAIL]" in contacts_source["snippet"]
+    # MockProvider echoes the prompt back verbatim (see app/providers.py) —
+    # the raw email must never have reached the prompt either.
+    assert "jane.doe@example.com" not in result.text
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_context_guardrail_none_without_guardrails_wired_in():
+    # No guardrails= passed -> redact_context_pii must never be called (it
+    # would AttributeError on self.guardrails being None) and sources pass
+    # through completely unredacted — matches the existing "not screened"
+    # contract for check_context (see the sibling test above).
+    rag = RAGStore()
+    await rag.add("contacts.md", "Email jane.doe@example.com for pricing.")
+    hitl = HitlService(LocalSubprocessSandbox())
+    orchestrator = AutoGenOrchestrator(
+        MockProvider(), default_agent_registry(), default_skill_registry(), rag, hitl,
+    )
+    result = await orchestrator.run("what does the document say about pricing", {"session_id": "s1", "history": []})
+    assert result.context_guardrail is None
+    contacts_source = next(s for s in result.sources if s["filename"] == "contacts.md")
+    assert "jane.doe@example.com" in contacts_source["snippet"]  # unredacted
 
 
 @pytest.mark.asyncio

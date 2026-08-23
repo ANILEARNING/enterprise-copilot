@@ -109,6 +109,37 @@ def test_render_memory_preview_includes_summary_turn_when_present():
     assert "user: what did I say I liked?" in preview
 
 
+# --- defensive PII redaction on the summarizer's own output -------------------
+# Belt-and-suspenders, not the primary control: every message folded into the
+# summarization prompt should already be redacted before it ever reaches
+# session history (see CopilotService.chat -> GuardrailService.check_input/
+# check_output). This covers the summarizer's OUTPUT, in case something ever
+# slips past that upstream redaction and would otherwise persist forward
+# turn after turn inside the running compact summary.
+
+@pytest.mark.asyncio
+async def test_extend_summary_redacts_pii_that_slipped_through():
+    # MockProvider.complete() echoes its prompt back verbatim ("Demo
+    # response: {prompt}") — since _extend_summary's prompt embeds the raw
+    # conversation excerpt, an email in a turn's content ends up in the
+    # "summary" MockProvider returns, exactly simulating a value that slipped
+    # past upstream redaction and reached the summarizer's own output.
+    provider = MockProvider()
+    history = [{"role": "user", "content": "contact me at jane.doe@example.com"}] + _turns(7)
+    _, state = await compact_history(provider, history, CompactMemoryState(), buffer_size=5)
+    assert "jane.doe@example.com" not in state.summary
+    assert "[REDACTED_EMAIL]" in state.summary
+
+
+@pytest.mark.asyncio
+async def test_extend_summary_leaves_clean_summary_unchanged():
+    provider = MockProvider()
+    history = _turns(8)  # no PII anywhere
+    _, state = await compact_history(provider, history, CompactMemoryState(), buffer_size=5)
+    assert "[REDACTED" not in state.summary
+    assert "turn 0" in state.summary  # MockProvider's echo is otherwise untouched
+
+
 @pytest.mark.asyncio
 async def test_render_memory_preview_matches_what_compact_history_actually_sends():
     # End-to-end: what a real call site (AutoGenOrchestrator's plain-

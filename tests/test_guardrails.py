@@ -1,4 +1,17 @@
+from app.retrieval import redact_pii
 from app.services import GuardrailService
+
+
+# --- shared redact_pii primitive (app/retrieval.py) ----------------------------
+# Lives there, not GuardrailService, so app/memory.py's compact-memory
+# summarizer can also call it without importing GuardrailService (which
+# would be a circular import — app/services.py already imports app/memory.py).
+
+def test_redact_pii_is_reusable_directly_from_retrieval_module():
+    text = "Email jane@example.com or call 415-555-0199"
+    direct = redact_pii(text)
+    via_service = GuardrailService()._redact_pii(text)
+    assert direct == via_service
 
 
 # --- check_input: prompt injection still blocks -------------------------------
@@ -125,6 +138,46 @@ def test_check_context_still_flags_injection_in_retrieved_chunks():
     result = GuardrailService().check_context(chunks)
     assert result["allowed"] is False
     assert result["flagged_chunk_ids"] == ["c1"]
+
+
+# --- redact_context_pii: retrieval-time PII redaction on RAG chunks -----------
+
+def test_redact_context_pii_redacts_snippet_and_keeps_the_chunk():
+    chunks = [{"chunk_id": "c1", "snippet": "Contact jane.doe@example.com for details."}]
+    redacted_chunks, findings = GuardrailService().redact_context_pii(chunks)
+    assert len(redacted_chunks) == 1  # never dropped, just masked
+    assert redacted_chunks[0]["snippet"] == "Contact [REDACTED_EMAIL] for details."
+    assert redacted_chunks[0]["chunk_id"] == "c1"  # other fields untouched
+    assert findings == {"pii": [{"category": "email", "count": 1}], "redacted_count": 1}
+
+
+def test_redact_context_pii_leaves_clean_chunks_untouched():
+    chunks = [{"chunk_id": "c1", "snippet": "Our refund policy is 30 days."}]
+    redacted_chunks, findings = GuardrailService().redact_context_pii(chunks)
+    assert redacted_chunks == chunks
+    assert findings == {"pii": [], "redacted_count": 0}
+
+
+def test_redact_context_pii_merges_findings_across_multiple_chunks():
+    chunks = [
+        {"chunk_id": "c1", "snippet": "Email a@example.com"},
+        {"chunk_id": "c2", "snippet": "Email b@example.com, call 415-555-0199"},
+        {"chunk_id": "c3", "snippet": "Nothing sensitive here"},
+    ]
+    redacted_chunks, findings = GuardrailService().redact_context_pii(chunks)
+    assert redacted_chunks[0]["snippet"] == "Email [REDACTED_EMAIL]"
+    assert redacted_chunks[1]["snippet"] == "Email [REDACTED_EMAIL], call [REDACTED_PHONE]"
+    assert redacted_chunks[2]["snippet"] == "Nothing sensitive here"
+    assert findings["redacted_count"] == 2  # two chunks had something redacted
+    categories = {f["category"]: f["count"] for f in findings["pii"]}
+    assert categories == {"email": 2, "phone": 1}  # merged across chunks, not per-chunk
+
+
+def test_redact_context_pii_does_not_mutate_input_list():
+    chunks = [{"chunk_id": "c1", "snippet": "Contact a@example.com"}]
+    original_snippet = chunks[0]["snippet"]
+    GuardrailService().redact_context_pii(chunks)
+    assert chunks[0]["snippet"] == original_snippet  # caller's dict untouched
 
 
 # --- structured findings shape (what the UI's guardrail activity panel reads) --

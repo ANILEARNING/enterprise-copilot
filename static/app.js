@@ -132,7 +132,7 @@ function switchView(name) {
   if (name === "knowledge") loadDocuments();
   if (name === "skills") loadSkillPackages();
   if (name === "agents") { loadAgentsAndSkills(); loadHitlRequests(); }
-  if (name === "sessions") { renderSessionView(); loadPastSessions(); }
+  if (name === "sessions") { renderSessionView(); loadPastSessions(); loadCheckpoints(); }
   if (name === "settings") renderSettingsView();
 }
 
@@ -309,6 +309,8 @@ async function startNewSession() {
     renderChat();
     syncSessionChrome();
     renderSessionView();
+    sessionCheckpoints = [];
+    showInterruptedTurnBanner(null);
     toast("success", "New session started", `Session ${sessionId.slice(0, 8)}… is now active.`);
   } catch (e) {
     toast("danger", "Couldn't start a session", e.message);
@@ -330,6 +332,8 @@ async function restoreActiveSession() {
     messages = (session.messages || []).map((m) => ({ role: m.role, content: m.content, at: m.at }));
     renderChat();
     syncSessionChrome();
+    sessionCheckpoints = session.checkpoints || [];
+    showInterruptedTurnBanner(session.turn_checkpoint || null);
   } catch (e) {
     // The saved session no longer exists server-side (e.g. its file was
     // removed) -- fall back to starting fresh rather than surfacing an error.
@@ -382,10 +386,120 @@ async function resumeSession(id) {
     lastMeta = null;
     renderChat();
     syncSessionChrome();
+    sessionCheckpoints = session.checkpoints || [];
+    showInterruptedTurnBanner(session.turn_checkpoint || null);
     switchView("copilot");
     toast("success", "Session resumed", `${messages.length} message(s) loaded.`);
   } catch (e) {
     toast("danger", "Couldn't resume session", e.message);
+  }
+}
+
+/* ==========================================================================
+   Checkpoints: named save points a session can be rolled back to, plus the
+   "your last turn didn't finish" banner surfaced from session.turn_checkpoint
+   (see app/storage.py's module docstring and POST /session/checkpoint/*).
+   ========================================================================== */
+
+// This session's saved checkpoints, refreshed by loadCheckpoints() — kept in
+// sync with restoreActiveSession()/resumeSession() so the Sessions view
+// doesn't need its own extra round-trip just to know what's there.
+let sessionCheckpoints = [];
+
+function showInterruptedTurnBanner(turnCheckpoint) {
+  const banner = $("interruptedTurnBanner");
+  if (!banner) return;
+  if (!turnCheckpoint) {
+    banner.classList.add("d-none");
+    return;
+  }
+  const stageLabel = turnCheckpoint.label || turnCheckpoint.stage || "an earlier step";
+  const hitlNote = turnCheckpoint.hitl_request_id
+    ? " Check Pending approvals — it may be waiting on you." : "";
+  $("interruptedTurnText").textContent =
+    `Your last turn didn't finish (last known step: ${stageLabel}).${hitlNote} Send a new message to continue.`;
+  banner.classList.remove("d-none");
+}
+
+async function saveCheckpoint() {
+  if (!sessionId) {
+    toast("warning", "No active session", "Start a conversation first, then save a checkpoint.");
+    return;
+  }
+  const label = window.prompt("Name this checkpoint:", `Checkpoint ${new Date().toLocaleString()}`);
+  if (!label) return;
+  try {
+    await post("/api/session/checkpoint/save", { session_id: sessionId, label });
+    toast("success", "Checkpoint saved", `"${label}" can be restored from the Sessions view.`);
+    loadCheckpoints();
+  } catch (e) {
+    toast("danger", "Couldn't save checkpoint", e.message);
+  }
+}
+
+async function loadCheckpoints() {
+  if (!sessionId) {
+    sessionCheckpoints = [];
+    renderCheckpoints([]);
+    return;
+  }
+  try {
+    const data = await post("/api/session/checkpoint/list", { session_id: sessionId });
+    sessionCheckpoints = data.checkpoints || [];
+    renderCheckpoints(sessionCheckpoints);
+  } catch (e) {
+    const container = $("checkpointsContainer");
+    if (container) container.innerHTML = `<p class="small mb-0" style="color:var(--danger)">Couldn't load checkpoints: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function renderCheckpoints(checkpoints) {
+  const container = $("checkpointsContainer");
+  if (!container) return;
+  if (!checkpoints.length) {
+    container.innerHTML = `<div class="state-block" style="padding:28px 16px;"><p style="margin:0;">No checkpoints saved yet. Use "Save checkpoint" in Copilot to create one.</p></div>`;
+    return;
+  }
+  container.innerHTML = `
+    <div class="table-responsive">
+      <table class="data-table">
+        <thead><tr><th>Label</th><th>Messages</th><th>Saved</th><th></th></tr></thead>
+        <tbody>
+          ${checkpoints.map((c) => `
+            <tr>
+              <td><span class="row-title">${escapeHtml(c.label)}</span></td>
+              <td>${c.message_count}</td>
+              <td>${timeAgo(c.created_at)}</td>
+              <td class="text-end"><button class="btn btn-sm btn-outline-secondary" data-action="restore-checkpoint" data-id="${c.checkpoint_id}">Restore</button></td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>`;
+  container.querySelectorAll('[data-action="restore-checkpoint"]').forEach((btn) => {
+    btn.addEventListener("click", () => restoreCheckpoint(btn.dataset.id));
+  });
+}
+
+async function restoreCheckpoint(checkpointId) {
+  const checkpoint = sessionCheckpoints.find((c) => c.checkpoint_id === checkpointId);
+  const label = checkpoint ? checkpoint.label : "this checkpoint";
+  const confirmed = window.confirm(
+    `Restore "${label}"? Messages sent after this checkpoint will be permanently discarded from this session.`,
+  );
+  if (!confirmed) return;
+  try {
+    const session = await post("/api/session/checkpoint/restore", { session_id: sessionId, checkpoint_id: checkpointId });
+    messages = (session.messages || []).map((m) => ({ role: m.role, content: m.content, at: m.at }));
+    lastMeta = null;
+    renderChat();
+    syncSessionChrome();
+    renderSessionView();
+    showInterruptedTurnBanner(null);
+    sessionCheckpoints = session.checkpoints || [];
+    renderCheckpoints(sessionCheckpoints);
+    toast("success", "Checkpoint restored", `Rolled back to "${label}".`);
+  } catch (e) {
+    toast("danger", "Couldn't restore checkpoint", e.message);
   }
 }
 
@@ -780,6 +894,10 @@ async function sendMessage(text, opts = {}) {
   if (!message) return;
   const agentMode = opts.agentMode ?? $("agentMode").checked;
   const webSearch = agentMode && $("webSearch").checked;
+  // Independent of agentMode — Deck Builder fires on a "pptx" chat-trigger
+  // match regardless of the Agent Mode toggle (see CopilotService.chat()'s
+  // routing), so this must stay checkable/sendable either way.
+  const autoGenerate = opts.autoGenerate ?? $("autoGenerate").checked;
   // Attachments are opt.images (retry/regenerate replaying an earlier user
   // message) or whatever's staged in the composer for a fresh send.
   const images = opts.images ?? pendingImages.map(({ data, mime_type }) => ({ data, mime_type }));
@@ -800,7 +918,10 @@ async function sendMessage(text, opts = {}) {
     const res = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, agent_mode: agentMode, web_search: webSearch, session_id: sessionId, images }),
+      body: JSON.stringify({
+        message, agent_mode: agentMode, web_search: webSearch, auto_generate: autoGenerate,
+        session_id: sessionId, images,
+      }),
     });
     if (!res.ok || !res.body) throw new Error(`Request failed (${res.status})`);
 
@@ -1081,6 +1202,8 @@ function initChat() {
     });
   });
   $("clearChat").addEventListener("click", clearChat);
+  $("saveCheckpointBtn").addEventListener("click", saveCheckpoint);
+  $("dismissInterruptedTurn").addEventListener("click", () => showInterruptedTurnBanner(null));
   $("profileNewSession").addEventListener("click", startNewSession);
   $("startNewSessionBtn").addEventListener("click", startNewSession);
   $("settingsNewSession").addEventListener("click", startNewSession);
