@@ -87,9 +87,288 @@ def reset_router_provider_cache() -> None:
     gemini_api_key changes at runtime (see docs/runtime-settings.md), so a
     Settings-page change takes effect on the very next agent-mode turn
     instead of only after a process restart."""
-    global _router_provider_built, _router_provider
+    global _router_provider_built, _router_provider, _turn_router_built, _turn_router
     _router_provider_built = False
     _router_provider = None
+    _turn_router_built = False
+    _turn_router = None
+
+
+# --- autonomous turn routing (plan_turn) -------------------------------------
+#
+# WHAT THIS REPLACES: CopilotService.chat() used to route a turn with a fixed
+# if/elif chain over SkillPackageStore.select_for_chat's substring match,
+# evaluated BEFORE the agent_mode toggle was ever consulted. That made the
+# three composer toggles (Agent mode / Web search / Auto-generate) mutually
+# exclusive in effect even though the UI presents them as independent, and no
+# single turn could ever honour more than one of them:
+#
+#   "...presentation..."     -> Deck Builder    (agent_mode + web_search dropped)
+#   "...create a report..."  -> fixed Q&A form  (all three dropped)
+#   anything else, agent on  -> agent           (auto_generate dropped)
+#
+# So a user who ticked all three and asked for a researched, auto-generated
+# deck got a deck built with two of their three choices silently discarded.
+#
+# WHAT IT DOES INSTEAD: one small, fast LLM call reads the message and picks
+# the route itself, using the same cheap router model AgentRegistry.select_llm
+# already uses (see _build_router_provider). The toggles stop being mode
+# switches and become permissions — they bound what the router is ALLOWED to
+# pick, and within those bounds the decision comes from the query rather than
+# from whichever substring happened to appear in it.
+#
+# The degrade path is deliberately exact: with no router provider (mock mode,
+# no GEMINI_API_KEY, a call that fails or answers nonsense) this falls back to
+# _deterministic_plan, which reproduces the previous if/elif chain move for
+# move — so the "every flow works end-to-end with zero credentials" guarantee
+# and all existing routing behaviour survive unchanged.
+
+# Enough for this answer shape (four short fields) with real headroom — a
+# truncated answer is worse than a slightly costlier one, since it reads as
+# malformed JSON and degrades the whole turn to trigger matching.
+_ROUTER_MAX_TOKENS = 512
+
+# plan_turn's router provider — deliberately NOT settings.agent_router_model,
+# which select_llm uses and keeps.
+#
+# Measured live against both. agent_router_model's default (gemma-4-26b-a4b-it)
+# answers select_llm's one-line "which agent?" prompt fine, but on this larger
+# prompt it spends 10-15s on hidden reasoning it cannot be told to skip (Gemma
+# rejects thinkingConfig outright — see app/providers.py's
+# _GEMMA_THINKING_TOKEN_FLOOR) and routinely blew GeminiProvider's own 15s HTTP
+# timeout. Routing then degraded to trigger matching on roughly half of all
+# turns: the feature was silently off, which is indistinguishable from it not
+# existing. The configured Gemini chat model answers the same prompt in 1-3s,
+# because thinkingConfig CAN disable reasoning for real Gemini models.
+#
+# This call sits in front of every single turn, so its latency is the product.
+# It follows GEMINI_MODEL (already exposed on the Settings page) rather than
+# introducing another env var. Cached for the life of the process for the same
+# reason _build_router_provider is, and cleared by the same reset function.
+_turn_router_built = False
+_turn_router: AIProvider | None = None
+
+
+def _build_turn_router_provider() -> AIProvider | None:
+    global _turn_router_built, _turn_router
+    if _turn_router_built:
+        return _turn_router
+    _turn_router_built = True
+    if not settings.gemini_api_key:
+        return None
+    # No FallbackProvider wrapping, same as _build_router_provider: a failure
+    # here is handled explicitly by plan_turn's try/except, which degrades to
+    # trigger matching for that turn rather than landing on mock.
+    _turn_router = GeminiProvider(
+        settings.gemini_api_key, max_output_tokens=_ROUTER_MAX_TOKENS,
+        model=settings.gemini_model or GeminiProvider.DEFAULT_MODEL,
+    )
+    return _turn_router
+
+
+_ROUTE_DESCRIPTIONS = {
+    "deck": "The user wants a PowerPoint/slide deck built as a real downloadable file.",
+    "skill": "The user wants one of the file generators listed below to produce a document file.",
+    "agent": ("The request needs multi-step work — tools, live web research, code, or this "
+              "organisation's own indexed documents — rather than a single direct answer."),
+    "direct": "A simple, single-step request the model can answer straight out.",
+}
+
+
+@dataclass(frozen=True)
+class TurnPlan:
+    """One turn's routing decision.
+
+    `needs_web` is ADVISORY only — reported to the UI, never used to gate
+    anything. The Web search toggle is a hard ceiling on capability (a user who
+    switched it off must not get web calls because a router decided the query
+    "needed" them), and inside that ceiling the model already decides per-call
+    whether an offered tool is worth invoking. Its job is to explain the
+    decision, and to let the UI point out when a turn would have benefited from
+    a capability the user left switched off.
+
+    There is deliberately no `needs_knowledge` counterpart: knowledge-base
+    grounding is already autonomous and relevance-gated on every agent turn
+    (see AutoGenOrchestrator.run), so a router hint would change nothing and
+    only costs the router tokens it can't spare — see the prompt below.
+    """
+    route: str
+    skill_id: str | None = None
+    needs_web: bool = False
+    routed_by_llm: bool = False
+    reason: str = ""
+
+    def public(self) -> dict:
+        return {
+            "route": self.route, "skill_id": self.skill_id, "needs_web": self.needs_web,
+            "routed_by_llm": self.routed_by_llm, "reason": self.reason,
+        }
+
+
+def _loads_router_json(raw: str) -> dict:
+    """Gemini's JSON mode, given no response schema, is not consistent about the
+    shape it wraps an answer in: verified live against gemma-4-26b-a4b-it, the
+    same prompt returns a bare object on one call and `["{\\"route\\": ...}"]` —
+    the object re-encoded as a string inside a list — on the next. A parser that
+    only accepts the bare object silently degrades routing to trigger matching
+    on roughly every other turn, which looks exactly like the feature not
+    working. Peel up to a few layers of list/string before giving up, and fall
+    back to _extract_json (app/skills.py — the same tolerant extractor skill
+    spec-drafting already relies on) for the fenced//prose-wrapped answers
+    strict json.loads rejects outright."""
+    value: object = raw
+    for _ in range(4):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                extracted = _extract_json(value)
+                if extracted is None:
+                    raise
+                return extracted
+        elif isinstance(value, list):
+            if not value:
+                raise ValueError("router returned an empty list")
+            value = value[0]
+        else:
+            break
+    if not isinstance(value, dict):
+        raise ValueError(f"router returned {type(value).__name__}, expected an object")
+    return value
+
+
+def _as_bool(value: object) -> bool:
+    """Router models answer JSON booleans most of the time and the strings
+    "true"/"yes" the rest of the time; both must mean the same thing."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "yes", "1")
+
+
+def _deterministic_plan(keyword_match: dict | None, allow_agent: bool, allow_web: bool) -> TurnPlan:
+    """Exactly the routing CopilotService.chat() did before plan_turn existed —
+    the fallback whenever no router model is available. `keyword_match` is
+    SkillPackageStore.select_for_chat's result (as .public()), i.e. the same
+    substring match that used to be the whole routing decision."""
+    if keyword_match is not None:
+        skill_id = keyword_match["skill_id"]
+        return TurnPlan(
+            route="deck" if skill_id == "pptx" else "skill", skill_id=skill_id,
+            # The Deck Builder used to hardcode web_search=True regardless of the
+            # toggle; recording that as "this route wants the web" keeps the same
+            # intent while letting the toggle stay the thing that actually decides.
+            needs_web=(skill_id == "pptx"),
+            reason="matched this generator's chat triggers",
+        )
+    if allow_agent:
+        return TurnPlan(route="agent", needs_web=allow_web, reason="agent mode is on")
+    return TurnPlan(route="direct", reason="no generator matched and agent mode is off")
+
+
+async def plan_turn(
+    message: str, *, skills: list[dict], keyword_match: dict | None,
+    allow_agent: bool, allow_web: bool, provider: AIProvider,
+) -> TurnPlan:
+    """Decides what this turn should DO, from the message itself.
+
+    `skills`: SkillPackageStore.list() — the router is told the real installed
+    generators (id/name/output/description) rather than a hardcoded list, so an
+    uploaded skill package becomes routable the moment it's installed.
+
+    `allow_agent`/`allow_web`: the Agent mode and Web search toggles, as
+    permissions. allow_agent picks which non-generation route is on the menu
+    ("agent" when on, "direct" when off) — the router chooses between
+    generating a file and answering, never between those two. allow_web never
+    restricts routing at all (it gates tool offering at the point of use) and
+    is passed only so the deterministic fallback can reproduce the previous
+    behaviour exactly.
+
+    `provider`: the caller's chat provider, used only for the same
+    bare-MockProvider check AutoGenOrchestrator.run makes — explicitly mock
+    means "deterministic, no real model call", so the router is never built
+    for it and routing stays fully reproducible in tests.
+    """
+    fallback = _deterministic_plan(keyword_match, allow_agent, allow_web)
+    router_provider = _build_turn_router_provider() if not isinstance(provider, MockProvider) else None
+    if router_provider is None:
+        return fallback
+
+    by_id = {s["skill_id"]: s for s in skills}
+    # "agent" and "direct" are the two ends of the same non-generation route,
+    # picked by the toggle rather than by the router: Agent mode on means every
+    # non-generation turn gets the agent's RAG grounding and tools, off means
+    # every one is a plain answer. That's unchanged, and deliberately so —
+    # letting the router downgrade an agent-mode turn to "direct" would quietly
+    # cost it the relevance-gated knowledge-base grounding AutoGenOrchestrator.
+    # run does on every turn. What the router decides is the thing that was
+    # actually broken: whether this message wants a FILE generated at all.
+    allowed = ["agent"] if allow_agent else ["direct"]
+    if "pptx" in by_id:
+        allowed.append("deck")
+    if any(skill_id != "pptx" for skill_id in by_id):
+        allowed.append("skill")
+
+    # Kept deliberately terse. The default router model is Gemma, which spends
+    # hidden reasoning tokens in proportion to how much it is given to weigh and
+    # cannot be capped (see _ROUTER_MAX_TOKENS) — a longer prompt or a wordier
+    # answer shape pushes the visible JSON past the budget and the whole call
+    # degrades to trigger matching. Verified live: full 300-char skill
+    # descriptions plus a five-field answer failed on most deck requests even at
+    # 2048 tokens; this shape answers reliably at 1536.
+    routes_block = "\n".join(f'- "{route}": {_ROUTE_DESCRIPTIONS[route]}' for route in allowed)
+    skills_block = "\n".join(
+        f'- "{s["skill_id"]}" -> .{s["output"]}: {s["description"][:110]}' for s in skills
+    ) or "(none installed)"
+    prompt = (
+        "Route one message in an enterprise copilot. Answer with ONLY this JSON:\n"
+        '{"route": "...", "skill_id": "..." or null, "needs_web": true|false, "reason": "..."}\n\n'
+        f"Routes:\n{routes_block}\n\n"
+        f'Generators (use as "skill_id" for the file routes):\n{skills_block}\n\n'
+        'Pick a file route ONLY if the user wants a FILE made. Asking about, reviewing or '
+        "discussing a document or deck is not a request to generate one.\n"
+        '"needs_web": true only if answering needs current external facts.\n'
+        '"reason": under 10 words, shown to the user.\n\n'
+        f"Message:\n{message}"
+    )
+
+    try:
+        result = await router_provider.complete(prompt, [], max_tokens=_ROUTER_MAX_TOKENS, json_mode=True)
+        parsed = _loads_router_json(result.text)
+        route = str(parsed.get("route", "")).strip()
+    except Exception as exc:  # noqa: BLE001 - a router failure must degrade to trigger matching, never break the turn
+        logger.warning("Turn routing failed, falling back to trigger matching: %s", exc)
+        return fallback
+
+    if route not in allowed:
+        logger.warning("Turn router chose unavailable route %r, falling back to trigger matching.", route)
+        return fallback
+
+    skill_id = str(parsed.get("skill_id") or "").strip() or None
+    if route in ("deck", "skill"):
+        if skill_id not in by_id:
+            # Router picked a generation route but couldn't name a real
+            # generator — take the one the substring matcher found, if any.
+            skill_id = "pptx" if route == "deck" and "pptx" in by_id else (keyword_match or {}).get("skill_id")
+        if skill_id not in by_id:
+            # Still nothing real to run. Answering the message beats running
+            # the wrong generator against it.
+            return TurnPlan(
+                route="agent" if allow_agent else "direct", routed_by_llm=True,
+                reason="no matching generator is installed",
+            )
+        # Keep route and skill_id consistent however the router paired them:
+        # "pptx" is the Deck Builder's conversational flow, every other skill is
+        # SkillRunService's fixed-question form. Neither reassignment can name a
+        # route that wasn't in `allowed` — skill_id == "pptx" implies "deck" was
+        # offered, and anything else implies "skill" was.
+        route = "deck" if skill_id == "pptx" else "skill"
+    else:
+        skill_id = None
+
+    return TurnPlan(
+        route=route, skill_id=skill_id, needs_web=_as_bool(parsed.get("needs_web")),
+        routed_by_llm=True, reason=str(parsed.get("reason", "")).strip()[:120],
+    )
 
 
 # --- agent-mode system prompt ------------------------------------------------
@@ -1058,6 +1337,13 @@ class DeckBuilderResult:
     used_fallback: bool = False           # True whenever _fallback_deck_spec ran (no model client, or unparseable JSON)
     provider: str | None = None
     model: str | None = None
+    # Real web_search results this run actually read — same {"title", "url",
+    # "content"} shape as OrchestrationResult.web_sources, so the UI renders
+    # deck research with the identical citation panel it uses for agent turns.
+    # These were previously emitted as progress events and then dropped on the
+    # floor: the turn's meta hardcoded an empty list, so a deck built entirely
+    # from live sources showed no sources at all.
+    web_sources: list[dict] = field(default_factory=list)
 
 
 class DeckBuilderOrchestrator:
@@ -1075,32 +1361,48 @@ class DeckBuilderOrchestrator:
     async def run_turn(self, task: str, context: dict, on_event: EventSink | None = None) -> DeckBuilderResult:
         """`task`: the accumulated task_brief (original request + prior
         clarifying Q&A) plus this turn's new user message, already merged by
-        the caller. `context`: currently unused beyond being available for
-        future extension (mirrors AutoGenOrchestrator.run()'s signature
-        shape) — session_id/etc. aren't needed here since this method is
-        stateless per call."""
+        the caller.
+
+        `context["web_search"]`: this turn's Web search toggle. Previously the
+        Tavily tool was offered unconditionally here (`web_search=True`), which
+        meant a deck request made live web calls whether or not the user had
+        asked for that — the toggle was simply not reachable from this route.
+        It now behaves the same way it does on an agent turn: offered when the
+        user permits it, and the model still decides per-call whether to use
+        it. Defaults True so a caller that doesn't pass one (tests, any future
+        internal caller) keeps the previous behaviour."""
         model_client, provider_name, model_name = build_streaming_model_client(function_calling=True)
         if model_client is None:
             await _emit(on_event, {"stage": "drafting_spec", "label": "No model configured — using a basic deck."})
             return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True)
 
+        # Owned here, not inside _run_magentic_one, so research already done
+        # survives a failure part-way through the run. That is not theoretical:
+        # AutoGen raises RuntimeError("Reflect on tool use produced no valid
+        # text response.") when the model returns empty content while
+        # summarising tool results, which happens on exactly the turns that
+        # searched the most. Losing the citations as well as the deck made a
+        # turn that really did three web searches look like it did nothing.
+        web_sources: list[dict] = []
         try:
-            tools = await get_mcp_tools(web_search=True)
+            tools = await get_mcp_tools(web_search=context.get("web_search", True))
             agent = AssistantAgent(
                 "deck_builder", model_client=model_client, tools=tools,
                 system_message=_build_deck_builder_system_message(self.skill.instructions),
                 reflect_on_tool_use=True,
             )
             team = MagenticOneGroupChat([agent], model_client=model_client, max_turns=_DECK_BUILDER_MAX_TURNS)
-            final_text = await self._run_magentic_one(team, task, on_event)
+            final_text = await self._run_magentic_one(team, task, on_event, web_sources)
         except Exception as exc:  # noqa: BLE001 - a Magentic-One failure must degrade, never break the turn
             logger.warning("Deck Builder Magentic-One run failed, falling back to a basic deck: %s", exc)
-            return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True)
+            return DeckBuilderResult(
+                spec=_fallback_deck_spec(task), used_fallback=True, web_sources=web_sources,
+            )
         finally:
             await model_client.close()
 
         if not (final_text or "").strip():
-            return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True)
+            return DeckBuilderResult(spec=_fallback_deck_spec(task), used_fallback=True, web_sources=web_sources)
 
         spec = _extract_json(final_text)
         if spec is None or not isinstance(spec, dict) or not spec.get("title"):
@@ -1108,11 +1410,19 @@ class DeckBuilderOrchestrator:
             # clarifying question/status, not a failure. The caller keeps
             # the session in "clarifying" phase and shows this text as the
             # chat response.
-            return DeckBuilderResult(clarifying_text=final_text.strip(), provider=provider_name, model=model_name)
+            return DeckBuilderResult(
+                clarifying_text=final_text.strip(), provider=provider_name, model=model_name,
+                web_sources=web_sources,
+            )
 
-        return DeckBuilderResult(spec=spec, provider=provider_name, model=model_name)
+        return DeckBuilderResult(
+            spec=spec, provider=provider_name, model=model_name, web_sources=web_sources,
+        )
 
-    async def _run_magentic_one(self, team: MagenticOneGroupChat, task: str, on_event: EventSink | None) -> str:
+    async def _run_magentic_one(
+        self, team: MagenticOneGroupChat, task: str, on_event: EventSink | None,
+        web_sources: list[dict],
+    ) -> str:
         """Consumes MagenticOneGroupChat.run_stream()'s event shape — DIFFERENT
         from AutoGenOrchestrator._run_with_tools' on_messages_stream/Response
         (MagenticOneGroupChat has no on_messages_stream; it's a BaseGroupChat,
@@ -1123,9 +1433,19 @@ class DeckBuilderOrchestrator:
         plus a new "planning" stage for the orchestrator's own plan/ledger
         TextMessages — there is no dedicated plan/progress-ledger event type
         in this AutoGen version, confirmed by inspecting the installed
-        package: the orchestrator only ever emits plain TextMessage."""
+        package: the orchestrator only ever emits plain TextMessage.
+
+        Returns the final answer text, and appends every web source this run
+        read to the caller's `web_sources` list — appended as they arrive, not
+        returned at the end, so a run that raises part-way through still leaves
+        the caller holding the research it already did (see run_turn).
+        Deduped by URL, first-seen order, the same treatment _run_with_tools
+        gives its own sources and for the same reason: a Magentic-One run
+        routinely reformulates its query and re-searches, so raw results
+        overlap heavily."""
         token = CancellationToken()
         final_text = ""
+        seen_urls = {s["url"] for s in web_sources}
         async for event in team.run_stream(task=task, cancellation_token=token):
             if isinstance(event, ToolCallRequestEvent):
                 for call in event.content:
@@ -1147,6 +1467,10 @@ class DeckBuilderOrchestrator:
                                 "stage": "web_sources", "label": f"{len(parsed)} web source(s) found.",
                                 "sources": parsed,
                             })
+                            for source in parsed:
+                                if source["url"] not in seen_urls:
+                                    seen_urls.add(source["url"])
+                                    web_sources.append(source)
             elif isinstance(event, TextMessage) and event.source == "MagenticOneOrchestrator":
                 await _emit(on_event, {"stage": "planning", "label": str(event.content)[:200]})
             elif isinstance(event, TaskResult):

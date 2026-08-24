@@ -96,6 +96,12 @@ async def test_auto_generate_off_queues_hitl_approval(tmp_path, monkeypatch):
     pending = [r for r in service.hitl.list() if r["kind"] == "deck_generation"]
     assert len(pending) == 1
     record = pending[0]
+    # The turn must SAY it queued something. The UI attaches the inline
+    # approve/reject card and refreshes the Pending approvals panel off this
+    # field alone (static/app.js, sendMessage) — reporting [] while a record
+    # existed left the queued deck invisible until the Agents & Tools tab was
+    # opened and happened to reload the queue.
+    assert result["hitl_pending"] == [record["request_id"]]
     assert record["status"] == "WAITING_FOR_APPROVAL"
     assert record["deck_spec"] == _TEST_SPEC
     assert record["skill_id"] == "pptx"
@@ -106,6 +112,30 @@ async def test_auto_generate_off_queues_hitl_approval(tmp_path, monkeypatch):
     artifact_id = decided["downloadable_artifacts"][0]["artifact_id"]
     stored = service.artifacts.get(artifact_id)
     assert stored.mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+@pytest.mark.asyncio
+async def test_deck_phases_that_queue_nothing_report_no_pending_approval(tmp_path, monkeypatch):
+    """The mirror of the assertion above: a turn that generated immediately, or
+    is still clarifying, must report an EMPTY hitl_pending — a stale id there
+    would pin an approve/reject card to a message with nothing to approve."""
+    service = _service(tmp_path)
+    monkeypatch.setattr(
+        service.deck_builder, "_orchestrator_for", lambda skill: _fake_orchestrator(_TEST_SPEC)(skill),
+    )
+    generated = await service.chat(
+        "make me a powerpoint about Q3", agent_mode=False, session_id=None, auto_generate=True,
+    )
+    assert generated["downloadable_artifacts"]
+    assert generated["hitl_pending"] == []
+
+    class _Clarifying(DeckBuilderOrchestrator):
+        async def run_turn(self, task, context, on_event=None):
+            return DeckBuilderResult(clarifying_text="Who is the audience?", provider="mock")
+
+    monkeypatch.setattr(service.deck_builder, "_orchestrator_for", lambda skill: _Clarifying(skill))
+    clarifying = await service.chat("make me a powerpoint about Q4", agent_mode=False, session_id=None)
+    assert clarifying["hitl_pending"] == []
 
 
 @pytest.mark.asyncio

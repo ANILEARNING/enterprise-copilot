@@ -32,9 +32,12 @@ below.
   `web_search` tool backed by the [Tavily Search
   API](https://docs.tavily.com/documentation/api-reference/endpoint/search).
   Unlike the two servers above, it's only ever offered to the model on a
-  given turn when the UI's **Web Search** toggle (next to Agent mode) is
-  also on for that turn — configuring the key alone doesn't make every
-  agent-mode turn search the web. The key reaches the child process only
+  given turn when the UI's **Web Search** toggle is also on for that turn —
+  configuring the key alone doesn't make every turn search the web. The
+  toggle is independent of Agent mode and applies to both tool-using routes:
+  an agent turn (`AutoGenOrchestrator.run`) and Deck Builder research
+  (`DeckBuilderOrchestrator.run_turn`, which previously searched
+  unconditionally and so ignored the toggle). The key reaches the child process only
   through its own environment (never the app's own env, never logged, never
   echoed in a tool result). See `app/mcp_tools.py:get_mcp_tools(web_search=...)`
   and `app/models.py:ChatRequest.web_search`.

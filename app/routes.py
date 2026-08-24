@@ -91,6 +91,7 @@ async def chat(request: ChatRequest):
         tool_calls=result.get("tool_calls", []),
         web_sources=result.get("web_sources", []),
         downloadable_artifacts=result.get("downloadable_artifacts", []),
+        routing=result.get("routing"),
     )
 
 def _sse(payload: dict) -> str:

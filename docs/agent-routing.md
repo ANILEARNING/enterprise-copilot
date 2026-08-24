@@ -1,5 +1,113 @@
 # Agent routing
 
+Two routing decisions run per turn, in this order:
+
+1. **Turn routing** — `plan_turn` (`app/agents.py`) decides *what this message
+   should do*: generate a deck, generate a document, run the agent, or answer
+   directly. See [Turn routing](#turn-routing) below.
+2. **Agent routing** — only on turns that took the agent route,
+   `AgentRegistry.select_llm` decides *which agent* handles it. That's the rest
+   of this document.
+
+---
+
+# Turn routing
+
+## The problem it fixes
+
+Turn routing used to be a fixed `if/elif` chain over `SkillPackageStore.
+select_for_chat`'s substring match, evaluated **before** `agent_mode` was ever
+read. Because each branch was terminal, the three composer toggles were
+mutually exclusive in effect even though the UI presents them as independent —
+no single turn could honour more than one:
+
+| Message | Old route | Toggles silently dropped |
+| --- | --- | --- |
+| "...presentation..." | Deck Builder | Agent mode, Web search |
+| "...create a report..." | fixed Q&A form | all three |
+| anything else, agent on | agent | Auto-generate |
+
+So ticking all three and asking for a researched, auto-generated deck built one
+with two of the three choices discarded — and asking *about* a presentation
+("what did last quarter's presentation say about churn?") was hijacked into the
+Deck Builder, because `presentation` is one of `skills/pptx/SKILL.md`'s
+`chat_triggers`.
+
+## How it works
+
+`plan_turn(message, skills=..., keyword_match=..., allow_agent=..., allow_web=...,
+provider=...)` makes one small LLM call and returns a `TurnPlan`:
+`route` (`"deck" | "skill" | "agent" | "direct"`), `skill_id`, `needs_web`,
+`routed_by_llm`, `reason`. The plan is surfaced to the UI as a `routing`
+progress event and on `ChatResponse.routing`, so the decision and its reason
+are visible rather than implicit.
+
+The router is told the **real installed generators** (`SkillPackageStore.list()`
+— id, output extension, description), so an uploaded skill package becomes
+routable the moment it's installed; nothing is hardcoded.
+
+## Toggles are permissions, not modes
+
+They bound what the router may choose and what the chosen route may do:
+
+- **Agent mode** picks which non-generation route is on the menu: `"agent"`
+  when on, `"direct"` when off. The router chooses between *generating a file*
+  and *answering* — never between those two. Letting it downgrade an agent-mode
+  turn to `"direct"` would quietly cost that turn the relevance-gated
+  knowledge-base grounding `AutoGenOrchestrator.run` does on every turn.
+- **Web search** never restricts routing; it gates tool offering at the point
+  of use, on both tool-using routes (agent turns and Deck Builder research).
+- **Auto-generate** gates only whether a finished deck spec may generate
+  without HITL approval.
+
+`TurnPlan.needs_web` is **advisory** — reported, never used to gate anything. A
+user who switched Web search off must not get web calls because a router
+decided the query "needed" them, and within that ceiling the model already
+decides per-call whether an offered tool is worth invoking. (There is
+deliberately no `needs_knowledge` counterpart: RAG grounding is already
+autonomous and relevance-gated on every agent turn, so the hint would change
+nothing and only costs router tokens.)
+
+## Fallback (reproduces the old behaviour exactly)
+
+`_deterministic_plan` — the previous `if/elif` chain, move for move: a trigger
+match routes to deck/skill, otherwise agent-or-direct per the toggle. It runs
+whenever the router is unavailable: a bare `MockProvider` (deterministic, no
+real model call — same contract `select_llm` has), no `GEMINI_API_KEY`, a call
+that raises, or an answer that isn't usable. So the "every flow works
+end-to-end with zero credentials" guarantee holds, and a router outage degrades
+to exactly the old routing rather than to an error.
+
+`plan_turn` also tolerates two answer shapes that strict parsing rejects, both
+verified live against the real API: the object re-encoded as a string inside a
+list (`["{\"route\": ...}"]`, which Gemini's JSON mode returns on some calls and
+not others), and fenced/prose-wrapped JSON (via `_extract_json`). Before that,
+routing degraded to trigger matching on roughly every other turn — which looks
+exactly like the feature not working.
+
+## Model choice: not `AGENT_ROUTER_MODEL`
+
+`plan_turn` deliberately uses the configured **Gemini chat model**
+(`GEMINI_MODEL`, default `gemini-flash-latest`) via
+`_build_turn_router_provider`, *not* `settings.agent_router_model`.
+
+Measured live against both. The `agent_router_model` default
+(`gemma-4-26b-a4b-it`) answers `select_llm`'s one-line "which agent?" prompt
+fine, but on this larger prompt it spent **10–15s** on hidden reasoning it
+cannot be told to skip and routinely blew `GeminiProvider`'s own 15s HTTP
+timeout — routing then degraded to trigger matching on about half of all turns.
+The Gemini chat model answers the same prompt in **1–3s**, because
+`thinkingConfig` *can* disable reasoning for real Gemini models. This call sits
+in front of every single turn, so its latency is the product.
+
+Also note this is a second model call per turn, on top of `select_llm`'s on
+agent turns. Both degrade gracefully under rate limiting (a 429 falls back to
+trigger matching), but on a constrained free-tier key that fallback will fire.
+
+---
+
+# Agent routing
+
 Which agent handles an agent-mode turn is decided by `AgentRegistry.select_llm`
 (`app/agents.py`) — an LLM classification call, not the older pure-keyword match
 (`AgentRegistry.select`, still present and used as the fallback below).
