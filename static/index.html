@@ -94,15 +94,15 @@
             <span class="pill pill-neutral" id="modePill"><span class="pill-dot"></span>Demo mode</span>
             <span class="session-tag" id="chatSessionTag">no session</span>
             <div class="topbar-spacer"></div>
-            <label class="composer-toggle">
+            <label class="composer-toggle" title="Answers that aren't file requests go through the multi-step agent — knowledge-base grounding, tools, code. Off: they get a direct answer instead.">
               <input type="checkbox" id="agentMode" class="form-check-input" style="margin:0">
               Agent mode
             </label>
-            <label class="composer-toggle" id="webSearchToggleWrap" title="Lets the agent search the live web when it decides that helps answer your question. Requires Agent mode.">
+            <label class="composer-toggle" id="webSearchToggleWrap" title="Lets this turn search the live web when it decides that helps — on agent answers and on deck research alike.">
               <input type="checkbox" id="webSearch" class="form-check-input" style="margin:0">
               🔎 Web Search
             </label>
-            <label class="composer-toggle" id="autoGenerateToggleWrap" title="Only applies to deck-building requests. OFF (default): a drafted deck is queued for your approval in Pending approvals before it's generated. ON: generates immediately, no approval step.">
+            <label class="composer-toggle" id="autoGenerateToggleWrap" title="Applies to deck-building requests. OFF (default): a drafted deck is queued for your approval in Pending approvals before it's generated. ON: generates immediately, no approval step.">
               <input type="checkbox" id="autoGenerate" class="form-check-input" style="margin:0">
               ⚡ Auto-generate
             </label>

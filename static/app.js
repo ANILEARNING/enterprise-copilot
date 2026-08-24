@@ -893,10 +893,11 @@ async function sendMessage(text, opts = {}) {
   const message = (text ?? $("message").value).trim();
   if (!message) return;
   const agentMode = opts.agentMode ?? $("agentMode").checked;
-  const webSearch = agentMode && $("webSearch").checked;
-  // Independent of agentMode — Deck Builder fires on a "pptx" chat-trigger
-  // match regardless of the Agent Mode toggle (see CopilotService.chat()'s
-  // routing), so this must stay checkable/sendable either way.
+  // All three toggles are independent permissions the server composes on a
+  // single turn (see CopilotService.chat's routing) — none of them gates
+  // another here. Web Search in particular used to be ANDed with agentMode,
+  // which silently dropped it on exactly the turns that research decks.
+  const webSearch = opts.webSearch ?? $("webSearch").checked;
   const autoGenerate = opts.autoGenerate ?? $("autoGenerate").checked;
   // Attachments are opt.images (retry/regenerate replaying an earlier user
   // message) or whatever's staged in the composer for a fresh send.
@@ -1148,11 +1149,12 @@ function addImageFiles(fileList) {
   });
 }
 
-// Web Search only ever takes effect in agent mode (tool-calling is an
-// agent-mode-only path — see AutoGenOrchestrator._run_with_tools). Keeping
-// the checkbox visually enabled but syncing a "needs agent mode" hint (via
-// syncWebSearchToggle) rather than hard-disabling it avoids a confusing
-// "why won't this check" moment if someone taps it before Agent mode.
+// Web Search used to be dimmed and inert unless Agent mode was also on, because
+// tool-calling only happened on the agent path. It no longer depends on it: the
+// Deck Builder is a tool-calling path too (it was searching the web on every
+// deck request whether or not this box was ticked), so the toggle now means the
+// same thing on every route — "this turn may search the live web" — and stands
+// on its own. TAVILY_API_KEY remains the one thing that can disable it.
 let webSearchConfigured = true; // optimistic until renderMcpStatus() confirms
 
 function updateWebSearchToggleAvailability(configured) {
@@ -1164,7 +1166,6 @@ function syncWebSearchToggle() {
   const wrap = $("webSearchToggleWrap");
   const input = $("webSearch");
   if (!wrap || !input) return;
-  const agentOn = $("agentMode").checked;
   if (!webSearchConfigured) {
     input.checked = false;
     input.disabled = true;
@@ -1172,16 +1173,14 @@ function syncWebSearchToggle() {
     wrap.style.opacity = "0.5";
   } else {
     input.disabled = false;
-    wrap.style.opacity = agentOn ? "1" : "0.6";
-    wrap.title = agentOn
-      ? "Lets the agent search the live web when it decides that helps answer your question."
-      : "Requires Agent mode to take effect.";
+    wrap.style.opacity = "1";
+    wrap.title = "Lets this turn search the live web when it decides that helps — "
+      + "on agent answers and on deck research alike.";
   }
 }
 
 function initChat() {
   $("send").addEventListener("click", () => sendMessage());
-  $("agentMode").addEventListener("change", syncWebSearchToggle);
   $("message").addEventListener("input", (e) => autoGrow(e.target));
   $("message").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }

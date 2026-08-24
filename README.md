@@ -116,18 +116,33 @@ request-flow diagram — lives at [`docs/architecture-explorer.html`](docs/archi
 
 ### Agent architecture
 
-Every chat message is routed by `CopilotService.chat()` in one strict order — an in-progress
-skill Q&A continues first, then an in-progress Deck Builder conversation, then a fresh trigger
-match, then Agent Mode, then a direct provider call:
+An in-progress exchange always continues first — a half-finished skill Q&A or deck
+clarification is a conversation already underway, not a new request. Once nothing is pending,
+`plan_turn()` (`app/agents.py`) decides what the message should actually do, from the message
+itself rather than from whichever substring happens to appear in it:
 
 ```
 check_input()  →  CopilotService.chat()  →  ┬─ pending_skill_run?     → SkillRunService
- (guardrails)        (routing decision)     ├─ pending_deck_builder?  → DeckBuilderOrchestrator
-                                             ├─ agent_mode on?        → AutoGenOrchestrator
-                                             └─ else                  → AIProvider.complete()
+ (guardrails)                                ├─ pending_deck_builder?  → DeckBuilderOrchestrator
+                                             └─ plan_turn()  ─┬─ "deck"   → DeckBuilderOrchestrator
+                                              (LLM router,    ├─ "skill"  → SkillRunService
+                                               trigger-match  ├─ "agent"  → AutoGenOrchestrator
+                                               fallback)      └─ "direct" → AIProvider.complete()
                                                                               │
                                                                      check_output()  →  response
 ```
+
+The three composer toggles are **permissions**, not modes — they bound what `plan_turn` may
+choose and what the chosen route may do, and they compose on a single turn:
+
+| Toggle | Means |
+| --- | --- |
+| **Agent mode** | Non-generation turns go through `AutoGenOrchestrator` (RAG grounding, tools) instead of a direct answer. |
+| **Web Search** | This turn may call the live web — on agent answers *and* deck research alike. |
+| **Auto-generate** | A finished deck spec may generate without a human approving it first. |
+
+See [`docs/agent-routing.md`](docs/agent-routing.md) for the router prompt, its fallback and
+its model choice.
 
 - **`AutoGenOrchestrator`** (`app/agents.py`) — agent-mode requests. LLM-based agent selection
   (`AgentRegistry.select_llm`, keyword-match fallback), RAG grounding with guardrail screening,

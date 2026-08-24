@@ -12,8 +12,8 @@ from uuid import uuid4
 from autogen_core import CancellationToken
 
 from .agents import (
-    AgentOrchestrator, AutoGenOrchestrator, DeckBuilderOrchestrator,
-    default_agent_registry, default_skill_registry, reset_router_provider_cache,
+    AgentOrchestrator, AutoGenOrchestrator, DeckBuilderOrchestrator, TurnPlan,
+    default_agent_registry, default_skill_registry, plan_turn, reset_router_provider_cache,
 )
 from .artifacts import ArtifactStore
 from .config import settings
@@ -34,7 +34,7 @@ from .sandbox import CodeSandbox, build_sandbox
 from .skills import SkillPackageError, SkillPackageStore, SkillRunService, run_generation_script
 from .storage import SessionStore
 from .streaming import stream_chat
-from .vector_store import VectorPoint, VectorStore, build_vector_store
+from .vector_store import QdrantVectorStore, VectorPoint, VectorStore, build_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -537,15 +537,29 @@ class RAGStore:
 
         # Bootstrap doc, seeded synchronously at construction time (no event
         # loop available yet — CopilotService() is constructed at plain
-        # synchronous app-startup time) — always via the offline hash
-        # embedder directly, regardless of self.embedding_provider, since
-        # this trivial internal doc doesn't warrant a real embedding call.
-        # See _run_sync's docstring for why this can't just be asyncio.run().
+        # synchronous app-startup time). Which embedder seeds it matters more
+        # than it looks: whichever embedding call upserts the FIRST vector
+        # ever written to this vector_store determines that collection's
+        # permanent dimension (see VectorStore._ensure_collection/Qdrant's
+        # "vector dimension error" on any later mismatch — a Qdrant
+        # collection can't hold two different vector sizes). For the
+        # in-memory fallback that's harmless (InMemoryVectorStore tolerates
+        # mixed dimensions per search, matching by length) so this trivial
+        # internal doc doesn't warrant a real embedding call there — but for
+        # a real, persistent store like Qdrant it must be seeded with the
+        # SAME embedding_provider real documents will actually use, or every
+        # later document add fails with a dimension mismatch the moment a
+        # real provider embeds at a different size than the offline hash
+        # embedder's fixed EMBEDDING_DIM. See _run_sync's docstring for why
+        # this can't just be asyncio.run().
+        bootstrap_embedding_provider = (
+            self.embedding_provider if isinstance(self.vector_store, QdrantVectorStore) else HashEmbeddingProvider()
+        )
         existing = self.documents.list()
         if not existing:
             content = "Enterprise Copilot knowledge base. Documents can be added, updated, deleted and retrieved."
             doc = self.documents.create("welcome.md", content, tenant_id=self.tenant_id)
-            _run_sync(self._reindex(doc["document_id"], embedding_provider=HashEmbeddingProvider()))
+            _run_sync(self._reindex(doc["document_id"], embedding_provider=bootstrap_embedding_provider))
         else:
             # A restart with documents already on disk (DocumentStore
             # persisted them, or Qdrant still has their vectors) — rebuild
@@ -862,7 +876,7 @@ class DeckBuilderService:
 
     async def _run_and_handle(
         self, session_id: str, skill_id: str, task_brief: str, auto_generate: bool,
-        on_event=None,
+        web_search: bool, on_event=None,
     ) -> tuple[str, dict]:
         """Runs one Deck Builder turn and applies its result: a clarifying
         question keeps `pending_deck_builder` set (phase stays "clarifying"),
@@ -870,19 +884,42 @@ class DeckBuilderService:
         queued through HitlService (False, the default). Always clears
         `pending_deck_builder` except on the clarifying-question path.
         Returns (chat response text, meta dict for CopilotService.chat's
-        `meta`/`skill_run`-equivalent surface)."""
+        `meta`/`skill_run`-equivalent surface). That meta always carries
+        `hitl_pending` — the ids of any approval this turn actually queued.
+        It is what tells the UI an approval is waiting: the frontend attaches
+        the inline approve/reject card and refreshes the Pending approvals
+        panel off `ChatResponse.hitl_pending` (static/app.js, sendMessage) and
+        does neither when it's empty. Reporting `[]` here while
+        submit_deck_generation had just created a record left the queued deck
+        invisible until something else happened to reload the queue — opening
+        the Agents &amp; Tools tab, which calls loadHitlRequests() and populates
+        both panels at once.
+
+        `web_search`: this turn's Web search toggle, forwarded to the
+        orchestrator (which used to offer the Tavily tool unconditionally —
+        see DeckBuilderOrchestrator.run_turn). Persisted alongside
+        `auto_generate` in `pending_deck_builder` so a multi-turn
+        clarification keeps researching on the same terms the user set when
+        they started, rather than silently changing capability mid-flow."""
         skill = self.skill_packages.get(skill_id)
         orchestrator = self._orchestrator_for(skill)
-        result = await orchestrator.run_turn(task_brief, {"session_id": session_id}, on_event=on_event)
+        result = await orchestrator.run_turn(
+            task_brief, {"session_id": session_id, "web_search": web_search}, on_event=on_event,
+        )
+        # Carried on every return path below: research the deck actually read
+        # is worth citing whether the deck was generated, queued or is still
+        # being clarified.
+        web_sources = result.web_sources
 
         if result.spec is None:
             # Still clarifying — keep the conversation going.
             self.sessions.set_field(session_id, "pending_deck_builder", {
                 "skill_id": skill_id, "phase": "clarifying", "auto_generate": auto_generate,
-                "task_brief": task_brief, "hitl_request_id": None,
+                "web_search": web_search, "task_brief": task_brief, "hitl_request_id": None,
             })
             return result.clarifying_text or "Could you tell me a bit more about the deck you want?", {
                 "deck_builder": {"phase": "clarifying"}, "downloadable_artifacts": [],
+                "web_sources": web_sources, "hitl_pending": [],
             }
 
         if auto_generate:
@@ -895,12 +932,14 @@ class DeckBuilderService:
                 self.sessions.set_field(session_id, "last_deck_spec", result.spec)
                 return (
                     f"Done! Generated **{artifact['filename']}** — view or download it below.",
-                    {"deck_builder": {"phase": "completed"}, "downloadable_artifacts": [artifact]},
+                    {"deck_builder": {"phase": "completed"}, "downloadable_artifacts": [artifact],
+                     "web_sources": web_sources, "hitl_pending": []},
                 )
             except SkillPackageError as exc:
                 self.sessions.set_field(session_id, "pending_deck_builder", None)
                 return f"Couldn't generate the deck: {exc}", {
                     "deck_builder": {"phase": "failed"}, "downloadable_artifacts": [],
+                    "web_sources": web_sources, "hitl_pending": [],
                 }
 
         # Auto-generate OFF (default): queue for approval, don't run yet.
@@ -914,23 +953,31 @@ class DeckBuilderService:
         })
         return (
             f"I've drafted the deck (**{result.spec.get('title', 'Untitled')}**) and queued it for your "
-            "approval — check Pending approvals to review and generate it.",
+            "approval — review and generate it right here, or from Pending approvals.",
             {"deck_builder": {"phase": "awaiting_approval", "hitl_request_id": record["request_id"]},
-             "downloadable_artifacts": []},
+             "downloadable_artifacts": [], "web_sources": web_sources,
+             "hitl_pending": [record["request_id"]]},
         )
 
-    async def start(self, session_id: str, skill, message: str, auto_generate: bool, on_event=None) -> tuple[str, dict]:
+    async def start(self, session_id: str, skill, message: str, auto_generate: bool,
+                    web_search: bool = False, on_event=None) -> tuple[str, dict]:
         last_spec = self.sessions.get(session_id).get("last_deck_spec")
         task_brief = (
             f"The user previously had this deck generated:\n{json.dumps(last_spec)}\n\n"
             f"They now want this change: {message}"
         ) if last_spec else message
-        return await self._run_and_handle(session_id, skill.skill_id, task_brief, auto_generate, on_event=on_event)
+        return await self._run_and_handle(
+            session_id, skill.skill_id, task_brief, auto_generate, web_search, on_event=on_event,
+        )
 
     async def continue_turn(self, session_id: str, pending: dict, message: str, on_event=None) -> tuple[str, dict]:
         task_brief = f"{pending['task_brief']}\n\nUser: {message}"
         return await self._run_and_handle(
-            session_id, pending["skill_id"], task_brief, pending["auto_generate"], on_event=on_event,
+            session_id, pending["skill_id"], task_brief, pending["auto_generate"],
+            # .get, not ["web_search"]: a pending_deck_builder written by an
+            # older build (or restored from a checkpoint saved by one) predates
+            # this field entirely and must not KeyError mid-conversation.
+            pending.get("web_search", False), on_event=on_event,
         )
 
 
@@ -1010,6 +1057,7 @@ class CopilotService:
         on_event: Callable[[dict], Awaitable[None]] | None = None,
         images: list[dict] | None = None, allow_live_hitl_wait: bool = False,
         web_search: bool = False, auto_generate: bool = False,
+        plan: TurnPlan | None = None,
     ) -> dict:
         """`on_event`, when given, receives live progress events for the
         multi-step paths below (skill drafting/generation, agent-mode
@@ -1026,16 +1074,36 @@ class CopilotService:
         `images`: optional multimodal attachments for this turn (see
         app/models.py:ImageAttachment).
 
-        `web_search`: the turn's "Web Search" UI toggle — offers the Tavily
-        web_search MCP tool for this turn (app/mcp_tools.py) when agent_mode
-        is also on. No effect otherwise (only agent-mode turns tool-call at
-        all) — see AutoGenOrchestrator.run's `context["web_search"]`.
+        The three UI toggles below are PERMISSIONS, not modes: they bound what
+        plan_turn (app/agents.py) may choose and what the chosen route may
+        then do, but none of them selects a route by itself. That's the point
+        — they used to be mutually exclusive in practice, so a turn could
+        only ever honour one of them.
 
-        `auto_generate`: the turn's "Auto-generate" UI toggle — only
-        meaningful for the Deck Builder flow (a "pptx" chat-trigger match,
-        see DeckBuilderService). False (default): a drafted deck spec is
-        queued through HitlService for approval before it's generated. True:
-        generates immediately, no approval step. No effect on any other path.
+        `agent_mode`: whether the multi-step tool-calling agent route may be
+        chosen for this turn at all. Off keeps routing to direct answers and
+        file generators, as before.
+
+        `web_search`: whether this turn may call the live web — the Tavily
+        web_search MCP tool (app/mcp_tools.py). Now honoured on BOTH
+        tool-using routes: the agent (AutoGenOrchestrator.run's
+        `context["web_search"]`) and the Deck Builder
+        (DeckBuilderOrchestrator.run_turn, which previously searched
+        unconditionally and so ignored this toggle entirely). The model still
+        decides per-call whether an offered tool is worth calling.
+
+        `auto_generate`: whether a finished deck spec may generate without a
+        human approving it first. False (default): the spec is queued through
+        HitlService. True: generates immediately. Deck Builder only — the
+        fixed-question skill flow has its own download step and no HITL gate
+        for this to lift.
+
+        `plan`: an already-computed routing decision (app/agents.py:TurnPlan).
+        Only chat_stream passes one — it has to know the route before it can
+        choose between token streaming and delegating here, so it computes the
+        plan once and hands it over rather than paying for a second router
+        call that could also disagree with the first. None (every other
+        caller, including the plain /api/chat route) means "decide here".
 
         `allow_live_hitl_wait`: only CopilotService.chat_stream's real-time
         SSE delegate branch sets this — a long-lived connection that can
@@ -1118,20 +1186,29 @@ class CopilotService:
                         "agent": None, "skills": [], "provider": None, "model": None,
                         "used_fallback": False, "hitl_pending": [], "sources": [], "skill_run": None,
                         "tool_calls": [], "web_sources": [], "downloadable_artifacts": [],
+                        # Blocked before routing ever ran — there is no decision to report.
+                        "routing": None,
                     }
 
-                # Skill routing: checked before agent_mode, regardless of its toggle state —
-                # "create a docx about X" is a tool-dispatch decision, not a chat-generation
-                # one. An in-progress skill Q&A (pending_skill_run) always continues first;
-                # only once nothing is pending do we check for a *new* skill trigger.
+                # Routing. An in-progress exchange always continues first — a
+                # half-finished skill Q&A or deck clarification is a conversation
+                # already underway, not a new request to classify. Only once nothing
+                # is pending does plan_turn() decide what this message should do.
                 #
-                # Deck Builder (pending_deck_builder / the "pptx" skill match below) sits
-                # in the same precedence slot as pending_skill_run/select_for_chat — an
-                # in-progress conversational deck-building exchange always continues
-                # first, and a fresh "pptx" chat-trigger match diverts to the Deck
-                # Builder's conversational/research flow instead of the fixed-question
-                # form every other skill uses. See DeckBuilderService.
+                # That decision used to be a fixed if/elif chain over
+                # SkillPackageStore.select_for_chat's substring match, evaluated ahead
+                # of agent_mode — which made the three composer toggles mutually
+                # exclusive in effect (see app/agents.py:plan_turn's header comment for
+                # the exact failure). They're now permissions bounding what plan_turn
+                # may choose, and the route itself comes from the query:
+                #
+                #   agent_mode    -> may the "agent" route be chosen at all
+                #   web_search    -> may this turn call the live web (any route)
+                #   auto_generate -> may a finished spec generate without HITL approval
+                #
+                # so all three compose on one turn instead of overriding each other.
                 skill_run_meta = None
+                routing: dict | None = None
                 pending_skill_run = session.get("pending_skill_run")
                 pending_deck_builder = session.get("pending_deck_builder")
                 if pending_skill_run:
@@ -1158,32 +1235,51 @@ class CopilotService:
                     context_check = None
                     meta = {
                         "agent": "deck-builder", "skills": ["pptx"], "provider": None, "model": None,
-                        "used_fallback": False, "hitl_pending": [], "sources": [], "tool_calls": [],
-                        "web_sources": [], "downloadable_artifacts": deck_meta["downloadable_artifacts"],
+                        "used_fallback": False, "hitl_pending": deck_meta["hitl_pending"],
+                        "sources": [], "tool_calls": [],
+                        "web_sources": deck_meta["web_sources"],
+                        "downloadable_artifacts": deck_meta["downloadable_artifacts"],
                     }
                 else:
-                    matched_skill = self.skill_packages.select_for_chat(message)
-                    if matched_skill and matched_skill.skill_id == "pptx":
+                    if plan is None:
+                        keyword_match = self.skill_packages.select_for_chat(message)
+                        plan = await plan_turn(
+                            message, skills=self.skill_packages.list(),
+                            keyword_match=keyword_match.public() if keyword_match else None,
+                            allow_agent=agent_mode, allow_web=web_search, provider=self.provider,
+                        )
+                    routing = plan.public()
+                    await emit({
+                        "stage": "routing",
+                        "label": f"Routing to {plan.route}" + (f" — {plan.reason}." if plan.reason else "."),
+                        **routing,
+                    })
+                    if plan.route == "deck":
                         response, deck_meta = await self.deck_builder.start(
-                            sid, matched_skill, message, auto_generate, on_event=emit,
+                            sid, self.skill_packages.get(plan.skill_id), message, auto_generate,
+                            web_search=web_search, on_event=emit,
                         )
                         context_check = None
                         meta = {
                             "agent": "deck-builder", "skills": ["pptx"], "provider": None, "model": None,
-                            "used_fallback": False, "hitl_pending": [], "sources": [], "tool_calls": [],
-                            "web_sources": [], "downloadable_artifacts": deck_meta["downloadable_artifacts"],
+                            "used_fallback": False, "hitl_pending": deck_meta["hitl_pending"],
+                            "sources": [], "tool_calls": [],
+                            "web_sources": deck_meta["web_sources"],
+                            "downloadable_artifacts": deck_meta["downloadable_artifacts"],
                         }
-                    elif matched_skill:
-                        response, skill_run_meta = await self._start_chat_skill_run(sid, matched_skill, on_event=emit)
+                    elif plan.route == "skill":
+                        response, skill_run_meta = await self._start_chat_skill_run(
+                            sid, self.skill_packages.get(plan.skill_id), on_event=emit,
+                        )
                         context_check = None
                         meta = {
-                            "agent": "skill", "skills": [matched_skill.skill_id],
+                            "agent": "skill", "skills": [plan.skill_id],
                             "provider": (skill_run_meta or {}).get("provider"), "model": None,
                             "used_fallback": (skill_run_meta or {}).get("used_fallback", False),
                             "hitl_pending": [], "sources": [], "tool_calls": [], "web_sources": [],
                             "downloadable_artifacts": [],
                         }
-                    elif agent_mode:
+                    elif plan.route == "agent":
                         result = await self.orchestrator.run(message, {
                             "session_id": sid, "history": history, "images": images,
                             "memory_state": memory_state.to_dict(), "allow_live_hitl_wait": allow_live_hitl_wait,
@@ -1240,7 +1336,7 @@ class CopilotService:
                 return {
                     "response": response, "session_id": sid,
                     "guardrails": {"input": input_check, "context": context_check, "output": output_check},
-                    "skill_run": skill_run_meta,
+                    "skill_run": skill_run_meta, "routing": routing,
                     **meta,
                 }
         finally:
@@ -1306,9 +1402,22 @@ class CopilotService:
             message = input_check["redacted_text"]
         pending_skill_run = session.get("pending_skill_run")
         pending_deck_builder = session.get("pending_deck_builder")
-        would_skill_route = bool(pending_skill_run) or bool(pending_deck_builder) or (
-            input_check["allowed"] and bool(self.skill_packages.select_for_chat(message))
-        )
+        # Whether this turn generates a file is now a routing decision, not a
+        # substring match (see app/agents.py:plan_turn) — so this pre-check has
+        # to ask the same question chat() will, or the two disagree and a turn
+        # the router sends to a generator gets token-streamed as plain chat
+        # instead. The plan is computed once here and handed to chat() below so
+        # the router model is called once per turn, not twice.
+        plan = None
+        would_skill_route = bool(pending_skill_run) or bool(pending_deck_builder)
+        if input_check["allowed"] and not would_skill_route:
+            keyword_match = self.skill_packages.select_for_chat(message)
+            plan = await plan_turn(
+                message, skills=self.skill_packages.list(),
+                keyword_match=keyword_match.public() if keyword_match else None,
+                allow_agent=agent_mode, allow_web=web_search, provider=self.provider,
+            )
+            would_skill_route = plan.route in ("deck", "skill")
         attempt_real_stream = input_check["allowed"] and not would_skill_route and not agent_mode
 
         if attempt_real_stream:
@@ -1369,7 +1478,7 @@ class CopilotService:
                             "agent": None, "skills": [], "provider": result_provider, "model": result_model,
                             "used_fallback": False,
                             "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
-                            "web_sources": [], "downloadable_artifacts": [],
+                            "web_sources": [], "downloadable_artifacts": [], "routing": plan.public(),
                         }
                         return
                     if error:
@@ -1383,7 +1492,7 @@ class CopilotService:
                             "agent": None, "skills": [], "provider": result_provider, "model": result_model,
                             "used_fallback": True,
                             "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
-                            "web_sources": [], "downloadable_artifacts": [],
+                            "web_sources": [], "downloadable_artifacts": [], "routing": plan.public(),
                         }
                         return
                     output_check = self.guardrails.check_output(full_text)
@@ -1412,7 +1521,7 @@ class CopilotService:
                         "agent": None, "skills": [], "provider": result_provider, "model": result_model,
                         "used_fallback": False,
                         "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
-                        "web_sources": [], "downloadable_artifacts": [],
+                        "web_sources": [], "downloadable_artifacts": [], "routing": plan.public(),
                     }
                     return
 
@@ -1437,9 +1546,13 @@ class CopilotService:
         # turn here can genuinely wait for a live HITL decision instead of
         # only ever reporting "queued" — see AutoGenOrchestrator.run's coding
         # skill section and app/hitl_agents.py.
+        # `plan` is the routing decision already made above (None when this
+        # turn never needed one — blocked input, or a pending skill/deck
+        # continuation), passed down so chat() reuses it instead of calling the
+        # router a second time and possibly landing somewhere else.
         chat_task = asyncio.ensure_future(self.chat(
             message, agent_mode, sid, on_event=on_event, images=images, allow_live_hitl_wait=True,
-            web_search=web_search, auto_generate=auto_generate,
+            web_search=web_search, auto_generate=auto_generate, plan=plan,
         ))
         cancellation_token.link_future(chat_task)
         try:
@@ -1466,6 +1579,7 @@ class CopilotService:
                 "agent": None, "skills": [], "provider": None, "model": None, "used_fallback": False,
                 "hitl_pending": [], "sources": [], "skill_run": None, "tool_calls": [],
                 "web_sources": [], "downloadable_artifacts": [],
+                "routing": plan.public() if plan else None,
             }
             return
         yield {"type": "delta", "text": result["response"]}

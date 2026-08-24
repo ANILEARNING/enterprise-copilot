@@ -59,6 +59,12 @@ class ChatResponse(BaseModel):
     # app/artifacts.py:StoredArtifact.public(). Only ever populated on the
     # live-SSE-wait path (agent-mode POST /api/chat/stream).
     downloadable_artifacts: list[dict] = Field(default_factory=list)
+    # What this turn was routed to and why — {"route", "skill_id",
+    # "needs_web", "routed_by_llm", "reason"}. See
+    # app/agents.py:TurnPlan. None when no routing decision was made: a
+    # blocked input, or a turn that continued an already-pending skill Q&A /
+    # deck clarification rather than classifying a new request.
+    routing: dict | None = None
 
 class ChatCancelRequest(BaseModel):
     stream_id: str = Field(min_length=1)
