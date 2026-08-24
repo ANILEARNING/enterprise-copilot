@@ -3,7 +3,7 @@
 A self-hosted enterprise copilot whose guardrails, retrieval and human-approval gates are owned and inspectable by the operator rather than trusted to a vendor.
 
 **Author:** Anish S
-**Date:** 2026-08-24
+**Date:** 2026-08-23
 **Course:** Agentic AI For Developers - Hexaware
 
 ---
@@ -76,7 +76,7 @@ Each item replaces a component that is explicitly a v1 placeholder, and each slo
 an interface that already exists — so none of them is a rewrite. **No implementation has
 started for any of them:** the repository contains the seam and the documented intent, not
 the replacement. Deployment to a server with a shareable link is targeted for the week of
-2026-08-24.
+2026-08-30.
 
 | Enhancement | Replaces or adds | Seam it slots behind | Status |
 |---|---|---|---|
@@ -299,7 +299,7 @@ and are not reported here.
 **What exists today is engineering verification, not agent evaluation.** The distinction
 matters and is stated plainly rather than blurred.
 
-*Executed.* A pytest suite of **395 tests across 17 files**, run on 2026-08-24: all
+*Executed.* A pytest suite of **395 tests across 17 files**, run on 2026-08-23: all
 passed in 87.51 seconds. It requires no network — `conftest.py` forces `AI_MODE=mock` and
 redirects every file-backed store to a temporary directory, specifically so a developer's
 real credentials in `.env` can never cause a test run to make live calls. Coverage by area:
@@ -352,10 +352,10 @@ run-to-run variance a property worth measuring rather than averaging away.
 
 | Metric | Value | How | Date |
 |---|---|---|---|
-| Automated tests passing | 395 / 395 | pytest, code assertions | 2026-08-24 |
-| Test suite wall-clock | 87.51 s | pytest, single run | 2026-08-24 |
-| Test files | 17 | repository count | 2026-08-24 |
-| Network calls during test run | 0 | `AI_MODE=mock` forced in `conftest.py` | 2026-08-24 |
+| Automated tests passing | 395 / 395 | pytest, code assertions | 2026-08-23 |
+| Test suite wall-clock | 87.51 s | pytest, single run | 2026-08-23 |
+| Test files | 17 | repository count | 2026-08-23 |
+| Network calls during test run | 0 | `AI_MODE=mock` forced in `conftest.py` | 2026-08-23 |
 | Documents used in RAG testing | 5 (PDF, Word, HTML) | author-reported; not committed | — |
 | Manual acceptance-checklist items completed | 0 of 40 | `docs/acceptance-tests.md`, all unticked | — |
 
@@ -400,6 +400,6 @@ smoothed over in the sections above.
 8. **Multi-participant Magentic-One was not attempted.** The Deck Builder runs a single participant; multi-agent is deferred to a later phase.
 9. **The 40-item manual acceptance checklist has never been completed**, so the manual verification the project defined for itself has not been run.
 10. **Frontend integration was the main implementation difficulty**, per the author; no specific defects were catalogued.
-11. **Every enhancement in §3's in-progress table is unstarted in code** — the repository holds the interface seam and the documented intent, not the replacement. Until they land the app is single-process, and generated artifacts, the live HITL decision wait and the in-flight stream registry do not survive a restart or a second worker. Server deployment is targeted for the week of 2026-08-24.
+11. **Every enhancement in §3's in-progress table is unstarted in code** — the repository holds the interface seam and the documented intent, not the replacement. Until they land the app is single-process, and generated artifacts, the live HITL decision wait and the in-flight stream registry do not survive a restart or a second worker. Server deployment is targeted for the week of 2026-08-30.
 12. **Local code execution is not a security boundary.** It is a plain OS subprocess with a temp workspace, timeout and output cap; no namespace, seccomp or container isolation.
 13. **Two documentation defects found while writing this report.** `README.md` claims 372 tests where 395 now pass, and `app/config.py` references `app/runtime_settings.py`, which does not exist — only `docs/runtime-settings.md` does.
