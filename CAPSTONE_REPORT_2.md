@@ -3,7 +3,7 @@
 A self-hosted enterprise copilot whose guardrails, retrieval, auth/approval workflow and human-approval gates are owned and inspectable by the operator rather than trusted to a vendor.
 
 **Author:** Anish S
-**Date:** 2026-09-07
+**Last Updated Date:** 2026-09-07
 **Course:** Agentic AI For Developers - Hexaware
 
 ---
