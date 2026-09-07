@@ -7,6 +7,13 @@
 # Render "Root Directory" of mcp_servers/ pointed at this file installs only
 # what this one small server needs, not the full app's much heavier stack
 # (autogen, sqlalchemy, boto3, ...).
-mcp
+#
+# mcp<2 is REQUIRED, not a style preference: mcp 2.x renamed FastMCP to
+# MCPServer and changed its API (see the deploy failure this pin fixes —
+# ModuleNotFoundError: No module named 'mcp.server.fastmcp' — a bare
+# unpinned "mcp" here installed 2.x on a fresh Render build while local dev
+# venvs stayed on whatever was already installed, silently drifting). Kept
+# in sync with the main app's own requirements.txt pin.
+mcp>=1.11.0,<2
 httpx
 uvicorn
