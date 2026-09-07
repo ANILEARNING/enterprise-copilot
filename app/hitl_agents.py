@@ -27,7 +27,6 @@ and those two imports autogen_agentchat.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from autogen_agentchat.agents import ApprovalRequest, ApprovalResponse, CodeExecutorAgent, UserProxyAgent
@@ -58,9 +57,10 @@ class SandboxCodeExecutor(CodeExecutor):
 
     async def execute_code_blocks(self, code_blocks: list[CodeBlock], cancellation_token: CancellationToken) -> CodeResult:
         combined = "\n\n".join(b.code for b in code_blocks)
-        # CodeSandbox.run() is a blocking subprocess call — off the event
-        # loop so it doesn't stall every other in-flight request meanwhile.
-        result = await asyncio.to_thread(self._sandbox.run, combined)
+        # CodeSandbox.run() is async — each implementation handles its own
+        # sync/async bridging internally (see CodeSandbox.run's docstring,
+        # app/sandbox.py), so this just awaits it directly.
+        result = await self._sandbox.run(combined)
         self.last_result = result
         output = result.stdout or ""
         if result.stderr:

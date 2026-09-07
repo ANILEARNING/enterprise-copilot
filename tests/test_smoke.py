@@ -217,8 +217,11 @@ def test_plain_stdout_code_has_no_downloadable_artifacts():
     decided = client.post("/api/hitl/decide", json={"request_id": req_id, "approved": True}).json()
     assert decided["downloadable_artifacts"] == []
 
-def test_chat_agent_mode_selects_agent_and_reports_provider():
-    r = client.post("/api/chat", json={"message": "please debug this ```print(1)```", "agent_mode": True})
+def test_chat_autonomously_selects_the_coding_agent():
+    # No agent_mode toggle any more — a message with no generator trigger
+    # always gets full agent capability (see app/agents.py:plan_turn), so
+    # this routes to the coding agent purely from the message itself.
+    r = client.post("/api/chat", json={"message": "please debug this ```print(1)```"})
     data = r.json()
     assert data["agent"] == "coding-agent"
     assert "coding" in data["skills"]
@@ -230,12 +233,6 @@ def test_chat_agent_mode_selects_agent_and_reports_provider():
     pending = client.post("/api/hitl/get", json={"request_id": data["hitl_pending"][0]})
     assert pending.json()["status"] == "WAITING_FOR_APPROVAL"
 
-def test_chat_direct_mode_has_no_agent():
-    r = client.post("/api/chat", json={"message": "hello", "agent_mode": False})
-    data = r.json()
-    assert data["agent"] is None
-    assert data["skills"] == []
-
 def test_agents_and_skills_listing():
     agents = client.post("/api/agents/list").json()["agents"]
     assert any(a["name"] == "coding-agent" for a in agents)
@@ -246,9 +243,13 @@ def test_agents_and_skills_listing():
 
 def test_settings_models_get_reflects_current_config():
     data = client.post("/api/settings/models").json()
-    assert data["model_provider"] in ("gemini", "ollama")
+    # Real-environment value, not a fixed test fixture (see conftest.py — only
+    # DATABASE_URL/AI_MODE/Redis/B2 are forced to safe test values; model_provider
+    # legitimately reflects whatever this environment's .env actually says).
+    assert data["model_provider"] in ("gemini", "ollama", "azure")
     assert "gemini_configured" in data
     assert "ollama_configured" in data
+    assert "azure_configured" in data
     assert "agent_router_model" in data
 
 def test_settings_models_update_applies_and_is_reflected_by_get():
@@ -339,16 +340,20 @@ def test_chat_skill_qa_reprompts_on_empty_required_answer():
     assert d2["skill_run"]["question"]["id"] == "topic"  # still stuck on the same required question
 
 def test_chat_without_skill_trigger_behaves_normally():
-    r = client.post("/api/chat", json={"message": "hello there", "agent_mode": False})
+    r = client.post("/api/chat", json={"message": "hello there"})
     data = r.json()
     assert data["skill_run"] is None
-    assert data["agent"] is None
+    # Every message with no generator match gets the "agent" route now (no
+    # more agent_mode toggle) — which agent it lands on can be "general" or
+    # an auto-grounded upgrade like "research-agent" depending on what else
+    # this test module has indexed by this point; the only real assertion
+    # here is that no fixed-question skill flow fired.
 
 def _parse_sse_events(text):
     return [json.loads(line[len("data: "):]) for line in text.splitlines() if line.startswith("data: ")]
 
 def test_chat_stream_sse_shape_and_cancel_lifecycle():
-    r = client.post("/api/chat/stream", json={"message": "hello there", "agent_mode": False})
+    r = client.post("/api/chat/stream", json={"message": "hello there"})
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
     events = _parse_sse_events(r.text)

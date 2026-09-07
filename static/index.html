@@ -37,7 +37,7 @@
     <div class="nav-section-label">Workspace</div>
     <ul class="nav-list">
       <li><button class="nav-link" data-view="settings"><span class="nav-icon">⚙️</span> Settings</button></li>
-      <li><button class="nav-link" data-view="login"><span class="nav-icon">🔐</span> Login</button></li>
+      <li data-requires-superadmin class="d-none"><button class="nav-link" data-view="admin"><span class="nav-icon">🛡️</span> Admin <span class="nav-badge d-none" id="adminNavBadge">0</span></button></li>
       <li><button class="nav-link" data-view="about"><span class="nav-icon">ℹ️</span> About</button></li>
     </ul>
 
@@ -71,14 +71,16 @@
 
     <div class="dropdown">
       <button class="btn btn-ghost d-flex align-items-center gap-2 px-2" data-bs-toggle="dropdown" aria-expanded="false">
-        <span class="avatar-ring">G</span>
+        <span class="avatar-ring" id="profileAvatarLabel">?</span>
       </button>
       <ul class="dropdown-menu dropdown-menu-end">
-        <li><h6 class="dropdown-header">Local session</h6></li>
+        <li><h6 class="dropdown-header" id="profileEmail">Account</h6></li>
         <li><span class="dropdown-item-text small text-muted" id="profileSessionId">No session yet</span></li>
         <li><hr class="dropdown-divider"></li>
         <li><button class="dropdown-item" id="profileNewSession">Start new session</button></li>
         <li><button class="dropdown-item" data-view-link="settings">Settings</button></li>
+        <li><hr class="dropdown-divider"></li>
+        <li><button class="dropdown-item text-danger" id="profileLogout">Sign out</button></li>
       </ul>
     </div>
   </header>
@@ -94,14 +96,6 @@
             <span class="pill pill-neutral" id="modePill"><span class="pill-dot"></span>Demo mode</span>
             <span class="session-tag" id="chatSessionTag">no session</span>
             <div class="topbar-spacer"></div>
-            <label class="composer-toggle" title="Answers that aren't file requests go through the multi-step agent — knowledge-base grounding, tools, code. Off: they get a direct answer instead.">
-              <input type="checkbox" id="agentMode" class="form-check-input" style="margin:0">
-              Agent mode
-            </label>
-            <label class="composer-toggle" id="webSearchToggleWrap" title="Lets this turn search the live web when it decides that helps — on agent answers and on deck research alike.">
-              <input type="checkbox" id="webSearch" class="form-check-input" style="margin:0">
-              🔎 Web Search
-            </label>
             <label class="composer-toggle" id="autoGenerateToggleWrap" title="Applies to deck-building requests. OFF (default): a drafted deck is queued for your approval in Pending approvals before it's generated. ON: generates immediately, no approval step.">
               <input type="checkbox" id="autoGenerate" class="form-check-input" style="margin:0">
               ⚡ Auto-generate
@@ -118,15 +112,15 @@
             <div class="chat-welcome" id="chatWelcome">
               <div class="brand-mark">EC</div>
               <h2>How can I help today?</h2>
-              <p>Ask a direct question, or turn on Agent mode to route your request through the agent/skill/tool layer with guardrails and human approval on risky actions.</p>
+              <p>Ask anything — the router decides on its own whether your request needs the agent/skill/tool layer, with guardrails and human approval on risky actions either way.</p>
               <div class="prompt-suggestions">
                 <button class="prompt-chip" data-prompt="Summarize what this Enterprise Copilot can do today.">
                   <strong>What can you do?</strong>Get an overview of current capabilities
                 </button>
-                <button class="prompt-chip" data-prompt="please debug this &#96;&#96;&#96;print(1)&#96;&#96;&#96;" data-agent="1">
+                <button class="prompt-chip" data-prompt="please debug this &#96;&#96;&#96;print(1)&#96;&#96;&#96;">
                   <strong>Debug some code</strong>Routes to the coding agent + HITL
                 </button>
-                <button class="prompt-chip" data-prompt="What does the knowledge base say about pricing?" data-agent="1">
+                <button class="prompt-chip" data-prompt="What does the knowledge base say about pricing?">
                   <strong>Ask the knowledge base</strong>Routes to the research agent
                 </button>
                 <button class="prompt-chip" data-prompt="Reply with exactly the word: PONG">
@@ -471,33 +465,24 @@
       </div>
     </section>
 
-    <!-- ----------------------------- LOGIN VIEW (placeholder) ---------------------------- -->
-    <section class="view" id="view-login">
-      <div class="page-header">
-        <h1>Login</h1>
-        <p>A placeholder screen — this app has no real authentication in v1.</p>
+    <!-- ----------------------------- ADMIN VIEW (superadmin only) ---------------------------- -->
+    <section class="view" id="view-admin">
+      <div class="page-header d-flex align-items-start justify-content-between flex-wrap gap-3">
+        <div>
+          <h1>Admin</h1>
+          <p>Approve, reject, suspend, or reinstate accounts on this deployment.</p>
+        </div>
+        <button class="btn btn-outline-secondary" id="refreshAdminPending">↻ Refresh</button>
       </div>
 
-      <div class="row justify-content-center">
-        <div class="col-12 col-md-6 col-lg-4">
-          <div class="panel">
-            <div class="panel-header"><h2>Sign in</h2></div>
-            <div class="panel-body d-flex flex-column gap-3">
-              <p class="small mb-0" style="color:var(--text-faint)">
-                This form doesn't do anything yet. Enterprise Copilot v1 runs as a single local
-                workspace with no accounts, sessions are per-browser (see Sessions), and nothing
-                here is gated behind sign-in. Real authentication is future work, not wired up.
-              </p>
-              <div>
-                <label class="form-label">Email</label>
-                <input type="email" class="form-control" placeholder="you@company.com" disabled>
-              </div>
-              <div>
-                <label class="form-label">Password</label>
-                <input type="password" class="form-control" placeholder="••••••••" disabled>
-              </div>
-              <button class="btn btn-primary" disabled title="Not implemented — placeholder only">Sign in</button>
-            </div>
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Pending approvals</h2>
+          <span class="muted" id="adminPendingCount">0</span>
+        </div>
+        <div class="panel-body p-0" id="adminPendingContainer">
+          <div class="state-block" style="padding:28px 16px;">
+            <p style="margin:0;">Nothing waiting on approval right now.</p>
           </div>
         </div>
       </div>
@@ -507,7 +492,7 @@
     <section class="view" id="view-about">
       <div class="page-header">
         <h1>About Enterprise Copilot</h1>
-        <p>Phase 0 · v1 — what this workspace is and how it's built.</p>
+        <p>What this workspace is and how it's built.</p>
       </div>
 
       <div class="panel mb-3">
@@ -525,14 +510,32 @@
         <div class="panel-header"><h2>Architecture</h2></div>
         <div class="panel-body">
           <ul class="mb-0">
-            <li>FastAPI + Pydantic backend, this page as a plain HTML/CSS/JS/Bootstrap SPA frontend.</li>
+            <li>FastAPI + Pydantic backend, this page as a plain HTML/CSS/JS/Bootstrap SPA frontend
+              served directly by the same app — no separate frontend build or deploy.</li>
             <li>Agents run through a single <code>AgentOrchestrator</code> contract (currently backed by
               AutoGen) — application code never depends on the agent framework directly.</li>
             <li>Guardrails check every chat request's input and output, visibly, before and after
-              the model runs — a Phase 0 feature, not a placeholder.</li>
+              the model runs, and every check is persisted for later review.</li>
             <li>Knowledge/RAG documents and generation skills support the full add / list / view /
               update / delete lifecycle, all through POST APIs.</li>
+            <li>Accounts, sessions, guardrail history, and usage/cost data persist in Postgres,
+              Redis, and object storage — not just in-memory or on local disk.</li>
+            <li>Code execution runs in a real isolated sandbox (<a href="https://e2b.dev" target="_blank" rel="noopener">E2B</a>)
+              when configured, with a local subprocess fallback for development.</li>
           </ul>
+        </div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-header"><h2>Accounts &amp; access</h2></div>
+        <div class="panel-body">
+          <p class="mb-0">
+            Sign-in is required to use this workspace. The first account ever created on a given
+            deployment is automatically approved as its administrator; every account after that
+            needs an administrator's approval<span data-requires-superadmin class="d-none"> (see the
+            <button type="button" class="btn btn-link p-0 align-baseline" data-view-link="admin">Admin</button> tab)</span>
+            before it can sign in.
+          </p>
         </div>
       </div>
 
@@ -540,9 +543,10 @@
         <div class="panel-header"><h2>Scope</h2></div>
         <div class="panel-body">
           <p class="mb-0 small" style="color:var(--text-faint)">
-            v1 keeps infrastructure in-memory or file-backed locally rather than a real database or
-            production sandbox — local code execution is development-only. This About page and the
-            Login page are static; there is no account system behind either yet.
+            Existing chat/session/document routes don't yet require sign-in themselves — only account
+            creation, login, and the Admin approval endpoints are enforced server-side today. Local
+            code execution (the fallback used when no sandbox provider is configured) has no real
+            isolation and is development-only.
           </p>
         </div>
       </div>

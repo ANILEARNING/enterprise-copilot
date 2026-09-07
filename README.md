@@ -31,9 +31,10 @@ Copy `.env.example` to `.env`. Everything is optional — the defaults run fully
 | Variable | Default | Effect |
 |---|---|---|
 | `AI_MODE` | `mock` | `mock` = deterministic offline responses. `configured` = use a real model. |
-| `MODEL_PROVIDER` | `gemini` | `gemini` or `ollama`, used when `AI_MODE=configured`. |
-| `GEMINI_API_KEY` | — | Enables Gemini chat/embedding, and LLM-based agent routing. |
+| `MODEL_PROVIDER` | `gemini` | `gemini`, `ollama`, or `azure`, used when `AI_MODE=configured`. |
+| `GEMINI_API_KEY` | — | Enables Gemini chat/embedding, and LLM-based agent routing (always used for routing regardless of `MODEL_PROVIDER`). |
 | `OLLAMA_BASE_URL` | `localhost:11434` | Self-hosted models; no API key needed. |
+| `AZURE_AI_ENDPOINT` / `AZURE_AI_API_KEY` / `AZURE_AI_DEPLOYMENT` | — | Azure AI Foundry (classic Azure OpenAI resource shape) — see `.env.example` for the full set, including `AZURE_AI_DEPLOYMENTS` (extra reasoning deployments selectable from the model picker) and `AZURE_AI_EMBEDDING_DEPLOYMENT`. |
 | `TAVILY_API_KEY` | — | Enables the web-search tool. |
 | `QDRANT_URL` / `QDRANT_API_KEY` | — | Enables Qdrant Cloud as the vector store; falls back to an in-memory cosine scan when unset. |
 | `LANGFUSE_*` | — | Enables tracing (one trace per chat turn). |

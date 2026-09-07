@@ -20,6 +20,8 @@ development-only, not a production sandbox"), not an oversight.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import re
 import shutil
@@ -31,6 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 10000
 MAX_ARTIFACTS_LISTED = 20
@@ -85,9 +89,18 @@ class ExecutionResult:
 
 
 class CodeSandbox:
-    """The contract application code depends on. See module docstring."""
+    """The contract application code depends on. See module docstring.
 
-    def run(self, code: str) -> ExecutionResult:
+    `run` is async — E2BSandbox's real backend (https://e2b.dev) is
+    async-native (its SDK's AsyncSandbox, not a sync wrapper around it), so
+    the interface follows that rather than forcing every implementation to
+    bridge sync/async on its own. LocalSubprocessSandbox's own blocking
+    subprocess.run() call is wrapped in asyncio.to_thread internally (see
+    its own run()) — that bridging is this sandbox's concern, not its
+    caller's; SandboxCodeExecutor (app/hitl_agents.py) just awaits
+    whichever sandbox it was given."""
+
+    async def run(self, code: str) -> ExecutionResult:
         raise NotImplementedError
 
 
@@ -132,7 +145,7 @@ class LocalSubprocessSandbox(CodeSandbox):
     Does NOT provide real filesystem, network, or process isolation.
     """
 
-    def run(self, code: str) -> ExecutionResult:
+    async def run(self, code: str) -> ExecutionResult:
         if settings.code_execution_mode != "local":
             return ExecutionResult(status=ExecutionStatus.DISABLED,
                                     error="Code execution is disabled in this environment.")
@@ -151,7 +164,13 @@ class LocalSubprocessSandbox(CodeSandbox):
             return ExecutionResult(status=ExecutionStatus.ERROR, error=f"Could not create workspace: {exc}")
 
         try:
-            return self._run_in_workspace(code, Path(workspace))
+            # _run_in_workspace's subprocess.run() call is blocking — off the
+            # event loop so it doesn't stall every other in-flight request
+            # meanwhile. Was previously the caller's job (SandboxCodeExecutor,
+            # app/hitl_agents.py) — moved here so every CodeSandbox
+            # implementation's own async/sync bridging is its own concern
+            # (see CodeSandbox.run's docstring).
+            return await asyncio.to_thread(self._run_in_workspace, code, Path(workspace))
         finally:
             shutil.rmtree(workspace, ignore_errors=True)  # best-effort; a locked file shouldn't fail the request
 
@@ -226,6 +245,128 @@ class LocalSubprocessSandbox(CodeSandbox):
         )
 
 
+# Files already present in a fresh E2B sandbox's home directory — verified
+# live (AsyncSandbox.create() then files.list('/home/user') before running
+# any code) — subtracted from a post-run listing the same way
+# LocalSubprocessSandbox diffs before/after its own workspace, so these
+# don't show up as "artifacts" the script supposedly produced.
+_E2B_BASELINE_HOME_FILES = frozenset({
+    ".bash_logout", ".bashrc", ".profile", ".sudo_as_admin_successful",
+})
+_E2B_HOME_DIR = "/home/user"
+
+
+class E2BSandbox(CodeSandbox):
+    """A real, network-isolated VM sandbox via the E2B API
+    (https://e2b.dev/docs) — code_execution_mode == "e2b" (see
+    app/config.py). Unlike LocalSubprocessSandbox this genuinely isolates
+    the executed code: a dedicated micro-VM per run, not a subprocess of
+    this app's own interpreter, so none of that class's "does NOT provide
+    real ... isolation" caveats apply here.
+
+    Each call opens a fresh sandbox and kills it when done — no sandbox
+    reuse across calls in this v1 (a longer-lived pool/session concept is a
+    natural follow-up once there's a real multi-step "agent working in one
+    sandbox over several turns" use case; today's one-shot HITL-approved
+    code execution, app/hitl_agents.py, doesn't need one)."""
+
+    def __init__(self, api_key: str, timeout_seconds: int):
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+
+    async def run(self, code: str) -> ExecutionResult:
+        if settings.code_execution_mode != "e2b":
+            return ExecutionResult(status=ExecutionStatus.DISABLED,
+                                    error="Code execution is disabled in this environment.")
+        if not self._api_key:
+            return ExecutionResult(status=ExecutionStatus.ERROR, error="E2B_SANDBOX is not configured.")
+
+        matched = _first_suspicious_match(code)
+        if matched:
+            return ExecutionResult(
+                status=ExecutionStatus.BLOCKED,
+                error=f"Blocked by the pre-execution guard (matched pattern {matched!r}). "
+                      "This is a best-effort static check, not sandboxing — see app/sandbox.py.",
+            )
+
+        from e2b import FileType
+        from e2b_code_interpreter import AsyncSandbox
+        from e2b_code_interpreter.exceptions import TimeoutException
+
+        started = time.monotonic()
+        try:
+            sbx = await AsyncSandbox.create(api_key=self._api_key, timeout=self._timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 - sandbox creation failure (bad key, quota, network) is not this app's bug
+            return ExecutionResult(status=ExecutionStatus.ERROR, error=f"Could not start E2B sandbox: {exc}")
+
+        try:
+            try:
+                execution = await sbx.run_code(code, timeout=self._timeout_seconds)
+            except TimeoutException:
+                return ExecutionResult(
+                    status=ExecutionStatus.TIMEOUT,
+                    error=f"Execution exceeded {self._timeout_seconds}s timeout.",
+                    duration_seconds=time.monotonic() - started,
+                )
+
+            duration = time.monotonic() - started
+            stdout = _truncate("".join(execution.logs.stdout))
+            stderr = _truncate("".join(execution.logs.stderr))
+            ok = execution.error is None
+            if execution.error and not stderr:
+                # E2B's error carries its own traceback separate from
+                # stderr (verified live: a raised exception produces empty
+                # logs.stderr but a populated execution.error.traceback) —
+                # folded into stderr here so ExecutionResult's shape (and
+                # every caller reading .stderr, e.g. SandboxCodeExecutor)
+                # doesn't need a separate "or check .error too" path.
+                stderr = _truncate(execution.error.traceback or f"{execution.error.name}: {execution.error.value}")
+
+            artifacts: list[str] = []
+            artifact_files: dict[str, bytes] = {}
+            if ok:
+                try:
+                    entries = await sbx.files.list(_E2B_HOME_DIR)
+                    # FileType is a plain Enum, not a str subclass — verified
+                    # live that `entry.type == "file"` is always False (an
+                    # easy, silent way to filter out every real file); the
+                    # comparison has to be against FileType.FILE itself.
+                    artifacts = sorted(
+                        e.name for e in entries
+                        if e.name not in _E2B_BASELINE_HOME_FILES and e.type == FileType.FILE
+                    )
+                except Exception as exc:  # noqa: BLE001 - artifact listing is best-effort, never fails the run itself
+                    logger.warning("Could not list E2B sandbox files: %s", exc)
+                for name in artifacts:
+                    if len(artifact_files) >= MAX_ARTIFACT_FILES_CAPTURED:
+                        break
+                    if not name.lower().endswith(DOWNLOADABLE_ARTIFACT_EXTENSIONS):
+                        continue
+                    try:
+                        content = await sbx.files.read(f"{_E2B_HOME_DIR}/{name}", format="bytes")
+                        if len(content) > MAX_ARTIFACT_FILE_BYTES:
+                            continue
+                        artifact_files[name] = content
+                    except Exception as exc:  # noqa: BLE001 - unreadable file shouldn't fail the whole result
+                        logger.warning("Could not read E2B artifact %s: %s", name, exc)
+
+            return ExecutionResult(
+                status=ExecutionStatus.COMPLETED,
+                ok=ok,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=0 if ok else 1,  # E2B reports success/error, not a real process exit code
+                artifacts=artifacts[:MAX_ARTIFACTS_LISTED],
+                artifact_files=artifact_files,
+                duration_seconds=duration,
+            )
+        finally:
+            try:
+                await sbx.kill()
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup; a failed kill shouldn't fail the request
+                logger.warning("Could not kill E2B sandbox %s: %s", sbx.sandbox_id, exc)
+
+
 def _truncate(text) -> str:
     if not isinstance(text, str):
         return ""
@@ -234,5 +375,14 @@ def _truncate(text) -> str:
 
 def build_sandbox() -> CodeSandbox:
     """Factory mirroring build_provider()/build_embedding_provider() (see
-    app/providers.py) — a single seam to swap in a hardened backend later."""
+    app/providers.py) — a single seam to swap in a hardened backend later.
+    code_execution_mode == "e2b" selects E2BSandbox (a real, isolated
+    micro-VM sandbox — see its own docstring); anything else (the default
+    "local", or "disabled") returns LocalSubprocessSandbox, whose own run()
+    already handles the disabled case by checking code_execution_mode
+    itself. E2BSandbox is still constructed even without E2B_SANDBOX set —
+    its run() reports that clearly (ExecutionStatus.ERROR) rather than this
+    factory needing its own separate "is it configured" branch."""
+    if settings.code_execution_mode == "e2b":
+        return E2BSandbox(api_key=settings.e2b_sandbox, timeout_seconds=settings.max_code_execution_seconds)
     return LocalSubprocessSandbox()

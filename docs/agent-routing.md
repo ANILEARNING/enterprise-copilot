@@ -16,10 +16,11 @@ Two routing decisions run per turn, in this order:
 ## The problem it fixes
 
 Turn routing used to be a fixed `if/elif` chain over `SkillPackageStore.
-select_for_chat`'s substring match, evaluated **before** `agent_mode` was ever
-read. Because each branch was terminal, the three composer toggles were
-mutually exclusive in effect even though the UI presents them as independent —
-no single turn could honour more than one:
+select_for_chat`'s substring match, evaluated **before** an `agent_mode`
+toggle was ever read, with two more toggles (Web search, Auto-generate)
+gating capability further downstream. Because each branch was terminal, the
+three composer toggles were mutually exclusive in effect even though the UI
+presented them as independent — no single turn could honour more than one:
 
 | Message | Old route | Toggles silently dropped |
 | --- | --- | --- |
@@ -33,11 +34,16 @@ with two of the three choices discarded — and asking *about* a presentation
 Deck Builder, because `presentation` is one of `skills/pptx/SKILL.md`'s
 `chat_triggers`.
 
+**Agent mode and Web search no longer exist as toggles at all.** Every turn
+now gets full agent capability unconditionally — tools, RAG grounding, live
+web research whenever Tavily is configured. Auto-generate remains the one
+deliberate, explicit control (a safety/HITL gate, not a capability switch).
+
 ## How it works
 
-`plan_turn(message, skills=..., keyword_match=..., allow_agent=..., allow_web=...,
-provider=...)` makes one small LLM call and returns a `TurnPlan`:
-`route` (`"deck" | "skill" | "agent" | "direct"`), `skill_id`, `needs_web`,
+`plan_turn(message, skills=..., keyword_match=..., provider=...)` makes one
+small LLM call and returns a `TurnPlan`: `route`
+(`"deck" | "skill" | "agent" | "direct"`), `skill_id`, `needs_web`,
 `routed_by_llm`, `reason`. The plan is surfaced to the UI as a `routing`
 progress event and on `ChatResponse.routing`, so the decision and its reason
 are visible rather than implicit.
@@ -46,37 +52,70 @@ The router is told the **real installed generators** (`SkillPackageStore.list()`
 — id, output extension, description), so an uploaded skill package becomes
 routable the moment it's installed; nothing is hardcoded.
 
-## Toggles are permissions, not modes
+## What the router still decides
 
-They bound what the router may choose and what the chosen route may do:
+With no toggles left to consult, `"agent"` and `"direct"` are both always on
+the menu — the router picks purely from the query:
 
-- **Agent mode** picks which non-generation route is on the menu: `"agent"`
-  when on, `"direct"` when off. The router chooses between *generating a file*
-  and *answering* — never between those two. Letting it downgrade an agent-mode
-  turn to `"direct"` would quietly cost that turn the relevance-gated
-  knowledge-base grounding `AutoGenOrchestrator.run` does on every turn.
-- **Web search** never restricts routing; it gates tool offering at the point
-  of use, on both tool-using routes (agent turns and Deck Builder research).
-- **Auto-generate** gates only whether a finished deck spec may generate
-  without HITL approval.
+- Generate a **file** (`"deck"`/`"skill"`) vs. **answer** (`"agent"`/`"direct"`).
+- Within "answer," whether the message needs augmentation at all —
+  **`"agent"`** for anything that might benefit from tools/RAG/web research
+  (the safe default — `_deterministic_plan`'s fallback never picks anything
+  else), **`"direct"`** only for what's unambiguously answerable from the
+  model alone. `"direct"` exists specifically so
+  `CopilotService.chat_stream` can real-stream tokens for a genuinely simple
+  question instead of paying for the full orchestrator pipeline on every
+  turn — a turn routed `"agent"` always goes through
+  `AutoGenOrchestrator.run` (RAG grounding, tools) instead, even with no tool
+  ultimately invoked.
 
-`TurnPlan.needs_web` is **advisory** — reported, never used to gate anything. A
-user who switched Web search off must not get web calls because a router
-decided the query "needed" them, and within that ceiling the model already
-decides per-call whether an offered tool is worth invoking. (There is
-deliberately no `needs_knowledge` counterpart: RAG grounding is already
-autonomous and relevance-gated on every agent turn, so the hint would change
-nothing and only costs router tokens.)
+Web search is no longer gated by anything routing decides either: it's
+offered on both tool-using routes (agent turns and Deck Builder research)
+whenever `TAVILY_API_KEY` is configured, full stop — the model itself still
+decides per-call whether the offered tool is worth invoking.
 
-## Fallback (reproduces the old behaviour exactly)
+`TurnPlan.needs_web` is **advisory only** — reported to the UI to explain
+whether this turn's route benefits from live web results, never used to gate
+anything. (There is deliberately no `needs_knowledge` counterpart: RAG
+grounding is already autonomous and relevance-gated on every agent turn, so
+the hint would change nothing and only costs router tokens.)
 
-`_deterministic_plan` — the previous `if/elif` chain, move for move: a trigger
-match routes to deck/skill, otherwise agent-or-direct per the toggle. It runs
-whenever the router is unavailable: a bare `MockProvider` (deterministic, no
-real model call — same contract `select_llm` has), no `GEMINI_API_KEY`, a call
-that raises, or an answer that isn't usable. So the "every flow works
-end-to-end with zero credentials" guarantee holds, and a router outage degrades
-to exactly the old routing rather than to an error.
+## Delivery: file vs. inline content
+
+On a `"deck"`/`"skill"` route, the router also judges `TurnPlan.delivery` —
+`"file"` (default) generates and hands back a real downloadable file exactly
+as before this field existed; `"inline"` means the phrasing clearly asked for
+the content shown in chat instead ("just tell me," "summarize it here," "no
+need for a file"). Ambiguous or unstated phrasing defaults to `"file"`.
+
+Unlike `needs_web`, `delivery` is a real gate, but not an unconditional one:
+`app/skill_render.py`'s `render_spec_as_chat_text(skill_id, spec)` is what
+actually turns a drafted spec into chat text, and it only covers
+`docx-generator` and `pptx` today — `ppt-generator` (chat-unreachable by
+design) and `brd-prd-generator` (a more complex, conditional-section shape,
+deferred) return `None`. Every caller (`DeckBuilderService._run_and_handle`,
+`SkillRunService.submit_answers`) treats `None` as "no renderer for this
+skill yet" and falls back to generating the file regardless of what
+`delivery` said — "inline" is a request the render step is allowed to grant,
+not a guarantee it can.
+
+There's no separate mechanism for "the user changed their mind" (e.g. "actually
+just give me the file" after an inline reply) — it's just the next chat
+message, which re-enters `plan_turn` and can pick `delivery="file"` on its
+own, the same way Deck Builder's existing "enhance this" follow-up already
+reuses `last_deck_spec`.
+
+## Fallback (no router available)
+
+`_deterministic_plan` — a trigger match routes to deck/skill, otherwise
+unconditionally to `"agent"` (never `"direct"`: telling a genuinely simple
+question apart from one that needs augmentation is exactly the judgment call
+that needs a real router; without one, the safe default is the fully-capable
+route). It runs whenever the router is unavailable: a bare `MockProvider`
+(deterministic, no real model call — same contract `select_llm` has), no
+`GEMINI_API_KEY`, a call that raises, or an answer that isn't usable. So the
+"every flow works end-to-end with zero credentials" guarantee holds, and a
+router outage degrades to full agent capability rather than to an error.
 
 `plan_turn` also tolerates two answer shapes that strict parsing rejects, both
 verified live against the real API: the object re-encoded as a string inside a
@@ -108,7 +147,7 @@ trigger matching), but on a constrained free-tier key that fallback will fire.
 
 # Agent routing
 
-Which agent handles an agent-mode turn is decided by `AgentRegistry.select_llm`
+Which agent handles a turn on the `"agent"` route is decided by `AgentRegistry.select_llm`
 (`app/agents.py`) — an LLM classification call, not the older pure-keyword match
 (`AgentRegistry.select`, still present and used as the fallback below).
 

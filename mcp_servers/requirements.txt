@@ -1,0 +1,12 @@
+# Dependencies for hosted_tools_server.py ONLY — deliberately its own
+# requirements file, separate from the repo root's requirements.txt. This
+# server is meant to deploy as its own standalone Render service with no
+# dependency on the Enterprise Copilot app package (app/) at all — it never
+# imports anything from app/, and the main app never imports anything from
+# mcp_servers/ either (see hosted_tools_server.py's module docstring). A
+# Render "Root Directory" of mcp_servers/ pointed at this file installs only
+# what this one small server needs, not the full app's much heavier stack
+# (autogen, sqlalchemy, boto3, ...).
+mcp
+httpx
+uvicorn

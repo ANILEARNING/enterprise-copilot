@@ -133,9 +133,9 @@ async def _load_web_search_tools() -> list:
 async def get_web_search_tools() -> list:
     """The Tavily `web_search` tool, loaded once and cached — [] if
     TAVILY_API_KEY isn't set or the server failed to load (see
-    _last_status["web_search"]). Separate from get_mcp_tools()'s cache since
-    inclusion is also gated per-turn by the UI toggle (see that function's
-    `web_search` param), not just by configuration."""
+    _last_status["web_search"]). Kept as its own cache, separate from
+    get_mcp_tools()'s, since not every caller wants it included (see that
+    function's `web_search` param)."""
     global _web_search_cache
     if _web_search_cache is not None:
         return _web_search_cache
@@ -148,9 +148,11 @@ async def get_web_search_tools() -> list:
 
 async def get_mcp_tools(web_search: bool = False) -> list:
     """Every available MCP tool for this turn: the always-on stdio + remote
-    servers, plus the Tavily web-search tool when `web_search` is True (the
-    turn's "Web Search" UI toggle) AND TAVILY_API_KEY is configured. The
-    always-on pair is loaded once and cached for the life of the process —
+    servers, plus the Tavily web-search tool when `web_search` is True AND
+    TAVILY_API_KEY is configured — no per-request UI toggle any more, every
+    call site that wants web capability at all passes True unconditionally
+    (see app/agents.py). The always-on pair is loaded once and cached for
+    the life of the process —
     loading spawns a subprocess (stdio) / makes a network round-trip
     (remote), too slow to repeat on every chat turn. Never raises: a server
     that fails to load just contributes no tools (see _last_status, surfaced

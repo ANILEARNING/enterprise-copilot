@@ -3,11 +3,12 @@ import base64
 import binascii
 import json
 import logging
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from autogen_core import CancellationToken
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+from .auth import AccessTokenClaims
 from .config import settings
 from .extraction import ExtractionError, extract_document, sanitize_filename
 from .models import (
@@ -18,12 +19,22 @@ from .models import (
     CodeExecuteSubmitRequest, HitlDecisionRequest, HitlRequestGet,
     SkillUpload, SkillDelete, SkillRunStart, SkillRunAnswer, SkillRunGet, SkillRunRegenerate,
     SkillRunUploadAnswerFile, SettingsModelsUpdate, ArtifactGet,
+    SignupRequest, LoginRequest, AuthTokenResponse, RefreshRequest, RefreshResponse,
+    LogoutRequest, CurrentUserResponse,
+    PendingUsersResponse, PendingUserSummary, UserApprovalDecisionRequest, UserSuspendRequest,
+    UserApprovalHistoryRequest, UserApprovalHistoryResponse, UserApprovalHistoryEntry,
 )
 from .mcp_tools import describe_mcp_config
 from .observability import describe_observability
-from .providers import build_vision_provider, list_available_embedding_models, list_available_models
+from .providers import (
+    _azure_deployment_names, build_vision_provider, list_available_embedding_models, list_available_models,
+)
 from .services import service
 from .skills import SkillPackageError
+from .tenancy import (
+    AuthError, decide_user_approval, get_approval_history, get_current_user, list_pending_users,
+    login, logout, refresh_access_token, require_superadmin, signup,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -59,6 +70,202 @@ _active_streams: dict[str, CancellationToken] = {}
 async def health():
     return HealthResponse(status="ok")
 
+
+# --- Auth (app/tenancy.py, app/auth.py) ---------------------------------------
+
+def _require_db_session_factory():
+    """Every auth route needs an open DB session; DATABASE_URL is optional
+    at CopilotService construction time (see its __init__) so auth can be
+    unset without breaking the rest of the app — this is where that
+    "unset" state actually surfaces to a caller, as a clear 503 rather than
+    an AttributeError on a None session_factory."""
+    if service.db_session_factory is None:
+        raise HTTPException(status_code=503, detail="Login is not configured on this server (DATABASE_URL unset).")
+    return service.db_session_factory
+
+
+def _client_meta(request: Request) -> tuple[str | None, str | None]:
+    """(user_agent, ip_address) for a login/signup's RefreshTokenRow —
+    display-only metadata (see that model's docstring in app/db/models.py),
+    never used for anything security-critical."""
+    return request.headers.get("user-agent"), (request.client.host if request.client else None)
+
+
+@router.post("/auth/signup", response_model=AuthTokenResponse)
+async def auth_signup(request: SignupRequest, http_request: Request):
+    session_factory = _require_db_session_factory()
+    user_agent, ip_address = _client_meta(http_request)
+    async with session_factory() as session:
+        try:
+            result = await signup(
+                session, email=request.email, password=request.password, display_name=request.display_name,
+                workspace_name=request.workspace_name, user_agent=user_agent, ip_address=ip_address,
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return AuthTokenResponse(
+        access_token=result.access_token, refresh_token=result.refresh_token,
+        user_id=str(result.user_id), tenant_id=str(result.tenant_id), email=result.email,
+        platform_role=result.platform_role,
+    )
+
+
+@router.post("/auth/login", response_model=AuthTokenResponse)
+async def auth_login(request: LoginRequest, http_request: Request):
+    session_factory = _require_db_session_factory()
+    user_agent, ip_address = _client_meta(http_request)
+    tenant_id = UUID(request.tenant_id) if request.tenant_id else None
+    async with session_factory() as session:
+        try:
+            result = await login(
+                session, email=request.email, password=request.password, tenant_id=tenant_id,
+                user_agent=user_agent, ip_address=ip_address,
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return AuthTokenResponse(
+        access_token=result.access_token, refresh_token=result.refresh_token,
+        user_id=str(result.user_id), tenant_id=str(result.tenant_id), email=result.email,
+        platform_role=result.platform_role,
+    )
+
+
+@router.post("/auth/refresh", response_model=RefreshResponse)
+async def auth_refresh(request: RefreshRequest):
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        try:
+            access_token = await refresh_access_token(session, raw_refresh_token=request.refresh_token)
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return RefreshResponse(access_token=access_token)
+
+
+@router.post("/auth/logout")
+async def auth_logout(request: LogoutRequest):
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        await logout(session, raw_refresh_token=request.refresh_token)
+    return {"status": "ok"}
+
+
+@router.post("/auth/me", response_model=CurrentUserResponse)
+async def auth_me(claims: AccessTokenClaims = Depends(get_current_user)):
+    """Confirms a token is valid and reports whose it is — the frontend's
+    "am I still logged in" check on load, and the simplest possible example
+    of a route gated by get_current_user (see its docstring in
+    app/tenancy.py for why no other existing route uses it yet)."""
+    return CurrentUserResponse(
+        user_id=str(claims.user_id), tenant_id=str(claims.tenant_id), platform_role=claims.platform_role,
+    )
+
+
+# --- Admin: approve / reject / suspend / reinstate users ----------------------
+#
+# Every route below requires Depends(require_superadmin) — see that
+# dependency's docstring in app/tenancy.py. Deliberately platform-wide, not
+# tenant-scoped: approval_status/platform_role are global on User (see
+# app/db/models.py), so there is no "this tenant's admin" queue distinct
+# from "the deployment's superadmin" queue in this pass — every signup gets
+# its own tenant (see app/tenancy.py:signup), so a tenant-scoped approval
+# queue wouldn't currently mean anything different anyway.
+
+@router.post("/admin/users/pending", response_model=PendingUsersResponse)
+async def admin_users_pending(claims: AccessTokenClaims = Depends(require_superadmin)):
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        users = await list_pending_users(session)
+    return PendingUsersResponse(users=[
+        PendingUserSummary(
+            user_id=str(u.id), email=u.email, display_name=u.display_name, created_at=u.created_at.isoformat(),
+        )
+        for u in users
+    ])
+
+
+@router.post("/admin/users/approve")
+async def admin_users_approve(request: UserApprovalDecisionRequest, claims: AccessTokenClaims = Depends(require_superadmin)):
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        try:
+            await decide_user_approval(
+                session, user_id=UUID(request.user_id), decided_by_user_id=claims.user_id, action="approved",
+                tenant_id=claims.tenant_id, reason=request.reason,
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return {"status": "ok"}
+
+
+@router.post("/admin/users/reject")
+async def admin_users_reject(request: UserApprovalDecisionRequest, claims: AccessTokenClaims = Depends(require_superadmin)):
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        try:
+            await decide_user_approval(
+                session, user_id=UUID(request.user_id), decided_by_user_id=claims.user_id, action="rejected",
+                tenant_id=claims.tenant_id, reason=request.reason,
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return {"status": "ok"}
+
+
+@router.post("/admin/users/suspend")
+async def admin_users_suspend(request: UserSuspendRequest, claims: AccessTokenClaims = Depends(require_superadmin)):
+    """Suspends a currently-active account — distinct from reject (which is
+    for an account that was never approved in the first place). A
+    superadmin can suspend anyone, including another superadmin; there's no
+    "can't suspend yourself" guard here — that's a UI-level nicety, not a
+    security boundary worth enforcing server-side."""
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        try:
+            await decide_user_approval(
+                session, user_id=UUID(request.user_id), decided_by_user_id=claims.user_id, action="suspended",
+                tenant_id=claims.tenant_id, reason=request.reason,
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return {"status": "ok"}
+
+
+@router.post("/admin/users/reinstate")
+async def admin_users_reinstate(request: UserApprovalDecisionRequest, claims: AccessTokenClaims = Depends(require_superadmin)):
+    """Restores a suspended (or previously rejected) account to active —
+    the undo for suspend/reject. Unlike suspend/reject, does NOT revoke
+    existing refresh tokens (see decide_user_approval) — there shouldn't be
+    any still-live ones for an account that's been non-active, and even if
+    one somehow survived, reinstating is explicitly restoring access, not
+    the moment to also invalidate sessions."""
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        try:
+            await decide_user_approval(
+                session, user_id=UUID(request.user_id), decided_by_user_id=claims.user_id, action="reinstated",
+                tenant_id=claims.tenant_id, reason=request.reason,
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return {"status": "ok"}
+
+
+@router.post("/admin/users/approval-history", response_model=UserApprovalHistoryResponse)
+async def admin_users_approval_history(
+    request: UserApprovalHistoryRequest, claims: AccessTokenClaims = Depends(require_superadmin),
+):
+    session_factory = _require_db_session_factory()
+    async with session_factory() as session:
+        history = await get_approval_history(session, UUID(request.user_id))
+    return UserApprovalHistoryResponse(history=[
+        UserApprovalHistoryEntry(
+            action=h.action, decided_by_user_id=str(h.decided_by_user_id), reason=h.reason,
+            created_at=h.created_at.isoformat(),
+        )
+        for h in history
+    ])
+
+
 def _images_payload(request: ChatRequest) -> list[dict] | None:
     if not request.images:
         return None
@@ -67,9 +274,8 @@ def _images_payload(request: ChatRequest) -> list[dict] | None:
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     result = await service.chat(
-        request.message, request.agent_mode, request.session_id,
-        images=_images_payload(request), web_search=request.web_search,
-        auto_generate=request.auto_generate,
+        request.message, request.session_id,
+        images=_images_payload(request), auto_generate=request.auto_generate,
     )
     return ChatResponse(
         response=result["response"],
@@ -111,9 +317,8 @@ async def chat_stream(request: ChatRequest):
     async def produce(queue: asyncio.Queue) -> None:
         try:
             async for event in service.chat_stream(
-                request.message, request.agent_mode, request.session_id, token, request.model,
-                images=_images_payload(request), web_search=request.web_search,
-                auto_generate=request.auto_generate,
+                request.message, request.session_id, token, request.model,
+                images=_images_payload(request), auto_generate=request.auto_generate,
             ):
                 await queue.put(event)
         except asyncio.CancelledError:
@@ -167,17 +372,17 @@ async def skills_list():
 
 @router.post("/session/start", response_model=SessionStartResponse)
 async def session_start():
-    session = service.sessions.create()
+    session = await service.sessions.create()
     return SessionStartResponse(session_id=session["session_id"], created_at=session["created_at"])
 
 @router.post("/session/list")
 async def session_list():
-    return {"sessions": service.sessions.list()}
+    return {"sessions": await service.sessions.list()}
 
 @router.post("/session/get", response_model=SessionGetResponse)
 async def session_get(request: SessionGet):
     try:
-        return service.sessions.get(request.session_id)
+        return await service.sessions.get(request.session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -190,7 +395,7 @@ async def session_get(request: SessionGet):
 
 @router.post("/session/checkpoint/save")
 async def session_checkpoint_save(request: CheckpointSaveRequest):
-    checkpoint = service.sessions.add_checkpoint(request.session_id, request.label)
+    checkpoint = await service.sessions.add_checkpoint(request.session_id, request.label)
     if checkpoint is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return checkpoint
@@ -198,7 +403,7 @@ async def session_checkpoint_save(request: CheckpointSaveRequest):
 @router.post("/session/checkpoint/list")
 async def session_checkpoint_list(request: CheckpointListRequest):
     try:
-        return {"checkpoints": service.sessions.list_checkpoints(request.session_id)}
+        return {"checkpoints": await service.sessions.list_checkpoints(request.session_id)}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -211,7 +416,7 @@ async def session_checkpoint_restore(request: CheckpointRestoreRequest):
     calling this. Returns the full updated session, same shape as
     POST /session/get."""
     try:
-        return service.sessions.restore_checkpoint(request.session_id, request.checkpoint_id)
+        return await service.sessions.restore_checkpoint(request.session_id, request.checkpoint_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -243,8 +448,23 @@ def _settings_models_public() -> dict:
         "model_provider": settings.model_provider,
         "gemini_configured": bool(settings.gemini_api_key),
         "ollama_configured": bool(settings.ollama_base_url),
+        "azure_configured": bool(
+            settings.azure_ai_endpoint and settings.azure_ai_api_key and settings.azure_ai_deployment
+        ),
         "gemini_model": settings.gemini_model,  # "" = GeminiProvider.DEFAULT_MODEL
         "ollama_model": settings.ollama_model,
+        # Not user-editable here (see SettingsModelsUpdate — azure_ai_deployment
+        # isn't one of its fields): unlike gemini_model/ollama_model, there's no
+        # free-form model choice for Azure to override at runtime, just the
+        # default deployment fixed by .env — shown for visibility, not for
+        # editing. `azure_deployments` is every deployment this resource has
+        # (default plus any extras — see _azure_deployment_names,
+        # app/providers.py), which IS selectable from the Copilot chat
+        # picker's "provider/model" mechanism even though this Settings-page
+        # default isn't runtime-editable.
+        "azure_deployment": settings.azure_ai_deployment,
+        "azure_deployments": _azure_deployment_names(),
+        "azure_embedding_deployment": settings.azure_ai_embedding_deployment,
         "gemini_embedding_model": settings.gemini_embedding_model,
         "ollama_embedding_model": settings.ollama_embedding_model,
         "agent_router_model": settings.agent_router_model,
@@ -509,28 +729,25 @@ async def skill_run_regenerate(request: SkillRunRegenerate):
     except SkillPackageError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-# Real MIME types for skill-run downloads (previously always
-# application/octet-stream) — keyed by the actual file extension produced,
-# not a per-skill guess, so this covers every skill's output uniformly.
-_SKILL_OUTPUT_MIME_TYPES = {
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "pdf": "application/pdf",
-}
-
 @router.post("/skill-packages/run/download")
 async def skill_run_download(request: SkillRunGet):
     """POST rather than a GET-with-path-param, per this API's POST-only
     convention (.claude/rules/api.md) — the frontend fetches this as a blob
     and triggers the browser's save dialog client-side. `format` picks
     which file for a multi-output run (e.g. brd-prd-generator's docx/pdf);
-    omitted (every ordinary single-output skill) picks the sole output."""
+    omitted (every ordinary single-output skill) picks the sole output.
+
+    Output files live in B2 now, not on local disk (see
+    SkillRunService.get_output/app/blob_store.py), so this is a plain
+    Response over the fetched bytes rather than FileResponse — FileResponse
+    needs a real local filesystem path, which no longer exists here."""
     try:
-        path, filename = service.skill_runs.get_output(request.run_id, format=request.format)
+        content, filename, media_type = service.skill_runs.get_output(request.run_id, format=request.format)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except SkillPackageError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    media_type = _SKILL_OUTPUT_MIME_TYPES.get(extension, "application/octet-stream")
-    return FileResponse(path, filename=filename, media_type=media_type)
+    return Response(
+        content=content, media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

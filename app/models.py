@@ -17,12 +17,6 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     conversation_id: str | None = None
     model: str | None = None
-    agent_mode: bool = False
-    # UI "Web Search" toggle (see static/app.js) — offers the Tavily
-    # web_search MCP tool for this turn (app/mcp_tools.py). No effect unless
-    # agent_mode is also on (tool-calling only happens in agent mode) and
-    # TAVILY_API_KEY is configured; otherwise a strictly additive no-op.
-    web_search: bool = False
     images: list[ImageAttachment] = Field(default_factory=list)
     # UI "Auto-generate" toggle (see static/app.js) — only meaningful for the
     # Deck Builder flow (a "pptx" chat-trigger match, see CopilotService.chat).
@@ -189,9 +183,93 @@ class SettingsModelsUpdate(BaseModel):
     optional; only what's provided is changed, everything else keeps its
     current value (see POST /api/settings/models, docs/runtime-settings.md).
     Never includes an API key — those stay .env-only by design."""
-    model_provider: Literal["gemini", "ollama"] | None = None
+    model_provider: Literal["gemini", "ollama", "azure"] | None = None
     gemini_model: str | None = Field(default=None, max_length=200)
     ollama_model: str | None = Field(default=None, max_length=200)
     gemini_embedding_model: str | None = Field(default=None, max_length=200)
     ollama_embedding_model: str | None = Field(default=None, max_length=200)
     agent_router_model: str | None = Field(default=None, max_length=200)
+
+
+# --- Auth (app/tenancy.py, app/auth.py) ---------------------------------------
+
+class SignupRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    # bcrypt silently can't hash past 72 bytes (see app/auth.py) — 72 chars
+    # is a safe upper bound for any reasonable password (72 bytes only
+    # binds tighter than 72 chars for non-ASCII input, which is rare enough
+    # here not to warrant a byte-length check at the request-validation layer).
+    password: str = Field(min_length=8, max_length=72)
+    display_name: str | None = Field(default=None, max_length=255)
+    # The new tenant's display name (see Tenant.name, app/db/models.py) —
+    # omitted falls back to "<display_name or email>'s workspace" (see
+    # app/tenancy.py:signup).
+    workspace_name: str | None = Field(default=None, max_length=255)
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=72)
+    # Picks which of the user's tenant memberships this login's token is
+    # scoped to (see app/tenancy.py:login) — omitted uses their
+    # earliest-joined active membership, the common single-tenant case.
+    tenant_id: str | None = None
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: Literal["bearer"] = "bearer"
+    user_id: str
+    tenant_id: str
+    email: str
+    # Also embedded in access_token's own JWT claims (see
+    # app/auth.py:create_access_token) — duplicated here too so the
+    # frontend can show/hide role-gated UI (e.g. the Admin nav item)
+    # immediately on login/signup without decoding the JWT client-side.
+    platform_role: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+
+class LogoutRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+class CurrentUserResponse(BaseModel):
+    user_id: str
+    tenant_id: str
+    platform_role: str
+
+
+# --- Admin: approve / reject / suspend / reinstate users (app/tenancy.py) -----
+
+class PendingUserSummary(BaseModel):
+    user_id: str
+    email: str
+    display_name: str | None
+    created_at: str
+
+class PendingUsersResponse(BaseModel):
+    users: list[PendingUserSummary]
+
+class UserApprovalDecisionRequest(BaseModel):
+    user_id: str
+    reason: str | None = Field(default=None, max_length=2000)
+
+class UserSuspendRequest(BaseModel):
+    user_id: str
+    reason: str | None = Field(default=None, max_length=2000)
+
+class UserApprovalHistoryRequest(BaseModel):
+    user_id: str
+
+class UserApprovalHistoryEntry(BaseModel):
+    action: str
+    decided_by_user_id: str
+    reason: str | None
+    created_at: str
+
+class UserApprovalHistoryResponse(BaseModel):
+    history: list[UserApprovalHistoryEntry]

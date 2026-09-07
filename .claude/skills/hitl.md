@@ -26,9 +26,9 @@ already decided cannot be decided again (`decide()` raises `ValueError` on that)
    adapter over this app's own `CodeSandbox`/`LocalSubprocessSandbox`, `app/sandbox.py`) — the
    **one** place approved code actually runs, regardless of how or when it was approved. Status
    becomes `COMPLETED` with the real `stdout`/`stderr`/`returncode`/`artifacts` attached.
-5. **Live wait, agent-mode SSE only** (`POST /api/chat/stream` with `agent_mode: true`): because
-   that connection is already long-lived, the turn can genuinely wait for the decision instead of
-   only ever reporting "queued". `await_human_decision()` represents the human reviewer as a real
+5. **Live wait, SSE only** (`POST /api/chat/stream`, a turn the router sent to the "agent" route):
+   because that connection is already long-lived, the turn can genuinely wait for the decision
+   instead of only ever reporting "queued". `await_human_decision()` represents the human reviewer as a real
    `UserProxyAgent` whose `input_func` bridges to `HitlService.await_decision()` — resolved the
    moment `/api/hitl/decide` runs for that request, from the same Agents & Tools tab, no separate
    approval path. If approved, the turn's own final answer gets the real execution result

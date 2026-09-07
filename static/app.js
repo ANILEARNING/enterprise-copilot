@@ -7,16 +7,29 @@
 const $ = (id) => document.getElementById(id);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-async function post(url, body = {}) {
+async function post(url, body = {}, { skipAuthRetry = false } = {}) {
   let res;
+  const headers = { "Content-Type": "application/json" };
+  const token = Auth.accessToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   } catch (networkErr) {
     throw new Error("Network error — the server may be unreachable.");
+  }
+  // A 401 on an authenticated request means the access token expired
+  // (15-minute lifetime — see app/config.py) — try exactly once to refresh
+  // it and replay the original request, rather than surfacing a confusing
+  // error for something the user never needs to see. skipAuthRetry guards
+  // against retry-looping the refresh call itself, and against re-entering
+  // this path from auth endpoints (login/signup/refresh) that are
+  // deliberately called without a token in the first place.
+  if (res.status === 401 && token && !skipAuthRetry && url !== "/api/auth/refresh") {
+    const refreshed = await Auth.tryRefresh();
+    if (refreshed) return post(url, body, { skipAuthRetry: true });
+    Auth.clearSession();
+    renderAuthGate();
+    throw new Error("Your session expired — please sign in again.");
   }
   let data = {};
   try { data = await res.json(); } catch { /* empty body */ }
@@ -75,6 +88,303 @@ function toast(type, title, message = "") {
 }
 
 /* ==========================================================================
+   Auth — token storage, login/signup/refresh/logout, the full-page gate.
+
+   Every other API call already goes through post() (see above), which now
+   attaches Authorization: Bearer <token> automatically and retries once
+   through a silent refresh on a 401 — nothing else in this file needs to
+   know a token exists. This module owns the token's lifecycle and the
+   gate/pending screens; nothing else reaches into localStorage directly.
+   ========================================================================== */
+
+const AUTH_STORAGE_KEY = "ec-auth";
+
+const Auth = (() => {
+  let session = null; // {access_token, refresh_token, user_id, tenant_id, email, platform_role} | null
+
+  function load() {
+    if (session) return session;
+    try {
+      const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+      session = raw ? JSON.parse(raw) : null;
+    } catch { session = null; }
+    return session;
+  }
+
+  function save(next) {
+    session = next;
+    if (next) localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(next));
+    else localStorage.removeItem(AUTH_STORAGE_KEY);
+  }
+
+  function accessToken() { return load()?.access_token || null; }
+  function isSuperadmin() { return load()?.platform_role === "superadmin"; }
+  function isLoggedIn() { return !!load()?.access_token; }
+  function currentEmail() { return load()?.email || null; }
+
+  function clearSession() { save(null); }
+
+  // Called by post() on a 401 — a raw fetch, not post() itself, since
+  // retrying THROUGH post() here would recurse back into this same 401
+  // handling path the moment the refresh token has also expired.
+  async function tryRefresh() {
+    const current = load();
+    if (!current?.refresh_token) return false;
+    try {
+      const res = await fetch("/api/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: current.refresh_token }),
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
+      save({ ...current, access_token: data.access_token });
+      return true;
+    } catch { return false; }
+  }
+
+  async function signup({ email, password, display_name, workspace_name }) {
+    const res = await fetch("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, display_name: display_name || null, workspace_name: workspace_name || null }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 202) {
+      // Account created but not yet approved — see app/tenancy.py:signup.
+      // Not an error the caller should throw/toast; the pending screen IS
+      // the expected next step.
+      return { pending: true, message: data.detail };
+    }
+    if (!res.ok) throw new Error(data.detail || `Signup failed (${res.status})`);
+    save(data);
+    return { pending: false };
+  }
+
+  async function login({ email, password }) {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Sign in failed (${res.status})`);
+    save(data);
+    return data;
+  }
+
+  async function logout() {
+    const current = load();
+    if (current?.refresh_token) {
+      try {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: current.refresh_token }),
+        });
+      } catch { /* best-effort — clear locally regardless */ }
+    }
+    clearSession();
+  }
+
+  return { accessToken, isSuperadmin, isLoggedIn, currentEmail, clearSession, tryRefresh, signup, login, logout };
+})();
+
+/* ---- Auth gate: full-screen overlay shown whenever Auth.isLoggedIn() is
+   false. Built once, toggled via a CSS class rather than injected/removed
+   from the DOM each time, so its own form state (typed email, etc.)
+   survives a stray re-render. ---- */
+
+function authGateMarkup() {
+  return `
+    <div class="auth-gate-card">
+      <div class="brand-mark">EC</div>
+      <h2 id="authGateTitle">Sign in to Enterprise Copilot</h2>
+      <p class="auth-gate-sub" id="authGateSub">Use your account, or create a new workspace.</p>
+
+      <div class="auth-tabs" id="authTabs">
+        <button type="button" class="auth-tab active" data-auth-tab="login">Sign in</button>
+        <button type="button" class="auth-tab" data-auth-tab="signup">Create account</button>
+      </div>
+
+      <form id="authLoginForm" class="auth-form">
+        <label class="form-label">Email</label>
+        <input type="email" class="form-control" id="authLoginEmail" required autocomplete="username">
+        <label class="form-label">Password</label>
+        <div class="auth-password-wrap">
+          <input type="password" class="form-control" id="authLoginPassword" required autocomplete="current-password">
+          <button type="button" class="auth-password-toggle" data-password-toggle="authLoginPassword" aria-label="Show password" title="Show password">👁</button>
+        </div>
+        <button type="submit" class="btn btn-primary w-100" id="authLoginSubmit">Sign in</button>
+      </form>
+
+      <form id="authSignupForm" class="auth-form d-none">
+        <label class="form-label">Email</label>
+        <input type="email" class="form-control" id="authSignupEmail" required autocomplete="username">
+        <label class="form-label">Password</label>
+        <div class="auth-password-wrap">
+          <input type="password" class="form-control" id="authSignupPassword" required minlength="8" autocomplete="new-password">
+          <button type="button" class="auth-password-toggle" data-password-toggle="authSignupPassword" aria-label="Show password" title="Show password">👁</button>
+        </div>
+        <div class="form-hint">At least 8 characters.</div>
+        <label class="form-label">Your name <span class="form-optional">(optional)</span></label>
+        <input type="text" class="form-control" id="authSignupName" autocomplete="name">
+        <label class="form-label">Workspace name <span class="form-optional">(optional)</span></label>
+        <input type="text" class="form-control" id="authSignupWorkspace" placeholder="Acme Corp">
+        <button type="submit" class="btn btn-primary w-100" id="authSignupSubmit">Create account</button>
+      </form>
+
+      <p class="auth-gate-error d-none" id="authGateError"></p>
+    </div>`;
+}
+
+function pendingApprovalMarkup(message) {
+  return `
+    <div class="auth-gate-card auth-gate-pending">
+      <div class="brand-mark">EC</div>
+      <h2>Account created</h2>
+      <p class="auth-gate-sub">${escapeHtml(message || "An administrator needs to approve your account before you can sign in.")}</p>
+      <p class="auth-gate-sub" style="margin-top:-8px;">You can close this tab — come back and sign in once you've been approved.</p>
+      <button type="button" class="btn btn-outline-secondary w-100" id="authPendingBack">Back to sign in</button>
+    </div>`;
+}
+
+function renderAuthGate() {
+  let overlay = $("authGateOverlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "authGateOverlay";
+    overlay.className = "auth-gate-overlay";
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = authGateMarkup();
+  overlay.classList.add("open");
+  document.body.classList.add("auth-gate-active");
+  wireAuthGate(overlay);
+}
+
+function hideAuthGate() {
+  const overlay = $("authGateOverlay");
+  if (overlay) overlay.classList.remove("open");
+  document.body.classList.remove("auth-gate-active");
+}
+
+function showAuthGateError(message) {
+  const el = $("authGateError");
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle("d-none", !message);
+}
+
+function wireAuthGate(overlay) {
+  const tabs = $$(".auth-tab", overlay);
+  const loginForm = $("authLoginForm");
+  const signupForm = $("authSignupForm");
+
+  tabs.forEach((tab) => tab.addEventListener("click", () => {
+    tabs.forEach((t) => t.classList.toggle("active", t === tab));
+    const isLogin = tab.dataset.authTab === "login";
+    loginForm.classList.toggle("d-none", !isLogin);
+    signupForm.classList.toggle("d-none", isLogin);
+    showAuthGateError("");
+  }));
+
+  $$("[data-password-toggle]", overlay).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = document.getElementById(btn.dataset.passwordToggle);
+      const showing = input.type === "text";
+      input.type = showing ? "password" : "text";
+      btn.textContent = showing ? "👁" : "🙈";
+      btn.title = showing ? "Show password" : "Hide password";
+      btn.setAttribute("aria-label", btn.title);
+    });
+  });
+
+  loginForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    showAuthGateError("");
+    const submitBtn = $("authLoginSubmit");
+    submitBtn.disabled = true;
+    try {
+      await Auth.login({
+        email: $("authLoginEmail").value.trim(),
+        password: $("authLoginPassword").value,
+      });
+      hideAuthGate();
+      onAuthenticated();
+    } catch (err) {
+      showAuthGateError(err.message);
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
+  signupForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    showAuthGateError("");
+    const submitBtn = $("authSignupSubmit");
+    submitBtn.disabled = true;
+    try {
+      const result = await Auth.signup({
+        email: $("authSignupEmail").value.trim(),
+        password: $("authSignupPassword").value,
+        display_name: $("authSignupName").value.trim(),
+        workspace_name: $("authSignupWorkspace").value.trim(),
+      });
+      if (result.pending) {
+        overlay.innerHTML = pendingApprovalMarkup(result.message);
+        $("authPendingBack").addEventListener("click", () => renderAuthGate());
+      } else {
+        hideAuthGate();
+        onAuthenticated();
+      }
+    } catch (err) {
+      showAuthGateError(err.message);
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+}
+
+// Runs once, right after a successful login/signup or on page load when a
+// stored session is still valid — the one place that decides "the app is
+// now usable," so anything that needs fresh per-session state (sidebar
+// identity, the Admin nav item) has a single hook instead of being
+// scattered across login AND signup AND page-load-with-existing-token.
+function onAuthenticated() {
+  renderIdentityChrome();
+  syncSessionChrome();
+}
+
+function renderIdentityChrome() {
+  const email = Auth.currentEmail();
+  const avatarBtn = $("profileAvatarLabel");
+  if (avatarBtn) avatarBtn.textContent = (email || "?").charAt(0).toUpperCase();
+  const emailEl = $("profileEmail");
+  if (emailEl) emailEl.textContent = email || "";
+  $$("[data-requires-superadmin]").forEach((el) => el.classList.toggle("d-none", !Auth.isSuperadmin()));
+}
+
+// Verifies a stored token is still genuinely valid (not just present) via
+// GET-equivalent POST /api/auth/me — a token that LOOKS present in
+// localStorage but has an expired refresh token too (e.g. the browser was
+// closed for a week) must still gate, not silently grant access on stale
+// local state.
+async function initAuthGate() {
+  if (!Auth.isLoggedIn()) {
+    renderAuthGate();
+    return;
+  }
+  try {
+    await post("/api/auth/me", {});
+    onAuthenticated();
+  } catch {
+    Auth.clearSession();
+    renderAuthGate();
+  }
+}
+
+/* ==========================================================================
    Theme
    ========================================================================== */
 
@@ -117,7 +427,7 @@ const VIEW_META = {
   sessions: { title: "Session", sub: "Context Copilot is currently using for this conversation" },
   agents: { title: "Agents & tools", sub: "Registry, skills, and human-in-the-loop approvals" },
   settings: { title: "Settings", sub: "Appearance and read-only system status" },
-  login: { title: "Login", sub: "Placeholder only — v1 has no real authentication" },
+  admin: { title: "Admin", sub: "Approve, reject, suspend, or reinstate accounts" },
   about: { title: "About", sub: "What this workspace is and how it's built" },
 };
 
@@ -134,6 +444,7 @@ function switchView(name) {
   if (name === "agents") { loadAgentsAndSkills(); loadHitlRequests(); }
   if (name === "sessions") { renderSessionView(); loadPastSessions(); loadCheckpoints(); }
   if (name === "settings") renderSettingsView();
+  if (name === "admin") loadAdminPending();
 }
 
 function openSidebarMobile() { $("sidebar").classList.add("open"); $("sidebarBackdrop").classList.add("open"); }
@@ -159,7 +470,7 @@ const COMMANDS = [
   { icon: "🕒", label: "Go to Session", hint: "Nav", run: () => switchView("sessions") },
   { icon: "🧭", label: "Go to Agents & Tools", hint: "Nav", run: () => switchView("agents") },
   { icon: "⚙️", label: "Go to Settings", hint: "Nav", run: () => switchView("settings") },
-  { icon: "🔐", label: "Go to Login", hint: "Nav", run: () => switchView("login") },
+  { icon: "🛡️", label: "Go to Admin", hint: "Nav", run: () => switchView("admin"), requiresSuperadmin: true },
   { icon: "ℹ️", label: "Go to About", hint: "Nav", run: () => switchView("about") },
   { icon: "➕", label: "Add a document", hint: "Action", run: () => { switchView("knowledge"); openDocModal(); } },
   { icon: "🔄", label: "Refresh document list", hint: "Action", run: () => { switchView("knowledge"); loadDocuments(); } },
@@ -173,7 +484,8 @@ let cmdkActiveIndex = 0;
 function renderCmdk(filter = "") {
   const list = $("cmdkList");
   const f = filter.trim().toLowerCase();
-  const matches = COMMANDS.filter((c) => c.label.toLowerCase().includes(f));
+  const matches = COMMANDS.filter((c) =>
+    c.label.toLowerCase().includes(f) && (!c.requiresSuperadmin || Auth.isSuperadmin()));
   cmdkActiveIndex = 0;
   if (!matches.length) {
     list.innerHTML = `<div class="cmdk-empty">No matching commands</div>`;
@@ -892,12 +1204,11 @@ async function readSseStream(response, onEvent) {
 async function sendMessage(text, opts = {}) {
   const message = (text ?? $("message").value).trim();
   if (!message) return;
-  const agentMode = opts.agentMode ?? $("agentMode").checked;
-  // All three toggles are independent permissions the server composes on a
-  // single turn (see CopilotService.chat's routing) — none of them gates
-  // another here. Web Search in particular used to be ANDed with agentMode,
-  // which silently dropped it on exactly the turns that research decks.
-  const webSearch = opts.webSearch ?? $("webSearch").checked;
+  // Agent mode / Web Search are no longer composer toggles — the router
+  // (app/agents.py:plan_turn) decides autonomously, every turn, whether a
+  // message needs tools/RAG/web research. Auto-generate remains the one
+  // explicit safety gate: whether a finished file spec may generate without
+  // a human approving it first.
   const autoGenerate = opts.autoGenerate ?? $("autoGenerate").checked;
   // Attachments are opt.images (retry/regenerate replaying an earlier user
   // message) or whatever's staged in the composer for a fresh send.
@@ -920,7 +1231,7 @@ async function sendMessage(text, opts = {}) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        message, agent_mode: agentMode, web_search: webSearch, auto_generate: autoGenerate,
+        message, auto_generate: autoGenerate,
         session_id: sessionId, images,
       }),
     });
@@ -1149,36 +1460,6 @@ function addImageFiles(fileList) {
   });
 }
 
-// Web Search used to be dimmed and inert unless Agent mode was also on, because
-// tool-calling only happened on the agent path. It no longer depends on it: the
-// Deck Builder is a tool-calling path too (it was searching the web on every
-// deck request whether or not this box was ticked), so the toggle now means the
-// same thing on every route — "this turn may search the live web" — and stands
-// on its own. TAVILY_API_KEY remains the one thing that can disable it.
-let webSearchConfigured = true; // optimistic until renderMcpStatus() confirms
-
-function updateWebSearchToggleAvailability(configured) {
-  webSearchConfigured = configured;
-  syncWebSearchToggle();
-}
-
-function syncWebSearchToggle() {
-  const wrap = $("webSearchToggleWrap");
-  const input = $("webSearch");
-  if (!wrap || !input) return;
-  if (!webSearchConfigured) {
-    input.checked = false;
-    input.disabled = true;
-    wrap.title = "Set TAVILY_API_KEY in .env to enable web search (see Settings → MCP tools).";
-    wrap.style.opacity = "0.5";
-  } else {
-    input.disabled = false;
-    wrap.style.opacity = "1";
-    wrap.title = "Lets this turn search the live web when it decides that helps — "
-      + "on agent answers and on deck research alike.";
-  }
-}
-
 function initChat() {
   $("send").addEventListener("click", () => sendMessage());
   $("message").addEventListener("input", (e) => autoGrow(e.target));
@@ -1195,10 +1476,7 @@ function initChat() {
     if (files.length) addImageFiles(files);
   });
   $$(".prompt-chip").forEach((chip) => {
-    chip.addEventListener("click", () => {
-      if (chip.dataset.agent) $("agentMode").checked = true;
-      sendMessage(chip.dataset.prompt);
-    });
+    chip.addEventListener("click", () => sendMessage(chip.dataset.prompt));
   });
   $("clearChat").addEventListener("click", clearChat);
   $("saveCheckpointBtn").addEventListener("click", saveCheckpoint);
@@ -2496,6 +2774,71 @@ function initHitl() {
 }
 
 /* ==========================================================================
+   Admin — pending-user approval queue (superadmin only). Nav item/command
+   are hidden for anyone else (see [data-requires-superadmin] toggling in
+   renderIdentityChrome, and COMMANDS' requiresSuperadmin flag) — this
+   view's own load call would 403 for a non-superadmin regardless, this is
+   just not showing a door that's locked.
+   ========================================================================== */
+
+function adminPendingCardHtml(user) {
+  const displayName = user.display_name ? escapeHtml(user.display_name) : "";
+  return `
+    <div class="hitl-card" data-user-id="${escapeHtml(user.user_id)}">
+      <div class="hitl-card-head">
+        <strong>${escapeHtml(user.email)}</strong>
+        <span class="muted">${timeAgo(user.created_at)}</span>
+      </div>
+      ${displayName ? `<p class="small mb-2" style="color:var(--text-faint)">${displayName}</p>` : ""}
+      <div class="d-flex gap-2">
+        <button class="btn btn-success btn-sm" data-admin-action="approve">✓ Approve</button>
+        <button class="btn btn-outline-danger btn-sm" data-admin-action="reject">✕ Reject</button>
+      </div>
+    </div>`;
+}
+
+async function loadAdminPending() {
+  const container = $("adminPendingContainer");
+  try {
+    const data = await post("/api/admin/users/pending", {});
+    const users = data.users || [];
+    $("adminPendingCount").textContent = String(users.length);
+    const badge = $("adminNavBadge");
+    if (badge) {
+      if (users.length) { badge.textContent = String(users.length); badge.classList.remove("d-none"); }
+      else badge.classList.add("d-none");
+    }
+    container.innerHTML = users.length
+      ? `<div class="p-3 d-flex flex-column gap-2">${users.map(adminPendingCardHtml).join("")}</div>`
+      : `<div class="state-block" style="padding:28px 16px;"><p style="margin:0;">Nothing waiting on approval right now.</p></div>`;
+    $$('[data-admin-action]', container).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const userId = btn.closest("[data-user-id]").dataset.userId;
+        decideAdminApproval(userId, btn.dataset.adminAction);
+      });
+    });
+  } catch (e) {
+    container.innerHTML = `<p class="small m-3" style="color:var(--danger)">Couldn't load pending users: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function decideAdminApproval(userId, action) {
+  const endpoint = { approve: "/api/admin/users/approve", reject: "/api/admin/users/reject" }[action];
+  if (!endpoint) return;
+  try {
+    await post(endpoint, { user_id: userId });
+    toast(action === "approve" ? "success" : "info", action === "approve" ? "User approved" : "User rejected");
+    await loadAdminPending();
+  } catch (e) {
+    toast("danger", "Couldn't record decision", e.message);
+  }
+}
+
+function initAdminView() {
+  $("refreshAdminPending").addEventListener("click", loadAdminPending);
+}
+
+/* ==========================================================================
    Settings view
    ========================================================================== */
 
@@ -2549,6 +2892,7 @@ async function renderSettingsModels() {
     const ollamaEmbedError = embedErrors.find((e) => e.provider === "ollama")?.message;
     const geminiWarn = cfg.gemini_configured ? "" : ` <span style="color:var(--warning)">— no GEMINI_API_KEY, .env only</span>`;
     const ollamaWarn = cfg.ollama_configured ? "" : ` <span style="color:var(--warning)">— no OLLAMA_BASE_URL, .env only</span>`;
+    const azureWarn = cfg.azure_configured ? "" : ` <span style="color:var(--warning)">— no AZURE_AI_* vars, .env only</span>`;
 
     el.innerHTML = `
       <div class="settings-row">
@@ -2559,6 +2903,7 @@ async function renderSettingsModels() {
         <select class="form-select" id="modelsProvider" style="max-width:220px;">
           <option value="gemini" ${cfg.model_provider === "gemini" ? "selected" : ""}>Gemini${geminiWarn}</option>
           <option value="ollama" ${cfg.model_provider === "ollama" ? "selected" : ""}>Ollama${ollamaWarn}</option>
+          <option value="azure" ${cfg.model_provider === "azure" ? "selected" : ""}>Azure AI Foundry${azureWarn}</option>
         </select>
       </div>
       <div class="settings-row">
@@ -2579,6 +2924,13 @@ async function renderSettingsModels() {
         <select class="form-select" id="modelsOllamaChat" style="max-width:280px;" ${cfg.ollama_configured ? "" : "disabled"}>
           ${_modelOptionsHtml(models, "ollama", cfg.ollama_model)}
         </select>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">Chat model — Azure AI Foundry</div>
+          <div class="settings-desc">Used when Provider is Azure AI Foundry. Fixed by AZURE_AI_DEPLOYMENT in .env — not editable here, since Azure has no way to list a resource's other deployments from this app.</div>
+        </div>
+        <input class="form-control" style="max-width:280px;" value="${escapeHtml(cfg.azure_deployment || "(not set)")}" disabled>
       </div>
       <div class="settings-row">
         <div>
@@ -2705,11 +3057,10 @@ async function renderMcpStatus() {
       <div class="settings-row">
         <div>
           <div class="settings-label">🔎 Web Search (Tavily)</div>
-          <div class="settings-desc">${data.web_search.configured ? "TAVILY_API_KEY set — offered when the Web Search toggle is on in agent mode." : "Set TAVILY_API_KEY in .env to enable."}</div>
+          <div class="settings-desc">${data.web_search.configured ? "TAVILY_API_KEY set — offered automatically whenever a turn's research benefits from it." : "Set TAVILY_API_KEY in .env to enable."}</div>
         </div>
         <span class="pill ${data.web_search.configured ? "pill-success" : "pill-neutral"}"><span class="pill-dot"></span>${data.web_search.configured ? "configured" : "not configured"}</span>
       </div>`);
-    updateWebSearchToggleAvailability(data.web_search.configured);
     if (data.last_loaded) {
       const toolNames = [
         ...(data.last_loaded.stdio?.tools || []),
@@ -2779,14 +3130,26 @@ document.addEventListener("DOMContentLoaded", () => {
   initDocSearch();
   initHitl();
   initSkillsView();
+  initAdminView();
 
+  $("profileLogout").addEventListener("click", async () => {
+    await Auth.logout();
+    location.reload();
+  });
+
+  // The gate below is a CLIENT-side UX layer only — existing routes
+  // (/api/chat, /api/hitl/*, /api/session/*, ...) are deliberately NOT
+  // server-side auth-gated (see app/tenancy.py's own module docstring on
+  // this being a separate decision from building auth itself). Only
+  // /api/admin/* actually enforces anything server-side
+  // (Depends(require_superadmin) — app/routes.py). What follows still
+  // loads/initializes the app's own chrome regardless of login state; the
+  // overlay is what actually stops an unauthenticated visitor from seeing
+  // it, not a failed API call.
   syncSessionChrome();
-  syncWebSearchToggle();
   loadGuardrails();
   loadHitlRequests();
   restoreActiveSession();
-  // Cheap/no-op-safe (see describe_mcp_config's docstring) — just resolves
-  // whether the Web Search toggle should be enabled without waiting for the
-  // Settings tab to be opened first.
-  post("/api/tools/mcp/status", {}).then((data) => updateWebSearchToggleAvailability(data.web_search.configured)).catch(() => {});
+
+  initAuthGate();
 });

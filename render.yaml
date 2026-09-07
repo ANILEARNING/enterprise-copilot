@@ -1,0 +1,117 @@
+# Render Blueprint — defines both deployable services from this one repo.
+# Render's dashboard: New + -> Blueprint -> connect this repo -> it reads
+# this file and proposes both services below in one pass.
+#
+# This file lists WHICH env var KEYS each service needs, never real secret
+# VALUES — every `sync: false` entry means "Render will prompt you to paste
+# a real value for this during blueprint setup, then store it encrypted";
+# nothing here is committed with an actual secret in it. See .env.example
+# for what each key means/where to get it, and mcp_servers/README.md for
+# the MCP service's own deploy notes.
+
+services:
+  # --- MCP tool server (mcp_servers/hosted_tools_server.py) -------------------
+  # Deploy this one first — the backend service below needs its live URL
+  # (MCP_REMOTE_URL) as one of its own env vars.
+  - name: enterprise-copilot-mcp
+    type: web
+    runtime: python
+    rootDir: mcp_servers
+    buildCommand: pip install -r requirements.txt
+    startCommand: python hosted_tools_server.py
+    plan: free
+    envVars:
+      # Optional — omit entirely (don't even set an empty value) for
+      # general-purpose tools only, no web search. See hosted_tools_server.py.
+      - key: TAVILY_API_KEY
+        sync: false
+
+  # --- Backend + frontend (FastAPI, serves static/ itself — see app/main.py) --
+  - name: enterprise-copilot
+    type: web
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      # --- Required for the app to start with its DB-backed features -------
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: B2_ENDPOINT
+        sync: false
+      - key: B2_BUCKET_NAME
+        sync: false
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
+
+      # --- Code execution: E2B (real isolated sandbox) --------------------
+      - key: CODE_EXECUTION_MODE
+        value: e2b
+      - key: E2B_SANDBOX
+        sync: false
+
+      # --- Points at the MCP service above — update the host if you rename
+      # that service (its URL is <service-name>.onrender.com) -------------
+      - key: MCP_REMOTE_URL
+        value: https://enterprise-copilot-mcp.onrender.com/mcp
+      - key: MCP_REMOTE_TRANSPORT
+        value: streamable-http
+
+      # --- Model provider -----------------------------------------------------
+      # AI_MODE=configured uses the real provider below (mock would run fully
+      # offline with no credentials — useful only while first confirming the
+      # app comes up cleanly, not for a real deploy). MODEL_PROVIDER=azure is
+      # live here; Gemini/Ollama blocks are commented out as alternatives.
+      - key: AI_MODE
+        value: configured
+      - key: MODEL_PROVIDER
+        value: azure
+      - key: GEMINI_API_KEY
+        sync: false
+      # GEMINI_API_KEY is ALSO required regardless of MODEL_PROVIDER — the
+      # agent router (AgentRegistry.select_llm) and turn router (plan_turn)
+      # always call Gemini directly for routing decisions, independent of
+      # the main chat provider. See docs/agent-routing.md.
+
+      # --- Ollama (MODEL_PROVIDER=ollama) — self-hosted or Ollama Cloud ------
+      # - key: OLLAMA_BASE_URL
+      #   value: https://ollama.com  # or your own self-hosted daemon's URL
+      # - key: OLLAMA_MODEL
+      #   sync: false
+      # - key: OLLAMA_API_KEY
+      #   sync: false  # required for Ollama Cloud; omit for an unauthenticated local daemon
+
+      # --- Azure AI Foundry (MODEL_PROVIDER=azure) — see .env.example for the
+      # full explanation of each var, including the dimension-mismatch caveat
+      # in docs/rag.md if you switch providers after documents are already
+      # indexed. AZURE_AI_ENDPOINT is the bare resource URL only — never
+      # "/openai/deployments/..." or "/openai/v1".
+      - key: AZURE_AI_ENDPOINT
+        sync: false
+      - key: AZURE_AI_API_KEY
+        sync: false
+      - key: AZURE_AI_DEPLOYMENT
+        sync: false
+      - key: AZURE_AI_DEPLOYMENTS
+        sync: false  # optional — extra deployments for the Copilot model picker
+      - key: AZURE_AI_EMBEDDING_DEPLOYMENT
+        sync: false  # optional — enables Azure as the RAG embedding provider
+      - key: AZURE_AI_API_VERSION
+        value: "2024-10-21"
+
+      # --- Optional integrations — omit any you don't use -------------------
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
