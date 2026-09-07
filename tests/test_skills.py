@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.config import settings
 from app.providers import MockProvider
 from app.skills import (
     MULTI_FORMAT_OUTPUT, SkillPackageError, SkillPackageStore, SkillQuestion, SkillRunService,
@@ -503,6 +504,43 @@ async def test_submit_answers_inline_delivery_falls_back_to_file_when_no_rendere
     assert completed.rendered_text is None
     assert completed.output_keys
     assert completed.public()["download_ready"] is True
+
+
+# --- run_generation_script's code_execution_mode gate -------------------------
+
+@pytest.mark.asyncio
+async def test_run_generation_script_still_works_with_e2b_coding_sandbox_configured(tmp_path, monkeypatch):
+    # Regression test: run_generation_script (docx/pptx/brd-prd file
+    # generation) used to hard-require code_execution_mode == "local" and
+    # raised "Skill generation is disabled in this environment" the moment a
+    # real deployment set CODE_EXECUTION_MODE=e2b for the CODING AGENT's
+    # sandbox (build_sandbox, app/sandbox.py) — a setting that has nothing to
+    # do with running this app's own first-party generate_*.py scripts. This
+    # must keep generating regardless of which sandbox the coding agent uses.
+    monkeypatch.setattr(settings, "code_execution_mode", "e2b")
+    store = _store(tmp_path)
+    runs = _runs(store, tmp_path)
+    run = runs.start("docx-generator")
+    completed = await runs.submit_answers(
+        run.run_id,
+        {"topic": "Q3 performance", "doc_type": "Report", "audience": "Executives", "tone": "Formal"},
+    )
+    assert completed.status == "COMPLETED", completed.error
+    assert completed.output_keys
+
+
+@pytest.mark.asyncio
+async def test_run_generation_script_blocked_when_explicitly_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "code_execution_mode", "disabled")
+    store = _store(tmp_path)
+    runs = _runs(store, tmp_path)
+    run = runs.start("docx-generator")
+    completed = await runs.submit_answers(
+        run.run_id,
+        {"topic": "Q3 performance", "doc_type": "Report", "audience": "Executives", "tone": "Formal"},
+    )
+    assert completed.status == "FAILED"
+    assert "disabled" in completed.error
 
 
 @pytest.mark.asyncio

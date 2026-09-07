@@ -4,8 +4,18 @@ A minimal, runnable Enterprise Copilot: FastAPI + Pydantic backend, Bootstrap SP
 and an agent layer built on AutoGen behind a swappable orchestrator boundary.
 
 Runs with **zero configuration** — no API key, no model download, no external services.
-Every external integration (Gemini, Ollama, MCP, Tavily, Langfuse) is optional and degrades
-gracefully to an offline path when unconfigured.
+Every external integration (Gemini, Ollama, Azure AI Foundry, MCP, Tavily, Langfuse) is
+optional and degrades gracefully to an offline path when unconfigured.
+
+## Live deployment
+
+Deployed on Render as two services, per `render.yaml`:
+
+- **App:** <https://enterprise-copilot-4tc7.onrender.com/>
+- **MCP tool server:** <https://enterprise-copilot-mcp.onrender.com/>
+
+Both are on Render's free plan, which spins down after inactivity — the first request
+after idle can take up to a minute while the instance cold-starts.
 
 ## Quick start
 
@@ -21,7 +31,7 @@ Open <http://127.0.0.1:8000>. On git bash / Linux / macOS, `./run.sh` does all o
 (creates the venv, installs deps, seeds `.env` from `.env.example`, starts the server).
 
 ```bash
-pytest tests/          # 372 tests, no network required
+pytest tests/          # 458 tests, no network required
 ```
 
 ## Configuration

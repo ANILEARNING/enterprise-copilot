@@ -600,8 +600,21 @@ def run_generation_script(skill: SkillPackage, spec: dict, output_dir: Path | No
     spec['output_formats'] itself and writes each requested file next to the
     given --output base path (e.g. skills/brd-prd-generator/scripts/
     generate_brd.py); this function does not re-invoke the script per
-    format."""
-    if settings.code_execution_mode != "local":
+    format.
+
+    Deliberately NOT gated on settings.code_execution_mode == "local" — that
+    setting picks the sandbox for arbitrary MODEL-AUTHORED code (the coding
+    agent's HITL-approved snippets, see app/sandbox.py:build_sandbox), a
+    genuinely different risk than running one of this app's own first-party
+    scripts/generate_*.py files against a drafted spec. Gating this on
+    != "local" meant every skill-file generation (docx/pptx/brd-prd) broke
+    outright — "Skill generation is disabled in this environment" — the
+    moment a real deployment set CODE_EXECUTION_MODE=e2b for the coding
+    agent's sandbox, which is exactly the production-recommended setting
+    (see render.yaml). Only "disabled" (an explicit, deliberate opt-out of
+    running any local subprocess at all, including this one) should
+    actually block it."""
+    if settings.code_execution_mode == "disabled":
         raise SkillPackageError("Skill generation is disabled in this environment.")
 
     script_path = _find_generation_script(skill)
