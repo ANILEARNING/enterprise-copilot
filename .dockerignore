@@ -1,0 +1,18 @@
+# Secrets: never baked into the image — Render (or any host) sets these as
+# real environment variables on the service itself, not shipped inside it.
+.env
+.env.*
+!.env.example
+
+# Local dev / test artifacts that have no business in a deployed image.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+alembic_smoke.db
+_smoke_*.py
+
+# VCS / editor
+.git/
+.gitignore

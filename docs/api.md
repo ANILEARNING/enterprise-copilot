@@ -21,9 +21,12 @@ Application behavior uses POST APIs.
 - POST /api/agents/list — registered agents and their trigger keywords/skills
 - POST /api/skills/list — registered skills
 
-`POST /api/chat` accepts `agent_mode`; when true the request goes through `AgentOrchestrator` and
-the response includes `agent`, `skills`, `provider`, `used_fallback`, `hitl_pending`, `sources`.
-When false it's a direct provider call with no agent/skill selection.
+`POST /api/chat` has no mode toggles — the router (`plan_turn`, see
+`docs/agent-routing.md`) autonomously decides per turn whether the request
+goes through `AgentOrchestrator` (response includes `agent`, `skills`,
+`provider`, `used_fallback`, `hitl_pending`, `sources`) or is answered
+directly, with no agent/skill selection, when it judges no augmentation is
+needed.
 
 ## Tools / HITL
 - POST /api/tools/code/submit — submit a code snippet; creates a HITL request in `WAITING_FOR_APPROVAL`, does not execute.

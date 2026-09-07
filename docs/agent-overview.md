@@ -86,7 +86,8 @@ The AutoGen footprint itself is confined to exactly two files, both by design
   fall straight back to the plain hand-written completion — this is additive, optional
   runtime infrastructure, not a replacement for the orchestration logic above it.
 - **`app/streaming.py`** — the real-time token-streaming path for plain direct chat
-  (`agent_mode` off, no skill/agent routing): a single `AssistantAgent` in a
+  (the router's `"direct"` route — no augmentation needed, see
+  `docs/agent-routing.md`): a single `AssistantAgent` in a
   `RoundRobinGroupChat`, `model_client_stream=True`. `build_streaming_model_client()` here
   is shared by both files (streaming resolves the model client; `agents.py` reuses it for
   tool-calling) — see its docstring for the resolution rules (Gemini/Ollama's
@@ -111,15 +112,16 @@ sequenceDiagram
     participant Hitl as HitlService
     participant AI as AIProvider (Mock/Gemini/Ollama)
 
-    User->>UI: types a message, agent_mode on/off
-    UI->>API: POST {message, agent_mode, session_id}
-    API->>Svc: chat(message, agent_mode, session_id)
+    User->>UI: types a message
+    UI->>API: POST {message, session_id}
+    API->>Svc: chat(message, session_id)
     Svc->>GR: check_input(message)
     alt input blocked
         GR-->>Svc: allowed=false
         Svc-->>UI: blocked response, no model call
     else input allowed
-        alt agent_mode = true
+        Svc->>Svc: plan_turn(message) — no toggles, decides the route itself
+        alt route = "agent"
             Svc->>Orc: run(task, {history})
             Orc->>Reg: select(task) — keyword match, else "general"
             Orc->>Rag: search(task) — hybrid retrieve + rerank
@@ -135,8 +137,8 @@ sequenceDiagram
             Orc->>AI: complete(grounded prompt, history)
             AI-->>Orc: text, provider, used_fallback
             Orc-->>Svc: OrchestrationResult
-        else agent_mode = false
-            Svc->>AI: complete(message, []) — direct call, no agent/skill
+        else route = "direct"
+            Svc->>AI: complete(message, []) — no augmentation needed
             AI-->>Svc: text
         end
         Svc->>GR: check_output(response)
@@ -282,7 +284,7 @@ All application behavior is POST with a JSON body — no query parameters, per
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/chat` | Send a message; `agent_mode` selects direct vs. orchestrated |
+| `POST /api/chat` | Send a message; the router (`plan_turn`) autonomously decides direct vs. orchestrated |
 | `POST /api/session/start` | Create a session explicitly |
 | `POST /api/guardrails/status` | Phase/enabled/active checks |
 | `POST /api/rag/document/add\|list\|get\|update\|delete` | Knowledge base CRUD (re-index is immediate, no separate call) |

@@ -36,7 +36,9 @@ async def _emit(on_event: EventSink | None, event: dict) -> None:
     if on_event is not None:
         await on_event(event)
 
+from .blob_store import BlobStore, BlobStoreError
 from .config import settings
+from .skill_render import render_spec_as_chat_text
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,18 @@ BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 DEFAULT_SKILLS_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "skills"
 DEFAULT_SKILL_RUNS_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "skill-runs"
 MAX_OUTPUT_CHARS = 10000
+
+# Real MIME types for skill-run output files, by extension — set on the B2
+# object at upload time (see SkillRunService._upload_outputs) so it's
+# available for both the B2 object's own metadata and the download route's
+# response (app/routes.py:skill_run_download reads it back off the same
+# extension, kept in sync with this map deliberately rather than shared
+# code, since routes.py can't import from here without a circular import).
+_SKILL_OUTPUT_CONTENT_TYPES = {
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "pdf": "application/pdf",
+}
 
 
 def _now_iso() -> str:
@@ -693,20 +707,28 @@ class FileAnswerStore:
 class SkillRunSession:
     run_id: str
     skill_id: str
-    status: str  # AWAITING_ANSWERS -> GENERATING -> COMPLETED | FAILED
+    status: str  # AWAITING_ANSWERS -> GENERATING -> COMPLETED | COMPLETED_INLINE | FAILED
     answers: dict[str, str] = field(default_factory=dict)
     spec: dict | None = None  # the drafted content (title/slides or sections) — viewable & editable
-    # Every file this run's generation actually produced — one element for
-    # an ordinary skill (docx-generator, ppt-generator), one per requested
-    # format for a MULTI_FORMAT_OUTPUT skill (see run_generation_script).
-    # Empty until generation completes.
-    output_paths: list[Path] = field(default_factory=list)
+    # B2 object keys for every file this run's generation actually produced
+    # — one element for an ordinary skill (docx-generator, ppt-generator),
+    # one per requested format for a MULTI_FORMAT_OUTPUT skill (see
+    # run_generation_script). Empty until generation completes. Each key
+    # ends in the file's real extension (see SkillRunService._upload_outputs)
+    # so it doubles as this run's own little content-addressed record of
+    # what format each file is, without a separate lookup.
+    output_keys: list[str] = field(default_factory=list)
     error: str | None = None
     # Set once draft_spec() runs (on the finish turn): which provider actually
     # drafted `spec`, and whether it's real model output or fallback template
     # content. None/False while a run is still collecting answers.
     provider: str | None = None
     used_fallback: bool = False
+    # Set only when status is COMPLETED_INLINE — the spec rendered as chat
+    # text (app/skill_render.py) instead of a generated file. See
+    # submit_answers' `delivery` param. None on every other status, including
+    # a plain COMPLETED (a real file) run.
+    rendered_text: str | None = None
     created_at: str = field(default_factory=_now_iso)
 
     def public(self) -> dict:
@@ -715,22 +737,24 @@ class SkillRunSession:
             "answers": self.answers, "spec": self.spec, "error": self.error,
             "provider": self.provider, "used_fallback": self.used_fallback,
             "download_ready": self.status == "COMPLETED",
+            "rendered_text": self.rendered_text,
             # Real file extensions actually produced (e.g. ["docx", "pdf"])
             # — lets the frontend render one Download button per format
-            # without a separate call. Derived from the real files on disk,
-            # not a static skill.output string, so it's always accurate.
-            "outputs": [p.suffix.lstrip(".") for p in self.output_paths if p.suffix],
+            # without a separate call. Derived from each output_key's own
+            # extension (see class docstring), not a static skill.output
+            # string, so it's always accurate.
+            "outputs": [k.rsplit(".", 1)[-1] for k in self.output_keys if "." in k],
         }
 
     def to_disk(self) -> dict:
         """Full on-disk record (superset of public()) — includes
-        output_paths, which public()/the API response never expose directly
+        output_keys, which public()/the API response never expose directly
         (each file is only ever served through the dedicated download
-        route), but which SkillRunService._load needs to resolve
-        get_output()/list_outputs() after a restart. Path isn't JSON-native,
-        so each entry is stored as a plain string."""
+        route, which fetches it from B2 by key), but which
+        SkillRunService._load needs to resolve get_output()/list_output_keys()
+        after a restart."""
         data = self.public()
-        data["output_paths"] = [str(p) for p in self.output_paths]
+        data["output_keys"] = list(self.output_keys)
         data["created_at"] = self.created_at
         return data
 
@@ -739,9 +763,10 @@ class SkillRunSession:
         return SkillRunSession(
             run_id=data["run_id"], skill_id=data["skill_id"], status=data["status"],
             answers=data.get("answers") or {}, spec=data.get("spec"),
-            output_paths=[Path(p) for p in (data.get("output_paths") or [])],
+            output_keys=list(data.get("output_keys") or []),
             error=data.get("error"), provider=data.get("provider"),
             used_fallback=bool(data.get("used_fallback", False)),
+            rendered_text=data.get("rendered_text"),
             created_at=data.get("created_at") or _now_iso(),
         )
 
@@ -753,20 +778,41 @@ class SkillRunService:
     lands the run in COMPLETED/FAILED. get_output() hands back the
     downloadable file for a completed run.
 
-    Persisted to disk (data/skill-runs/<run_id>/), same file-backed +
-    in-memory-cache + write-through pattern as SessionStore
-    (app/storage.py) — a run and its generated output used to live only in
-    self.runs (dict) + a tempfile.mkdtemp output dir, both wiped on restart.
+    Run records persist to disk (data/skill-runs/<run_id>/), same
+    file-backed + in-memory-cache + write-through pattern as SessionStore
+    used to (app/storage.py, before it moved to Redis — see
+    app/session_store.py). Generated output files themselves live in B2
+    (see _upload_outputs) — a generation script still writes locally first
+    (subprocess -> --output <path> is unavoidably a local-filesystem
+    handoff, see run_generation_script), but that local copy is uploaded to
+    B2 and discarded immediately after, never kept as a second persistent
+    copy alongside B2.
     """
 
-    def __init__(self, skill_store: SkillPackageStore, provider, data_dir: Path | None = None):
+    def __init__(
+        self, skill_store: SkillPackageStore, provider, data_dir: Path | None = None,
+        blob_store: BlobStore | None = None,
+    ):
         self.skill_store = skill_store
         self.provider = provider
         self.runs: dict[str, SkillRunSession] = {}
         self.data_dir = data_dir or DEFAULT_SKILL_RUNS_DATA_DIR
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.files = FileAnswerStore(self.data_dir)
+        # blob_store lets tests inject a fake without real B2 credentials —
+        # same seam as app/document_store.py's blob_store param. Built
+        # lazily from settings (see _blobs), not here, so constructing a
+        # SkillRunService never itself requires B2_* to be configured.
+        self._blob_store = blob_store
         self._load_runs()
+
+    def _blobs(self) -> BlobStore:
+        if self._blob_store is None:
+            self._blob_store = BlobStore(
+                endpoint=settings.b2_endpoint, bucket=settings.b2_bucket_name,
+                key_id=settings.b2_key_id, application_key=settings.b2_application_key,
+            )
+        return self._blob_store
 
     def _run_dir(self, run_id: str) -> Path:
         return self.data_dir / run_id
@@ -775,13 +821,36 @@ class SkillRunService:
         return self._run_dir(run_id) / "run.json"
 
     def _fresh_output_dir(self, run_id: str) -> Path:
-        # A new uuid4-named subfolder per generation call (submit_answers OR
-        # regenerate) — keeps every generated file at its own distinct path,
-        # same "always a fresh file, never an in-place mutation" contract the
-        # original tempfile.mkdtemp()-per-call behavior had, while still
-        # living under this run's persistent directory so it survives a
-        # restart (unlike the old tempdir).
-        return self._run_dir(run_id) / "output" / str(uuid4())
+        # A throwaway local staging directory for run_generation_script's
+        # subprocess to write into — a real filesystem path is unavoidable
+        # here (the script is invoked with --output <path>), but nothing
+        # under it survives past _upload_outputs: every file it contains is
+        # uploaded to B2 and the whole directory is then removed, unlike the
+        # old behavior of keeping this as the run's permanent storage.
+        return Path(tempfile.mkdtemp(prefix=f"copilot-skill-output-{run_id}-"))
+
+    def _upload_outputs(self, run_id: str, local_paths: list[Path]) -> list[str]:
+        """Uploads every locally-generated output file to B2 and returns
+        their object keys, in the same order as local_paths. Each key ends
+        in the file's real extension (matches local_paths[i].suffix) so
+        SkillRunSession.public()'s `outputs` list and get_output()'s
+        format-matching both work directly off the key string, no separate
+        extension record needed. The local staging directory (this run's
+        _fresh_output_dir) is removed once every file is uploaded — nothing
+        from it is kept, matching class docstring's "never a second
+        persistent copy alongside B2"."""
+        keys = []
+        try:
+            for path in local_paths:
+                key = f"skill-runs/{run_id}/{uuid4()}{path.suffix}"
+                self._blobs().put_bytes(key, path.read_bytes(), content_type=_SKILL_OUTPUT_CONTENT_TYPES.get(
+                    path.suffix.lstrip("."), "application/octet-stream",
+                ))
+                keys.append(key)
+        finally:
+            if local_paths:
+                shutil.rmtree(local_paths[0].parent, ignore_errors=True)
+        return keys
 
     def _write(self, run: SkillRunSession) -> None:
         try:
@@ -849,12 +918,23 @@ class SkillRunService:
 
     async def submit_answers(
         self, run_id: str, answers: dict[str, str], on_event: EventSink | None = None,
+        delivery: str = "file",
     ) -> SkillRunSession:
         """`on_event`, when given, receives live progress for the two real
         steps below — drafting (an LLM call) and generating (an actual
         subprocess running the skill's scripts/generate_*.py) — so a
         streaming UI can show what's actually happening instead of one
-        opaque wait. See CopilotService.chat_stream."""
+        opaque wait. See CopilotService.chat_stream.
+
+        `delivery`: "file" (default — every existing caller, including the
+        Skills tab's own pre-flight form, which has no concept of this at
+        all) generates and uploads the real file, same as always. "inline"
+        (only ever passed by CopilotService's chat-integrated skill Q&A, per
+        TurnPlan.delivery — see app/agents.py) renders the drafted spec as
+        chat text via app/skill_render.py instead, skipping generation and
+        upload entirely, UNLESS this skill has no renderer yet, in which case
+        it falls back to "file" exactly as if delivery had been "file" all
+        along."""
         run = self.get(run_id)
         if run.status != "AWAITING_ANSWERS":
             raise SkillPackageError(f"Run is {run.status}, not awaiting answers.")
@@ -930,20 +1010,32 @@ class SkillRunService:
             run.provider = provider_name
             run.used_fallback = used_fallback
 
-            await _emit(on_event, {
-                "stage": "executing", "label": f"Running {skill.name} generator…",
-                "script": _find_generation_script(skill).name,
-            })
-            # Output lands under this run's own persistent dir (not a
-            # tempfile.mkdtemp) so get_output() still resolves after a
-            # restart — see class docstring.
-            run.output_paths = run_generation_script(skill, spec, output_dir=self._fresh_output_dir(run_id))
-            run.status = "COMPLETED"
-            await _emit(on_event, {
-                "stage": "done",
-                "label": f"Saved {', '.join(p.name for p in run.output_paths)}.",
-                "output_paths": [str(p) for p in run.output_paths],
-            })
+            rendered_text = render_spec_as_chat_text(skill.skill_id, spec) if delivery == "inline" else None
+            if rendered_text is not None:
+                # Rendered inline — no generation, no upload, no file at all.
+                run.rendered_text = rendered_text
+                run.status = "COMPLETED_INLINE"
+                await _emit(on_event, {"stage": "done_inline", "label": "Rendered inline."})
+            else:
+                # delivery == "file", or "inline" was requested but this
+                # skill has no renderer yet (see render_spec_as_chat_text's
+                # docstring) — either way, generate the real file exactly as
+                # before this parameter existed.
+                await _emit(on_event, {
+                    "stage": "executing", "label": f"Running {skill.name} generator…",
+                    "script": _find_generation_script(skill).name,
+                })
+                # Generated to a throwaway local staging dir, then uploaded to
+                # B2 and the local copy discarded — see _fresh_output_dir/
+                # _upload_outputs' docstrings and class docstring.
+                local_paths = run_generation_script(skill, spec, output_dir=self._fresh_output_dir(run_id))
+                run.output_keys = self._upload_outputs(run_id, local_paths)
+                run.status = "COMPLETED"
+                await _emit(on_event, {
+                    "stage": "done",
+                    "label": f"Saved {', '.join(p.name for p in local_paths)}.",
+                    "output_keys": run.output_keys,
+                })
         except SkillPackageError as exc:
             run.status = "FAILED"
             run.error = str(exc)
@@ -968,7 +1060,8 @@ class SkillRunService:
         run.spec = spec
         run.status = "GENERATING"
         try:
-            run.output_paths = run_generation_script(skill, spec, output_dir=self._fresh_output_dir(run_id))
+            local_paths = run_generation_script(skill, spec, output_dir=self._fresh_output_dir(run_id))
+            run.output_keys = self._upload_outputs(run_id, local_paths)
             run.status = "COMPLETED"
             run.error = None
         except SkillPackageError as exc:
@@ -981,29 +1074,43 @@ class SkillRunService:
         self._write(run)
         return run
 
-    def list_outputs(self, run_id: str) -> list[tuple[Path, str]]:
+    def list_output_keys(self, run_id: str) -> list[tuple[str, str]]:
         """Every completed file for this run, each paired with its
-        download filename (skill.name.ext, one entry per real file in
-        output_paths — extension taken from the actual file, not a static
+        download filename (skill.name.ext, one entry per real B2 key in
+        output_keys — extension taken from the key itself, not a static
         skill.output string, so it's correct for both an ordinary
-        single-format skill and a MULTI_FORMAT_OUTPUT one)."""
+        single-format skill and a MULTI_FORMAT_OUTPUT one). Returns keys,
+        not bytes — see get_output for the one that actually fetches
+        content, so listing formats (e.g. to validate a `format` request)
+        never pays for a B2 GET it doesn't need."""
         run = self.get(run_id)
-        if run.status != "COMPLETED" or not run.output_paths:
+        if run.status != "COMPLETED" or not run.output_keys:
             raise SkillPackageError("This run has no completed output yet.")
         skill = self.skill_store.get(run.skill_id)
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", skill.name).strip("-") or "output"
-        return [(p, f"{safe_name}.{p.suffix.lstrip('.') or 'bin'}") for p in run.output_paths]
+        return [(key, f"{safe_name}.{key.rsplit('.', 1)[-1] if '.' in key else 'bin'}") for key in run.output_keys]
 
-    def get_output(self, run_id: str, format: str | None = None) -> tuple[Path, str]:
-        """Returns one (Path, filename) pair. format=None (the default,
-        every existing single-output skill's call shape unchanged) picks
-        the sole output; for a multi-output run, format="docx"/"pdf" picks
-        the matching file by its real extension."""
-        outputs = self.list_outputs(run_id)
+    def get_output(self, run_id: str, format: str | None = None) -> tuple[bytes, str, str]:
+        """Fetches one output file's bytes from B2. Returns (content,
+        filename, content_type). format=None (the default, every existing
+        single-output skill's call shape unchanged) picks the sole output;
+        for a multi-output run, format="docx"/"pdf" picks the matching file
+        by its real extension."""
+        outputs = self.list_output_keys(run_id)
         if format is None:
-            return outputs[0]
-        wanted = format.strip().lower().lstrip(".")
-        for path, filename in outputs:
-            if path.suffix.lstrip(".").lower() == wanted:
-                return path, filename
-        raise SkillPackageError(f"This run has no {format!r} output.")
+            key, filename = outputs[0]
+        else:
+            wanted = format.strip().lower().lstrip(".")
+            match = next(((k, f) for k, f in outputs if k.rsplit(".", 1)[-1].lower() == wanted), None)
+            if match is None:
+                raise SkillPackageError(f"This run has no {format!r} output.")
+            key, filename = match
+        try:
+            content = self._blobs().get_bytes(key)
+        except KeyError:
+            raise SkillPackageError("This run's output file is missing from storage.") from None
+        except BlobStoreError as exc:
+            raise SkillPackageError(f"Could not fetch output from storage: {exc}") from exc
+        extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        content_type = _SKILL_OUTPUT_CONTENT_TYPES.get(extension, "application/octet-stream")
+        return content, filename, content_type

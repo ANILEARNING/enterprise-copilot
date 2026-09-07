@@ -30,6 +30,17 @@ class ProviderResult:
     model: str | None = None
     used_fallback: bool = False
     error: str | None = None
+    # Token usage, read from each provider's own response payload — Gemini's
+    # usageMetadata.{promptTokenCount,candidatesTokenCount}, Ollama's
+    # prompt_eval_count/eval_count. None means "this provider didn't report
+    # usage" (MockProvider; a call that errored before a response body
+    # existed) — never coerced to 0, matching ModelCallRow's own NULL=
+    # unmeasured vs. 0=measured-zero convention (app/db/models.py). Exists
+    # so CopilotService.chat's model_calls capture (see app/services.py) has
+    # real numbers to write instead of needing its own response-parsing
+    # duplicated outside each provider.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 class AIProvider:
@@ -81,6 +92,36 @@ class MockProvider(AIProvider):
 # prompts; a caller's own max_tokens is still respected if it's already
 # bigger than this.
 _GEMMA_THINKING_TOKEN_FLOOR = 512
+
+
+def _parse_gemini_usage(usage: dict | None) -> tuple[int | None, int | None]:
+    """(prompt_tokens, completion_tokens) from Gemini's usageMetadata, or
+    (None, None) if the field is absent entirely (verified: it's always
+    present on a successful response, but a caller passing a mocked/partial
+    dict — tests — shouldn't crash on a missing key).
+
+    completion_tokens is `candidatesTokenCount + thoughtsTokenCount`, not
+    candidatesTokenCount alone — verified live against real responses:
+    - A real Gemini model with thinkingConfig disabled still reports a
+      nonzero thoughtsTokenCount (92 tokens on an 8-prompt-token/2-visible-
+      token call) alongside candidatesTokenCount; both are billed output.
+    - A Gemma model (thinkingConfig can't disable its reasoning at all — see
+      GeminiProvider.complete's is_gemma branch) omits candidatesTokenCount
+      from the payload ENTIRELY even when real visible text came back, only
+      ever reporting promptTokenCount/totalTokenCount/thoughtsTokenCount.
+    Falling back to `total - prompt` (rather than requiring
+    candidatesTokenCount to be present) is what makes this correct for both
+    shapes: verified live that promptTokenCount + candidatesTokenCount +
+    thoughtsTokenCount == totalTokenCount exactly, so total - prompt already
+    equals candidates + thoughts whether or not candidatesTokenCount itself
+    was reported."""
+    if not usage:
+        return None, None
+    prompt_tokens = usage.get("promptTokenCount")
+    total_tokens = usage.get("totalTokenCount")
+    if prompt_tokens is None or total_tokens is None:
+        return prompt_tokens, None
+    return prompt_tokens, total_tokens - prompt_tokens
 
 
 class GeminiProvider(AIProvider):
@@ -161,7 +202,11 @@ class GeminiProvider(AIProvider):
                     f"Gemini returned only hidden-reasoning content, no visible answer "
                     f"(finishReason={finish_reason}) — try a larger max_tokens."
                 )
-            return ProviderResult(text="".join(answer_parts), provider=self.name, model=self.model)
+            prompt_tokens, completion_tokens = _parse_gemini_usage(data.get("usageMetadata"))
+            return ProviderResult(
+                text="".join(answer_parts), provider=self.name, model=self.model,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            )
 
 
 class OllamaProvider(AIProvider):
@@ -216,9 +261,117 @@ class OllamaProvider(AIProvider):
             text = data.get("response", "")
             if not text:
                 # A too-small token budget can be entirely consumed by hidden
-                # "thinking" tokens on reasoning models, leaving no visible text.
+                # "thinking" tokens on reasoning models, leaving no visible text
+                # — verified live against gpt-oss:20b: prompt_eval_count=69,
+                # eval_count=50 (the requested num_predict budget, fully
+                # consumed), response="" — think:False doesn't reliably stop
+                # this (see this method's own payload comment above).
                 raise RuntimeError(f"Ollama returned no content (done_reason={data.get('done_reason')})")
-            return ProviderResult(text=text, provider=self.name, model=self.model)
+            return ProviderResult(
+                text=text, provider=self.name, model=self.model,
+                prompt_tokens=data.get("prompt_eval_count"), completion_tokens=data.get("eval_count"),
+            )
+
+
+def _azure_deployment_names() -> list[str]:
+    """Every reasoning deployment offered to the Copilot model picker —
+    settings.azure_ai_deployments (comma-separated, optional) plus the
+    default settings.azure_ai_deployment, deduplicated with the default kept
+    first. Empty azure_ai_deployments means "just the default," the common
+    single-deployment case."""
+    default = settings.azure_ai_deployment.strip()
+    extra = [d.strip() for d in settings.azure_ai_deployments.split(",") if d.strip()]
+    names = ([default] if default else []) + extra
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+class AzureAIFoundryProvider(AIProvider):
+    """Azure AI Foundry / Azure OpenAI — the classic per-resource chat
+    completions shape: https://<resource>.openai.azure.com/openai/deployments/
+    <deployment>/chat/completions?api-version=<version>. Auth is an `api-key`
+    header (NOT `Authorization: Bearer`, unlike Ollama Cloud/Gemini's header
+    conventions) — Azure's own convention for this endpoint shape.
+
+    `model` here is really "which deployment" — Azure's unit of model
+    selection is a named deployment you create inside the resource, not a
+    public model id like GeminiProvider.DEFAULT_MODEL. There's no
+    Azure-wide default the way "gemini-flash-latest" is for Gemini, since a
+    deployment name is only ever meaningful within one specific resource —
+    every caller must pass one explicitly (settings.azure_ai_deployment)."""
+
+    name = "azure"
+
+    def __init__(
+        self, endpoint: str, api_key: str, deployment: str, api_version: str,
+        max_output_tokens: int = 256,
+    ):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.deployment = deployment
+        self.api_version = api_version
+        self.max_output_tokens = max_output_tokens
+        # Exposed as `model` for parity with GeminiProvider/OllamaProvider —
+        # ProviderResult.model / the UI's "which model answered" both read
+        # this attribute name, and here it's the deployment name (see class
+        # docstring: that's Azure's real unit of model selection).
+        self.model = deployment
+
+    async def complete(
+        self, prompt: str, history: list[dict], max_tokens: int | None = None, json_mode: bool = False,
+        images: list[dict] | None = None,
+    ) -> ProviderResult:
+        messages = [{"role": h["role"], "content": h["content"]} for h in history]
+        # Vision: OpenAI-compatible multi-part content (a list of {"type":
+        # "text"|"image_url", ...} parts) instead of a bare string — same
+        # shape autogen_ext's OpenAIChatCompletionClient expects, and what
+        # Azure OpenAI's GPT-4o-class deployments support natively.
+        if images:
+            content: list[dict] = [{"type": "text", "text": prompt}]
+            for image in images:
+                mime_type = image.get("mime_type", "image/png")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image['data']}"},
+                })
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": prompt})
+
+        payload: dict = {"messages": messages, "max_tokens": max_tokens or self.max_output_tokens}
+        if json_mode:
+            # Azure OpenAI's structured-output mode (same field/shape as
+            # OpenAI's own API) — constrains sampling to well-formed JSON,
+            # same guarantee json_mode gets on Gemini/Ollama above.
+            payload["response_format"] = {"type": "json_object"}
+
+        url = f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions"
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Key travels in a header, never the URL, so it can't leak into logs/exceptions.
+            resp = await client.post(
+                url, params={"api-version": self.api_version},
+                headers={"api-key": self.api_key}, json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("Azure AI Foundry returned no choices in its response.")
+            message = choices[0].get("message") or {}
+            text = message.get("content") or ""
+            if not text:
+                finish_reason = choices[0].get("finish_reason", "unknown")
+                raise RuntimeError(f"Azure AI Foundry returned no content (finish_reason={finish_reason}).")
+            usage = data.get("usage") or {}
+            return ProviderResult(
+                text=text, provider=self.name, model=self.model,
+                prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
+            )
 
 
 class FallbackProvider(AIProvider):
@@ -270,6 +423,11 @@ def build_provider() -> AIProvider:
             settings.ollama_base_url, settings.ollama_model, settings.ollama_api_key,
             settings.max_output_tokens,
         )
+    elif settings.model_provider == "azure" and settings.azure_ai_endpoint and settings.azure_ai_api_key and settings.azure_ai_deployment:
+        primary = AzureAIFoundryProvider(
+            settings.azure_ai_endpoint, settings.azure_ai_api_key, settings.azure_ai_deployment,
+            settings.azure_ai_api_version, settings.max_output_tokens,
+        )
 
     return FallbackProvider(primary, mock)
 
@@ -316,6 +474,23 @@ def build_provider_for(provider: str, model: str) -> AIProvider:
         return GeminiProvider(settings.gemini_api_key, settings.max_output_tokens, model=model)
     if provider == "ollama":
         return OllamaProvider(settings.ollama_base_url, model, settings.ollama_api_key, settings.max_output_tokens)
+    if provider == "azure":
+        if not (settings.azure_ai_endpoint and settings.azure_ai_api_key and settings.azure_ai_deployment):
+            raise ModelUnavailableError(
+                "Azure AI Foundry isn't configured in this environment "
+                "(need AZURE_AI_ENDPOINT, AZURE_AI_API_KEY and AZURE_AI_DEPLOYMENT)."
+            )
+        # `model` is the picker's chosen deployment name — honored directly
+        # if it's one of this resource's known deployments (see
+        # _azure_deployment_names/list_available_models's Azure branch, which
+        # is what actually offered it), otherwise falling back to the
+        # configured default rather than dialing a deployment that was never
+        # offered as a choice (a stale/hand-typed "provider/model" string).
+        deployment = model if model in _azure_deployment_names() else settings.azure_ai_deployment
+        return AzureAIFoundryProvider(
+            settings.azure_ai_endpoint, settings.azure_ai_api_key, deployment,
+            settings.azure_ai_api_version, settings.max_output_tokens,
+        )
     raise ModelUnavailableError(f"Unknown provider {provider!r}.")
 
 
@@ -383,6 +558,26 @@ async def list_available_models() -> dict:
             errors.append({"provider": "ollama", "message": describe_model_error(exc)})
     else:
         errors.append({"provider": "ollama", "message": "Not configured (no OLLAMA_BASE_URL)."})
+
+    # Azure has no equivalent "list every model this key can reach" call: a
+    # resource's deployments are only enumerable via Azure's management/ARM
+    # API, a completely different auth model (an Azure AD/ARM token, not the
+    # resource's own api-key) this app has no infrastructure for. What IS
+    # knowable from settings alone is every deployment actually configured —
+    # the default (AZURE_AI_DEPLOYMENT) plus any extras (AZURE_AI_DEPLOYMENTS,
+    # for a resource with more than one reasoning deployment — see
+    # _azure_deployment_names) — reported directly rather than left silently
+    # absent from the picker.
+    if settings.azure_ai_endpoint and settings.azure_ai_api_key and settings.azure_ai_deployment:
+        for name in _azure_deployment_names():
+            models.append({
+                "provider": "azure", "model": name, "label": f"{name} (Azure AI Foundry)",
+            })
+    else:
+        errors.append({
+            "provider": "azure",
+            "message": "Not configured (need AZURE_AI_ENDPOINT, AZURE_AI_API_KEY and AZURE_AI_DEPLOYMENT).",
+        })
 
     return {"models": models, "errors": errors}
 
@@ -603,6 +798,38 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         raise last_error or RuntimeError("Ollama embedding failed: no candidate models available")
 
 
+class AzureEmbeddingProvider(EmbeddingProvider):
+    """Azure AI Foundry / Azure OpenAI embeddings — same per-resource
+    deployment shape and auth (`api-key` header) as AzureAIFoundryProvider's
+    chat completions, just the /embeddings path instead of /chat/completions.
+    One deployment only (settings.azure_ai_embedding_deployment) — no
+    per-call picker, matching how gemini_embedding_model/ollama_embedding_model
+    already work (see build_embedding_provider)."""
+
+    name = "azure"
+
+    def __init__(self, endpoint: str, api_key: str, deployment: str, api_version: str):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.deployment = deployment
+        self.api_version = api_version
+        self.model = deployment
+
+    async def embed(self, text: str) -> EmbeddingResult:
+        url = f"{self.endpoint}/openai/deployments/{self.deployment}/embeddings"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                url, params={"api-version": self.api_version},
+                headers={"api-key": self.api_key}, json={"input": text},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            vector = data[0].get("embedding") if data else None
+            if not vector:
+                raise RuntimeError("Azure AI Foundry returned no embedding values")
+            return EmbeddingResult(vector=vector, provider=self.name, model=self.model)
+
+
 class ChainEmbeddingProvider(EmbeddingProvider):
     """Tries each embedding provider in `steps`, in order; the first success
     wins. Falls back to the offline hash embedder only if every step fails
@@ -638,7 +865,9 @@ def build_embedding_provider() -> EmbeddingProvider:
     few other embedding models on that host if the configured one fails —
     see OllamaEmbeddingProvider), then Gemini as a cross-provider safety net
     if it's also configured, then the offline hash embedder as the final,
-    always-available step."""
+    always-available step. Azure follows the same "primary provider, Gemini
+    as a cross-provider safety net" shape as Ollama, since Azure embedding
+    deployments can be just as host/plan-dependent as Ollama's pulled models."""
     hash_provider = HashEmbeddingProvider()
     if settings.ai_mode != "configured":
         return hash_provider
@@ -652,6 +881,16 @@ def build_embedding_provider() -> EmbeddingProvider:
             steps.append(GeminiEmbeddingProvider(settings.gemini_api_key, settings.gemini_embedding_model))
     elif settings.model_provider == "gemini" and settings.gemini_api_key:
         steps.append(GeminiEmbeddingProvider(settings.gemini_api_key, settings.gemini_embedding_model))
+    elif (
+        settings.model_provider == "azure" and settings.azure_ai_endpoint
+        and settings.azure_ai_api_key and settings.azure_ai_embedding_deployment
+    ):
+        steps.append(AzureEmbeddingProvider(
+            settings.azure_ai_endpoint, settings.azure_ai_api_key,
+            settings.azure_ai_embedding_deployment, settings.azure_ai_api_version,
+        ))
+        if settings.gemini_api_key:
+            steps.append(GeminiEmbeddingProvider(settings.gemini_api_key, settings.gemini_embedding_model))
 
     return ChainEmbeddingProvider(steps, hash_provider)
 
@@ -673,6 +912,13 @@ def describe_embedding_config() -> dict:
             chain.append({"provider": "gemini", "model": settings.gemini_embedding_model})
     elif settings.model_provider == "gemini" and settings.gemini_api_key:
         chain.append({"provider": "gemini", "model": settings.gemini_embedding_model})
+    elif (
+        settings.model_provider == "azure" and settings.azure_ai_endpoint
+        and settings.azure_ai_api_key and settings.azure_ai_embedding_deployment
+    ):
+        chain.append({"provider": "azure", "model": settings.azure_ai_embedding_deployment})
+        if settings.gemini_api_key:
+            chain.append({"provider": "gemini", "model": settings.gemini_embedding_model})
     chain.append({"provider": "hash", "model": None})
 
     primary = chain[0]

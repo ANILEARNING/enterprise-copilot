@@ -17,12 +17,12 @@ streaming endpoint — if it's unavailable or fails, CopilotService.chat_stream(
 falls back to the existing, fully-tested non-streaming chat() path (see
 app/services.py). Nothing elsewhere in the app depends on this module succeeding.
 
-Scope: powers only the plain "direct chat" case (agent_mode off, no skill
-match, no RAG grounding) — the one case that's genuinely "send a prompt,
-stream the answer." Agent-mode/skill/RAG-grounded turns keep using the
-existing orchestrator and are delivered over the same SSE envelope as a
-single non-streamed chunk, so the frontend (and the stop button) behave
-uniformly regardless of which path served a given turn.
+Scope: powers only the router's "direct" route (see app/agents.py:plan_turn
+— no augmentation needed, no skill match, no RAG grounding) — the one case
+that's genuinely "send a prompt, stream the answer." "agent"/skill/deck
+turns keep using the existing orchestrator and are delivered over the same
+SSE envelope as a single non-streamed chunk, so the frontend (and the stop
+button) behave uniformly regardless of which path served a given turn.
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ from .memory import (
     BUFFER_SIZE, CompactingChatCompletionContext, CompactMemoryState,
     history_to_llm_messages, llm_messages_to_plain, render_memory_preview,
 )
+from .providers import _azure_deployment_names
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,34 @@ def build_streaming_model_client(
             model_info=_model_info(function_calling, vision),
         )
         return client, "ollama", resolved_model
+    if provider == "azure":
+        if not (settings.azure_ai_endpoint and settings.azure_ai_api_key and settings.azure_ai_deployment):
+            if strict:
+                raise ModelUnavailableError(
+                    "Azure AI Foundry isn't configured in this environment "
+                    "(need AZURE_AI_ENDPOINT, AZURE_AI_API_KEY and AZURE_AI_DEPLOYMENT)."
+                )
+            return None, None, None
+        try:
+            from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
+        except ImportError:
+            if strict:
+                raise ModelUnavailableError("Streaming isn't available in this environment (autogen-ext[openai] not installed).")
+            logger.warning("autogen-ext[openai] not installed; real streaming chat is unavailable.")
+            return None, None, None
+        # `model` is the picker's chosen deployment name — honored if it's
+        # one of this resource's known deployments (see
+        # _azure_deployment_names, app/providers.py), otherwise the
+        # configured default, same reasoning as build_provider_for's Azure
+        # branch there.
+        resolved_model = model if model in _azure_deployment_names() else settings.azure_ai_deployment
+        client = AzureOpenAIChatCompletionClient(
+            model=resolved_model, azure_deployment=resolved_model,
+            azure_endpoint=settings.azure_ai_endpoint, api_version=settings.azure_ai_api_version,
+            api_key=settings.azure_ai_api_key,
+            model_info=_model_info(function_calling, vision),
+        )
+        return client, "azure", resolved_model
     if strict:
         raise ModelUnavailableError(f"{provider!r} doesn't support streaming chat.")
     return None, None, None
@@ -235,8 +264,8 @@ async def stream_chat(
     # which only know prompt_preview once a response comes back), so this
     # fires before the first token rather than after. Powers the UI's "View
     # context sent to model" disclosure (see static/app.js
-    # contextDisclosureHtml) — without this, direct chat (agent_mode off,
-    # the default mode) never had a system_preview/prompt_preview at all.
+    # contextDisclosureHtml) — without this, direct chat (the router's
+    # "direct" route) never had a system_preview/prompt_preview at all.
     yield {
         "type": "status", "stage": "model_call_started",
         "system_preview": SYSTEM_MESSAGE, "prompt_preview": message[:2000],

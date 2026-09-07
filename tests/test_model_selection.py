@@ -4,11 +4,51 @@ import pytest
 import app.providers as providers_module
 from app.config import settings
 from app.providers import (
-    GeminiProvider, MockProvider, ModelUnavailableError, OllamaProvider,
-    build_provider_for, describe_model_error, list_available_embedding_models,
-    list_available_models,
+    AzureAIFoundryProvider, GeminiProvider, MockProvider, ModelUnavailableError, OllamaProvider,
+    _azure_deployment_names, build_provider_for, describe_model_error,
+    list_available_embedding_models, list_available_models,
 )
 from app.services import CopilotService
+
+
+# --- _azure_deployment_names: default + extras, deduplicated -----------------
+
+def test_azure_deployment_names_just_the_default(monkeypatch):
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "")
+    assert _azure_deployment_names() == ["gpt-4o"]
+
+
+def test_azure_deployment_names_default_plus_extras(monkeypatch):
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "gpt-4o-mini, o1-mini")
+    assert _azure_deployment_names() == ["gpt-4o", "gpt-4o-mini", "o1-mini"]
+
+
+def test_azure_deployment_names_deduplicates_and_keeps_default_first(monkeypatch):
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "gpt-4o-mini,gpt-4o, gpt-4o-mini")
+    assert _azure_deployment_names() == ["gpt-4o", "gpt-4o-mini"]
+
+
+def test_azure_deployment_names_empty_when_nothing_configured(monkeypatch):
+    monkeypatch.setattr(settings, "azure_ai_deployment", "")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "")
+    assert _azure_deployment_names() == []
+
+
+@pytest.fixture(autouse=True)
+def _clear_azure_settings(monkeypatch):
+    # Every existing gemini/ollama-focused test in this file predates Azure
+    # support and doesn't set these — keep them explicitly unconfigured by
+    # default so list_available_models/build_provider_for's new Azure branch
+    # doesn't change any of those tests' behavior out from under them.
+    monkeypatch.setattr(settings, "azure_ai_endpoint", "")
+    monkeypatch.setattr(settings, "azure_ai_api_key", "")
+    monkeypatch.setattr(settings, "azure_ai_deployment", "")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "")
+    monkeypatch.setattr(settings, "azure_ai_embedding_deployment", "")
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +135,41 @@ def test_build_provider_for_unknown_provider():
         build_provider_for("not-a-real-provider", "x")
 
 
+def test_build_provider_for_azure_requires_full_config(monkeypatch):
+    monkeypatch.setattr(settings, "azure_ai_endpoint", "https://r.openai.azure.com")
+    monkeypatch.setattr(settings, "azure_ai_api_key", "")  # missing key
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o-mini")
+    with pytest.raises(ModelUnavailableError, match="AZURE_AI_API_KEY"):
+        build_provider_for("azure", "gpt-4o-mini")
+
+
+def test_build_provider_for_azure_falls_back_to_default_for_an_unknown_model(monkeypatch):
+    monkeypatch.setattr(settings, "azure_ai_endpoint", "https://r.openai.azure.com")
+    monkeypatch.setattr(settings, "azure_ai_api_key", "fake-key")
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o-mini")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "")
+    # A "provider/model" string naming a deployment this resource was never
+    # reported to have (see _azure_deployment_names) falls back to the
+    # configured default rather than dialing an unofferred deployment.
+    provider = build_provider_for("azure", "some-other-name")
+    assert isinstance(provider, AzureAIFoundryProvider)
+    assert provider.model == "gpt-4o-mini"
+    assert provider.endpoint == "https://r.openai.azure.com"
+
+
+def test_build_provider_for_azure_honors_a_known_second_deployment(monkeypatch):
+    # A resource with more than one reasoning deployment — the picker's
+    # choice of the NON-default one must actually be dialed, not silently
+    # replaced by the default.
+    monkeypatch.setattr(settings, "azure_ai_endpoint", "https://r.openai.azure.com")
+    monkeypatch.setattr(settings, "azure_ai_api_key", "fake-key")
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "gpt-4o-mini")
+    provider = build_provider_for("azure", "gpt-4o-mini")
+    assert isinstance(provider, AzureAIFoundryProvider)
+    assert provider.model == "gpt-4o-mini"
+
+
 # --- list_available_models: partial-failure-tolerant catalog ------------------
 
 @pytest.mark.asyncio
@@ -141,6 +216,43 @@ async def test_list_available_models_gemini_success(monkeypatch):
     result = await list_available_models()
     gemini_models = [m for m in result["models"] if m["provider"] == "gemini"]
     assert gemini_models == [{"provider": "gemini", "model": "gemini-flash-latest", "label": "Gemini Flash"}]
+
+
+@pytest.mark.asyncio
+async def test_list_available_models_azure_not_configured_reports_reason():
+    # Cleared by the autouse _clear_azure_settings fixture above.
+    result = await list_available_models()
+    assert not any(m["provider"] == "azure" for m in result["models"])
+    azure_error = next(e["message"] for e in result["errors"] if e["provider"] == "azure")
+    assert "AZURE_AI_ENDPOINT" in azure_error
+
+
+@pytest.mark.asyncio
+async def test_list_available_models_azure_reports_the_one_configured_deployment(monkeypatch):
+    # Unlike Gemini/Ollama, Azure has no "list every model this key can
+    # reach" call (deployments are only enumerable via a different Azure
+    # ARM/management-API auth model this app doesn't have) — the one
+    # deployment actually configured is reported directly instead.
+    monkeypatch.setattr(settings, "azure_ai_endpoint", "https://r.openai.azure.com")
+    monkeypatch.setattr(settings, "azure_ai_api_key", "fake-key")
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o-mini")
+    result = await list_available_models()
+    azure_models = [m for m in result["models"] if m["provider"] == "azure"]
+    assert azure_models == [{"provider": "azure", "model": "gpt-4o-mini", "label": "gpt-4o-mini (Azure AI Foundry)"}]
+    assert not any(e["provider"] == "azure" for e in result["errors"])
+
+
+@pytest.mark.asyncio
+async def test_list_available_models_azure_reports_every_deployment(monkeypatch):
+    # A resource with more than one reasoning deployment (AZURE_AI_DEPLOYMENTS)
+    # must offer all of them to the Copilot model picker, not just the default.
+    monkeypatch.setattr(settings, "azure_ai_endpoint", "https://r.openai.azure.com")
+    monkeypatch.setattr(settings, "azure_ai_api_key", "fake-key")
+    monkeypatch.setattr(settings, "azure_ai_deployment", "gpt-4o")
+    monkeypatch.setattr(settings, "azure_ai_deployments", "gpt-4o-mini, o1-mini")
+    result = await list_available_models()
+    azure_models = [m["model"] for m in result["models"] if m["provider"] == "azure"]
+    assert azure_models == ["gpt-4o", "gpt-4o-mini", "o1-mini"]
 
 
 # --- list_available_embedding_models: same shape, one level down --------------

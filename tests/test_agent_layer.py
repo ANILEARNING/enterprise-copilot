@@ -9,9 +9,9 @@ from app.agents import (
 )
 from app.config import settings
 from app.providers import (
-    ChainEmbeddingProvider, EmbeddingProvider, EmbeddingResult, FallbackProvider,
-    GeminiEmbeddingProvider, GeminiProvider, HashEmbeddingProvider, MockProvider,
-    OllamaEmbeddingProvider, OllamaProvider,
+    AzureAIFoundryProvider, AzureEmbeddingProvider, ChainEmbeddingProvider, EmbeddingProvider,
+    EmbeddingResult, FallbackProvider, GeminiEmbeddingProvider, GeminiProvider, HashEmbeddingProvider,
+    MockProvider, OllamaEmbeddingProvider, OllamaProvider,
 )
 from app.sandbox import LocalSubprocessSandbox
 from app.services import GuardrailService, HitlService, RAGStore
@@ -211,6 +211,220 @@ async def test_configured_ollama_unreachable_falls_back_to_mock():
     result = await provider.complete("ping", [])
     assert result.used_fallback is True
     assert result.provider == "mock"
+
+
+# --- Azure AI Foundry provider (classic Azure OpenAI resource shape) ---------
+
+@pytest.mark.asyncio
+async def test_azure_provider_sends_api_key_header_and_deployment_url(monkeypatch):
+    # Azure's auth convention is an `api-key` header, NOT `Authorization:
+    # Bearer` (unlike Ollama Cloud) — and the deployment name belongs in the
+    # URL path, with api-version as a query param, never the URL's own path
+    # segment for the key itself.
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, params=None, headers=None, json=None):
+            captured["url"] = url
+            captured["params"] = params
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    provider = AzureAIFoundryProvider(
+        endpoint="https://my-resource.openai.azure.com", api_key="secret-key",
+        deployment="gpt-4o-mini", api_version="2024-10-21",
+    )
+    result = await provider.complete("hi", [])
+    assert result.text == "OK"
+    assert result.model == "gpt-4o-mini"
+    assert result.provider == "azure"
+    assert result.prompt_tokens == 5
+    assert result.completion_tokens == 2
+    assert captured["headers"] == {"api-key": "secret-key"}
+    assert captured["url"] == "https://my-resource.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions"
+    assert captured["params"] == {"api-version": "2024-10-21"}
+    assert "secret-key" not in captured["url"]
+    assert captured["json"]["messages"][-1] == {"role": "user", "content": "hi"}
+
+
+@pytest.mark.asyncio
+async def test_azure_provider_json_mode_sets_response_format(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content": '{"a": 1}'}, "finish_reason": "stop"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, params=None, headers=None, json=None):
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    provider = AzureAIFoundryProvider("https://r.openai.azure.com", "key", "dep", "2024-10-21")
+    result = await provider.complete("give me json", [], json_mode=True)
+    assert result.text == '{"a": 1}'
+    assert captured["json"]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_azure_provider_sends_vision_content_as_image_url(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content": "I see a cat"}, "finish_reason": "stop"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, params=None, headers=None, json=None):
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    provider = AzureAIFoundryProvider("https://r.openai.azure.com", "key", "dep", "2024-10-21")
+    result = await provider.complete("what's in this image?", [], images=[{"data": "ZmFrZQ==", "mime_type": "image/png"}])
+    assert result.text == "I see a cat"
+    user_message = captured["json"]["messages"][-1]
+    assert user_message["role"] == "user"
+    assert user_message["content"][0] == {"type": "text", "text": "what's in this image?"}
+    assert user_message["content"][1]["image_url"]["url"] == "data:image/png;base64,ZmFrZQ=="
+
+
+@pytest.mark.asyncio
+async def test_azure_provider_empty_content_raises_with_finish_reason(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {}, "finish_reason": "content_filter"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, *a, **kw):
+            return FakeResponse()
+
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    provider = AzureAIFoundryProvider("https://r.openai.azure.com", "key", "dep", "2024-10-21")
+    with pytest.raises(RuntimeError, match="content_filter"):
+        await provider.complete("hi", [])
+
+
+@pytest.mark.asyncio
+async def test_configured_azure_unreachable_falls_back_to_mock():
+    # Same posture as Gemini/Ollama above: a real network failure degrades to
+    # mock, never crashes the turn.
+    primary = AzureAIFoundryProvider("https://does-not-exist.invalid", "key", "dep", "2024-10-21")
+    provider = FallbackProvider(primary=primary, mock=MockProvider())
+    result = await provider.complete("ping", [])
+    assert result.used_fallback is True
+    assert result.provider == "mock"
+
+
+@pytest.mark.asyncio
+async def test_azure_embedding_provider_sends_api_key_header_and_deployment_url(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, params=None, headers=None, json=None):
+            captured["url"] = url
+            captured["params"] = params
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    provider = AzureEmbeddingProvider(
+        endpoint="https://my-resource.openai.azure.com", api_key="secret-key",
+        deployment="text-embedding-3-small", api_version="2024-10-21",
+    )
+    result = await provider.embed("hello world")
+    assert result.vector == [0.1, 0.2, 0.3]
+    assert result.model == "text-embedding-3-small"
+    assert result.provider == "azure"
+    assert captured["headers"] == {"api-key": "secret-key"}
+    assert captured["url"] == (
+        "https://my-resource.openai.azure.com/openai/deployments/text-embedding-3-small/embeddings"
+    )
+    assert captured["params"] == {"api-version": "2024-10-21"}
+    assert captured["json"] == {"input": "hello world"}
+
+
+@pytest.mark.asyncio
+async def test_azure_embedding_provider_empty_values_raises(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"data": []}
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, *a, **kw):
+            return FakeResponse()
+
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    provider = AzureEmbeddingProvider("https://r.openai.azure.com", "key", "dep", "2024-10-21")
+    with pytest.raises(RuntimeError, match="no embedding values"):
+        await provider.embed("hi")
 
 
 # --- embedding provider abstraction / Ollama model retry / chain fallback ---

@@ -259,9 +259,10 @@ async def test_skill_run_full_flow_ppt(tmp_path):
     assert completed.status == "COMPLETED"
     assert completed.error is None
 
-    path, filename = runs.get_output(run.run_id)
-    assert path.exists() and path.stat().st_size > 0
+    content, filename, content_type = runs.get_output(run.run_id)
+    assert content and len(content) > 0
     assert filename.endswith(".pptx")
+    assert content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     assert completed.spec is not None and completed.spec["title"]
 
 
@@ -274,7 +275,7 @@ async def test_skill_run_regenerate_from_edited_spec(tmp_path):
         "topic": "Team offsite recap", "audience": "My team", "tone": "Casual",
     })
     assert completed.status == "COMPLETED"
-    original_path = completed.output_paths[0]
+    original_key = completed.output_keys[0]
 
     edited_spec = dict(completed.spec)
     edited_spec["title"] = "Edited Title From User"
@@ -283,10 +284,11 @@ async def test_skill_run_regenerate_from_edited_spec(tmp_path):
 
     assert regenerated.status == "COMPLETED"
     assert regenerated.spec["title"] == "Edited Title From User"
-    assert regenerated.output_paths[0] != original_path  # a fresh file, not a mutation of the old one
+    assert regenerated.output_keys[0] != original_key  # a fresh file, not a mutation of the old one
 
     from pptx import Presentation
-    prs = Presentation(regenerated.output_paths[0])
+    content, _, _ = runs.get_output(run.run_id)
+    prs = Presentation(io.BytesIO(content))
     assert prs.slides[0].shapes.title.text == "Edited Title From User"
     assert prs.slides[1].shapes.title.text == "New slide"
 
@@ -310,9 +312,10 @@ async def test_skill_run_full_flow_docx(tmp_path):
         "topic": "New hire policy", "doc_type": "Memo", "audience": "My team", "tone": "Formal",
     })
     assert completed.status == "COMPLETED"
-    path, filename = runs.get_output(run.run_id)
-    assert path.exists() and path.stat().st_size > 0
+    content, filename, content_type = runs.get_output(run.run_id)
+    assert content and len(content) > 0
     assert filename.endswith(".docx")
+    assert content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 @pytest.mark.asyncio
@@ -358,8 +361,8 @@ async def test_completed_run_survives_new_service_instance(tmp_path):
     reloaded_runs = _runs(store, tmp_path)
     reloaded = reloaded_runs.get(completed.run_id)
     assert reloaded.status == "COMPLETED"
-    path, filename = reloaded_runs.get_output(completed.run_id)
-    assert path.exists() and path.stat().st_size > 0
+    content, filename, _ = reloaded_runs.get_output(completed.run_id)
+    assert content and len(content) > 0
     assert filename.endswith(".pptx")
 
 
@@ -422,9 +425,8 @@ async def test_file_question_answer_reaches_generation_script(tmp_path):
 
     completed = await runs.submit_answers(run.run_id, {"dataset": uploaded["file_id"]})
     assert completed.status == "COMPLETED", completed.error
-    path, _ = runs.get_output(run.run_id)
-    content = path.read_text()
-    assert content == f"filename=data.csv size={len(raw)}"
+    content, _, _ = runs.get_output(run.run_id)
+    assert content.decode("utf-8") == f"filename=data.csv size={len(raw)}"
 
 
 def test_upload_answer_file_rejects_disallowed_extension(tmp_path):
@@ -455,6 +457,68 @@ async def test_submit_answers_rejects_expired_file_id(tmp_path):
     with pytest.raises(SkillPackageError, match="missing or expired"):
         await runs.submit_answers(run.run_id, {"dataset": "not-a-real-file-id"})
     assert runs.get(run.run_id).status == "AWAITING_ANSWERS"
+
+
+# --- delivery="inline" (see app/skill_render.py, TurnPlan.delivery) -----------
+
+@pytest.mark.asyncio
+async def test_submit_answers_inline_delivery_renders_text_no_file(tmp_path):
+    # docx-generator has a renderer — delivery="inline" must render the spec
+    # as text and skip generation/upload entirely (no output_keys at all).
+    # MockProvider's own drafting behavior (used here, same as every other
+    # test in this module) isn't the point of this test — just that
+    # whatever spec got drafted was rendered as text, not generated as a file.
+    store = _store(tmp_path)
+    runs = _runs(store, tmp_path)
+    run = runs.start("docx-generator")
+    completed = await runs.submit_answers(
+        run.run_id,
+        {"topic": "Q3 performance", "doc_type": "Report", "audience": "Executives", "tone": "Formal"},
+        delivery="inline",
+    )
+    assert completed.status == "COMPLETED_INLINE", completed.error
+    assert completed.rendered_text
+    assert completed.rendered_text.startswith("# ")  # render_spec_as_chat_text's title heading
+    assert completed.output_keys == []
+    public = completed.public()
+    assert public["download_ready"] is False
+    assert public["outputs"] == []
+    assert public["rendered_text"] == completed.rendered_text
+
+
+@pytest.mark.asyncio
+async def test_submit_answers_inline_delivery_falls_back_to_file_when_no_renderer(tmp_path):
+    # ppt-generator has no renderer yet (see app/skill_render.py) —
+    # delivery="inline" must fall back to generating the real file exactly
+    # as if delivery had been "file" all along, not silently produce nothing.
+    store = _store(tmp_path)
+    runs = _runs(store, tmp_path)
+    run = runs.start("ppt-generator")
+    completed = await runs.submit_answers(
+        run.run_id,
+        {"topic": "Q3 performance", "audience": "Executives", "tone": "Formal"},
+        delivery="inline",
+    )
+    assert completed.status == "COMPLETED", completed.error
+    assert completed.rendered_text is None
+    assert completed.output_keys
+    assert completed.public()["download_ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_submit_answers_default_delivery_is_file(tmp_path):
+    # Every existing caller (including the Skills tab's own route, which
+    # passes no delivery argument at all) must keep generating a real file.
+    store = _store(tmp_path)
+    runs = _runs(store, tmp_path)
+    run = runs.start("docx-generator")
+    completed = await runs.submit_answers(
+        run.run_id,
+        {"topic": "Q3 performance", "doc_type": "Report", "audience": "Executives", "tone": "Formal"},
+    )
+    assert completed.status == "COMPLETED", completed.error
+    assert completed.rendered_text is None
+    assert completed.output_keys
 
 
 # --- multi-output support (MULTI_FORMAT_OUTPUT) ------------------------------
@@ -499,20 +563,20 @@ async def test_multi_format_skill_produces_both_files(tmp_path):
     run = runs.start(skill.skill_id)
     completed = await runs.submit_answers(run.run_id, {"project_name": "Hello", "output_format": "Both"})
     assert completed.status == "COMPLETED", completed.error
-    assert len(completed.output_paths) == 2
-    assert {p.suffix for p in completed.output_paths} == {".docx", ".pdf"}
+    assert len(completed.output_keys) == 2
+    assert {k.rsplit(".", 1)[-1] for k in completed.output_keys} == {"docx", "pdf"}
 
     public = completed.public()
     assert set(public["outputs"]) == {"docx", "pdf"}
 
-    docx_path, docx_name = runs.get_output(run.run_id, format="docx")
-    pdf_path, pdf_name = runs.get_output(run.run_id, format="pdf")
-    assert docx_path.read_text() == "docx:Hello"
-    assert pdf_path.read_text() == "pdf:Hello"
+    docx_content, docx_name, _ = runs.get_output(run.run_id, format="docx")
+    pdf_content, pdf_name, _ = runs.get_output(run.run_id, format="pdf")
+    assert docx_content.decode("utf-8") == "docx:Hello"
+    assert pdf_content.decode("utf-8") == "pdf:Hello"
     assert docx_name.endswith(".docx") and pdf_name.endswith(".pdf")
 
-    outputs = runs.list_outputs(run.run_id)
-    assert {p.suffix.lstrip(".") for p, _ in outputs} == {"docx", "pdf"}
+    outputs = runs.list_output_keys(run.run_id)
+    assert {k.rsplit(".", 1)[-1] for k, _ in outputs} == {"docx", "pdf"}
 
 
 @pytest.mark.asyncio
@@ -525,8 +589,8 @@ async def test_multi_format_skill_docx_only(tmp_path):
     run = runs.start(skill.skill_id)
     completed = await runs.submit_answers(run.run_id, {"project_name": "Hello", "output_format": "Word (.docx)"})
     assert completed.status == "COMPLETED"
-    assert len(completed.output_paths) == 1
-    assert completed.output_paths[0].suffix == ".docx"
+    assert len(completed.output_keys) == 1
+    assert completed.output_keys[0].endswith(".docx")
 
     with pytest.raises(SkillPackageError, match="no 'pdf' output"):
         runs.get_output(run.run_id, format="pdf")
@@ -541,16 +605,16 @@ async def test_multi_format_skill_regenerate_produces_fresh_files(tmp_path):
 
     run = runs.start(skill.skill_id)
     completed = await runs.submit_answers(run.run_id, {"project_name": "Hello", "output_format": "Both"})
-    original_paths = set(completed.output_paths)
+    original_keys = set(completed.output_keys)
 
     regenerated = runs.regenerate(run.run_id, {**completed.spec, "output_formats": ["docx", "pdf"]})
     assert regenerated.status == "COMPLETED"
-    assert set(regenerated.output_paths).isdisjoint(original_paths)  # fresh files, not mutated in place
+    assert set(regenerated.output_keys).isdisjoint(original_keys)  # fresh files, not mutated in place
 
 
 def test_ordinary_single_output_skill_unaffected(tmp_path):
     # docx-generator/ppt-generator still produce exactly one file, wrapped
-    # in a single-element output_paths list — regression check that Part 1's
+    # in a single-element output_keys list — regression check that Part 1's
     # generalization didn't change ordinary skills' behavior.
     store = _store(tmp_path)
     skill = store.get("ppt-generator")
@@ -726,13 +790,13 @@ async def test_brd_prd_generator_full_flow_both_formats(tmp_path):
     assert completed.status == "COMPLETED", completed.error
     assert set(completed.public()["outputs"]) == {"docx", "pdf"}
 
-    docx_path, _ = runs.get_output(run.run_id, format="docx")
-    pdf_path, _ = runs.get_output(run.run_id, format="pdf")
-    assert docx_path.exists() and docx_path.stat().st_size > 0
-    assert pdf_path.exists() and pdf_path.stat().st_size > 0
+    docx_content, _, _ = runs.get_output(run.run_id, format="docx")
+    pdf_content, _, _ = runs.get_output(run.run_id, format="pdf")
+    assert docx_content and len(docx_content) > 0
+    assert pdf_content and len(pdf_content) > 0
 
     from docx import Document
-    doc = Document(docx_path)
+    doc = Document(io.BytesIO(docx_content))
     all_text = "\n".join(p.text for p in doc.paragraphs)
     assert "Order Portal Revamp" in all_text
     # ROI + traceability tables actually present

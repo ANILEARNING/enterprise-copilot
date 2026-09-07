@@ -23,3 +23,37 @@ reportlab
 qdrant-client
 openpyxl
 beautifulsoup4
+# Database (see docs/database.md): Postgres persistence + tenant management,
+# Azure PostgreSQL Flexible Server / Neon — both vanilla Postgres, reached
+# through the same postgresql+asyncpg:// URL, swappable via DATABASE_URL with
+# no code change. SQLAlchemy 2.x async Core-style queries, not full ORM
+# relationship machinery (see app/db/models.py). Alembic drives migrations
+# against the same DATABASE_URL.
+sqlalchemy>=2.0,<3
+asyncpg
+alembic
+# Auth (see app/auth.py, app/tenancy.py): email/password login now; schema
+# for Google OAuth/SSO is reserved (app/db/models.py:AuthIdentity) but no
+# provider integration ships yet. bcrypt called directly, not through
+# passlib — passlib 1.7.4 (unmaintained since 2020) breaks against
+# bcrypt>=4.1's dropped __about__ attribute, verified live; see app/auth.py.
+bcrypt
+pyjwt
+# Session/chat-history store (see app/session_store.py) — Upstash Redis,
+# reached over its HTTPS REST API (UPSTASH_REDIS_REST_URL/_TOKEN), not a
+# redis:// TCP connection — upstash-redis is Upstash's own SDK for that
+# REST protocol, distinct from (and not interchangeable with) the plain
+# redis-py package, which speaks RESP over TCP and can't talk to a
+# REST-only endpoint.
+upstash-redis
+# Document/skill-run blob storage (see app/blob_store.py) — Backblaze B2 via
+# its S3-compatible API, so the plain boto3 S3 client works unmodified
+# against B2_ENDPOINT with no B2-specific SDK.
+boto3
+# Code execution (see app/sandbox.py) — E2BSandbox, a real isolated micro-VM
+# sandbox via the E2B API (https://e2b.dev), selected when
+# CODE_EXECUTION_MODE=e2b. e2b-code-interpreter is E2B's own purpose-built
+# code-execution SDK (async-native — AsyncSandbox), not the lower-level
+# generic `e2b` package (pulled in transitively; its exceptions/FileType are
+# used directly too, see app/sandbox.py).
+e2b-code-interpreter

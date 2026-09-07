@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -17,6 +18,8 @@ from .agents import (
 )
 from .artifacts import ArtifactStore
 from .config import settings
+from .db.engine import build_engine, build_session_factory
+from .db.observability_service import ObservabilityService
 from .document_store import DocumentStore
 from .extraction import ExtractedBlock
 from .hitl_agents import run_approved_code
@@ -31,9 +34,11 @@ from .retrieval import (
     dedupe_results, embed, lexical_rerank_score, reciprocal_rank_fusion, redact_pii, tokenize,
 )
 from .sandbox import CodeSandbox, build_sandbox
+from .session_store import SessionStore
+from .skill_render import render_spec_as_chat_text
 from .skills import SkillPackageError, SkillPackageStore, SkillRunService, run_generation_script
-from .storage import SessionStore
 from .streaming import stream_chat
+from .tenancy import configure_session_factory
 from .vector_store import QdrantVectorStore, VectorPoint, VectorStore, build_vector_store
 
 logger = logging.getLogger(__name__)
@@ -876,14 +881,17 @@ class DeckBuilderService:
 
     async def _run_and_handle(
         self, session_id: str, skill_id: str, task_brief: str, auto_generate: bool,
-        web_search: bool, on_event=None,
+        on_event=None, delivery: str = "file",
     ) -> tuple[str, dict]:
         """Runs one Deck Builder turn and applies its result: a clarifying
         question keeps `pending_deck_builder` set (phase stays "clarifying"),
         a ready spec either generates immediately (auto_generate=True) or is
-        queued through HitlService (False, the default). Always clears
-        `pending_deck_builder` except on the clarifying-question path.
-        Returns (chat response text, meta dict for CopilotService.chat's
+        queued through HitlService (False, the default) — unless `delivery`
+        is "inline" and app/skill_render.py has a renderer for this skill, in
+        which case the spec is rendered as chat text instead and neither
+        generation nor HITL ever runs (see TurnPlan.delivery, app/agents.py).
+        Always clears `pending_deck_builder` except on the clarifying-question
+        path. Returns (chat response text, meta dict for CopilotService.chat's
         `meta`/`skill_run`-equivalent surface). That meta always carries
         `hitl_pending` — the ids of any approval this turn actually queued.
         It is what tells the UI an approval is waiting: the frontend attaches
@@ -893,34 +901,41 @@ class DeckBuilderService:
         submit_deck_generation had just created a record left the queued deck
         invisible until something else happened to reload the queue — opening
         the Agents &amp; Tools tab, which calls loadHitlRequests() and populates
-        both panels at once.
-
-        `web_search`: this turn's Web search toggle, forwarded to the
-        orchestrator (which used to offer the Tavily tool unconditionally —
-        see DeckBuilderOrchestrator.run_turn). Persisted alongside
-        `auto_generate` in `pending_deck_builder` so a multi-turn
-        clarification keeps researching on the same terms the user set when
-        they started, rather than silently changing capability mid-flow."""
+        both panels at once."""
         skill = self.skill_packages.get(skill_id)
         orchestrator = self._orchestrator_for(skill)
-        result = await orchestrator.run_turn(
-            task_brief, {"session_id": session_id, "web_search": web_search}, on_event=on_event,
-        )
+        result = await orchestrator.run_turn(task_brief, {"session_id": session_id}, on_event=on_event)
         # Carried on every return path below: research the deck actually read
-        # is worth citing whether the deck was generated, queued or is still
-        # being clarified.
+        # is worth citing whether the deck was generated, queued, rendered
+        # inline, or is still being clarified.
         web_sources = result.web_sources
 
         if result.spec is None:
-            # Still clarifying — keep the conversation going.
-            self.sessions.set_field(session_id, "pending_deck_builder", {
+            # Still clarifying — keep the conversation going. `delivery` is
+            # persisted alongside auto_generate so a multi-turn clarification
+            # keeps the user's original choice once a spec is finally ready,
+            # same reasoning as auto_generate's own persistence here.
+            await self.sessions.set_field(session_id, "pending_deck_builder", {
                 "skill_id": skill_id, "phase": "clarifying", "auto_generate": auto_generate,
-                "web_search": web_search, "task_brief": task_brief, "hitl_request_id": None,
+                "delivery": delivery, "task_brief": task_brief, "hitl_request_id": None,
             })
             return result.clarifying_text or "Could you tell me a bit more about the deck you want?", {
                 "deck_builder": {"phase": "clarifying"}, "downloadable_artifacts": [],
                 "web_sources": web_sources, "hitl_pending": [],
             }
+
+        if delivery == "inline":
+            rendered = render_spec_as_chat_text(skill_id, result.spec)
+            if rendered is not None:
+                await self.sessions.set_field(session_id, "pending_deck_builder", None)
+                await self.sessions.set_field(session_id, "last_deck_spec", result.spec)
+                return rendered, {
+                    "deck_builder": {"phase": "completed_inline"}, "downloadable_artifacts": [],
+                    "web_sources": web_sources, "hitl_pending": [],
+                }
+            # No renderer for this skill yet (see app/skill_render.py) — fall
+            # through to the file path exactly as if delivery had been "file"
+            # all along, rather than silently producing nothing.
 
         if auto_generate:
             try:
@@ -928,15 +943,15 @@ class DeckBuilderService:
                 artifact = self.artifacts.add(
                     f"{skill.name}.{skill.output}", output_paths[0].read_bytes(), session_id=session_id,
                 ).public()
-                self.sessions.set_field(session_id, "pending_deck_builder", None)
-                self.sessions.set_field(session_id, "last_deck_spec", result.spec)
+                await self.sessions.set_field(session_id, "pending_deck_builder", None)
+                await self.sessions.set_field(session_id, "last_deck_spec", result.spec)
                 return (
                     f"Done! Generated **{artifact['filename']}** — view or download it below.",
                     {"deck_builder": {"phase": "completed"}, "downloadable_artifacts": [artifact],
                      "web_sources": web_sources, "hitl_pending": []},
                 )
             except SkillPackageError as exc:
-                self.sessions.set_field(session_id, "pending_deck_builder", None)
+                await self.sessions.set_field(session_id, "pending_deck_builder", None)
                 return f"Couldn't generate the deck: {exc}", {
                     "deck_builder": {"phase": "failed"}, "downloadable_artifacts": [],
                     "web_sources": web_sources, "hitl_pending": [],
@@ -944,8 +959,8 @@ class DeckBuilderService:
 
         # Auto-generate OFF (default): queue for approval, don't run yet.
         record = self.hitl.submit_deck_generation(result.spec, skill_id, session_id)
-        self.sessions.set_field(session_id, "pending_deck_builder", None)
-        self.sessions.set_field(session_id, "last_deck_spec", result.spec)
+        await self.sessions.set_field(session_id, "pending_deck_builder", None)
+        await self.sessions.set_field(session_id, "last_deck_spec", result.spec)
         await _deck_emit(on_event, {
             "stage": "queued_for_approval",
             "label": "Deck spec ready — waiting for your approval in Agents & Tools.",
@@ -960,24 +975,24 @@ class DeckBuilderService:
         )
 
     async def start(self, session_id: str, skill, message: str, auto_generate: bool,
-                    web_search: bool = False, on_event=None) -> tuple[str, dict]:
-        last_spec = self.sessions.get(session_id).get("last_deck_spec")
+                    on_event=None, delivery: str = "file") -> tuple[str, dict]:
+        session = await self.sessions.get(session_id)
+        last_spec = session.get("last_deck_spec")
         task_brief = (
             f"The user previously had this deck generated:\n{json.dumps(last_spec)}\n\n"
             f"They now want this change: {message}"
         ) if last_spec else message
         return await self._run_and_handle(
-            session_id, skill.skill_id, task_brief, auto_generate, web_search, on_event=on_event,
+            session_id, skill.skill_id, task_brief, auto_generate, on_event=on_event, delivery=delivery,
         )
 
     async def continue_turn(self, session_id: str, pending: dict, message: str, on_event=None) -> tuple[str, dict]:
         task_brief = f"{pending['task_brief']}\n\nUser: {message}"
         return await self._run_and_handle(
-            session_id, pending["skill_id"], task_brief, pending["auto_generate"],
-            # .get, not ["web_search"]: a pending_deck_builder written by an
-            # older build (or restored from a checkpoint saved by one) predates
-            # this field entirely and must not KeyError mid-conversation.
-            pending.get("web_search", False), on_event=on_event,
+            session_id, pending["skill_id"], task_brief, pending["auto_generate"], on_event=on_event,
+            # .get, not ["delivery"]: a pending_deck_builder written before this
+            # field existed must not KeyError mid-conversation.
+            delivery=pending.get("delivery", "file"),
         )
 
 
@@ -999,7 +1014,18 @@ class CopilotService:
             embedding_provider=self.embedding_provider,
             data_dir=resolved_dir / "documents" if resolved_dir else None,
         )
-        self.sessions = SessionStore(data_dir=resolved_dir / "sessions" if resolved_dir else None)
+        # Sessions live in Upstash Redis now, not under data_dir — see
+        # app/session_store.py's module docstring for why chat history never
+        # became a Postgres table pair either. settings.upstash_redis_rest_*
+        # come from UPSTASH_REDIS_REST_URL/_TOKEN; a blank value fails the
+        # first real session call rather than at construction time, matching
+        # the rest of this method's "let the actual missing-config error
+        # surface" posture for provider/store setup that already tolerates
+        # being unconfigured in tests (see build_provider()/build_vector_store()
+        # above).
+        self.sessions = SessionStore(
+            url=settings.upstash_redis_rest_url, token=settings.upstash_redis_rest_token,
+        )
         self.sandbox = build_sandbox()
         self.artifacts = ArtifactStore()
         self.skill_packages = SkillPackageStore(data_dir=resolved_dir / "skills" if resolved_dir else None)
@@ -1024,6 +1050,28 @@ class CopilotService:
         # stateless (app/agents.py) — this service owns the session-state
         # machinery (pending_deck_builder) and the HITL/auto-generate split.
         self.deck_builder = DeckBuilderService(self.skill_packages, self.hitl, self.artifacts, self.sessions)
+
+        # Postgres engine + session factory — the one composition root every
+        # DB-backed repository (app/db/*_repository.py) is meant to share
+        # (see app/db/engine.py's module docstring). Built lazily-tolerant,
+        # not lazily-deferred: unlike sessions/blob storage above, a missing
+        # DATABASE_URL here does NOT fail CopilotService() construction —
+        # auth/observability simply aren't usable until it's set, same as
+        # every other optional-until-configured piece in this constructor,
+        # so importing this module (e.g. from a test that never touches
+        # either) never requires Postgres.
+        if settings.database_url:
+            self.db_engine = build_engine(settings.database_url)
+            self.db_session_factory = build_session_factory(self.db_engine)
+            configure_session_factory(self.db_session_factory)
+        else:
+            self.db_engine = None
+            self.db_session_factory = None
+        # Persists guardrail_events/traces/model_calls for every chat turn
+        # (see chat()/chat_stream() below) — a thin wrapper over the
+        # observability/cost repository layer, itself a no-op when
+        # db_session_factory is None (see ObservabilityService.enabled).
+        self.observability = ObservabilityService(self.db_session_factory)
 
     def reload_providers(self) -> None:
         """Rebuilds every provider instance derived from `settings` after a
@@ -1053,10 +1101,10 @@ class CopilotService:
         reset_router_provider_cache()
 
     async def chat(
-        self, message: str, agent_mode: bool, session_id: str | None,
+        self, message: str, session_id: str | None,
         on_event: Callable[[dict], Awaitable[None]] | None = None,
         images: list[dict] | None = None, allow_live_hitl_wait: bool = False,
-        web_search: bool = False, auto_generate: bool = False,
+        auto_generate: bool = False,
         plan: TurnPlan | None = None,
     ) -> dict:
         """`on_event`, when given, receives live progress events for the
@@ -1074,23 +1122,12 @@ class CopilotService:
         `images`: optional multimodal attachments for this turn (see
         app/models.py:ImageAttachment).
 
-        The three UI toggles below are PERMISSIONS, not modes: they bound what
-        plan_turn (app/agents.py) may choose and what the chosen route may
-        then do, but none of them selects a route by itself. That's the point
-        — they used to be mutually exclusive in practice, so a turn could
-        only ever honour one of them.
-
-        `agent_mode`: whether the multi-step tool-calling agent route may be
-        chosen for this turn at all. Off keeps routing to direct answers and
-        file generators, as before.
-
-        `web_search`: whether this turn may call the live web — the Tavily
-        web_search MCP tool (app/mcp_tools.py). Now honoured on BOTH
-        tool-using routes: the agent (AutoGenOrchestrator.run's
-        `context["web_search"]`) and the Deck Builder
-        (DeckBuilderOrchestrator.run_turn, which previously searched
-        unconditionally and so ignored this toggle entirely). The model still
-        decides per-call whether an offered tool is worth calling.
+        There are no more Agent mode / Web search toggles: every turn gets
+        full agent capability unconditionally (multi-step tool use, live web
+        research whenever Tavily is configured, this organisation's own
+        indexed documents) — see app/agents.py:plan_turn. The only remaining
+        turn-level control is `auto_generate` below, kept as a deliberate
+        safety gate rather than made autonomous.
 
         `auto_generate`: whether a finished deck spec may generate without a
         human approving it first. False (default): the spec is queued through
@@ -1125,7 +1162,7 @@ class CopilotService:
         returns on ANY path. It's advisory only: it never gates this or any
         future call to chat(), it just lets a resumed UI say "your last turn
         didn't finish, here's where it got to.\""""
-        session = self.sessions.get_or_create(session_id)
+        session = await self.sessions.get_or_create(session_id)
         sid = session["session_id"]
         history = list(session["messages"])  # snapshot before appending this turn
         memory_state = CompactMemoryState.from_dict(session.get("memory_state"))
@@ -1137,13 +1174,29 @@ class CopilotService:
         # found anything, so every downstream use in this method already sees
         # the safe version. See GuardrailService.check_input.
         input_check = self.guardrails.check_input(message)
+        await self.observability.record_guardrail_check(
+            stage="check_input", findings=input_check, session_id=sid, turn_id=turn_id,
+        )
         if input_check["redacted_text"] is not None:
             message = input_check["redacted_text"]
-        self.sessions.append(sid, "user", message)
+        await self.sessions.append(sid, "user", message)
+
+        # Populated by emit() below on every "model_call" progress event —
+        # what record_turn (this method's finally block) writes to
+        # model_calls, one row per completed AIProvider.complete() call
+        # this turn actually made (usually one; a tool-calling agent turn
+        # or a routed turn can make more). started_at/turn_status/turn_error
+        # are this same finally block's other inputs, set on whichever
+        # return/exception path this method actually takes.
+        collected_model_calls: list[dict] = []
+        turn_started_at = datetime.now(timezone.utc)
+        turn_status = "ok"
+        turn_error: str | None = None
+        turn_route: str | None = None
 
         try:
             async with tracer.turn(
-                "chat_turn", input=message, metadata={"agent_mode": agent_mode, "session_id": sid},
+                "chat_turn", input=message, metadata={"session_id": sid},
             ) as turn:
                 async def emit(event: dict) -> None:
                     if event.get("stage") == "model_call":
@@ -1152,34 +1205,55 @@ class CopilotService:
                             input=event.get("prompt_preview"), output=event.get("response_preview"),
                             metadata={"used_fallback": event.get("used_fallback"), "tool_calls": event.get("tool_calls")},
                         )
+                        prompt_tokens, completion_tokens = event.get("prompt_tokens"), event.get("completion_tokens")
+                        collected_model_calls.append({
+                            "call_type": "chat_completion", "provider": event.get("provider") or "unknown",
+                            "model": event.get("model"), "used_fallback": bool(event.get("used_fallback")),
+                            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                            "total_tokens": (
+                                prompt_tokens + completion_tokens
+                                if prompt_tokens is not None and completion_tokens is not None else None
+                            ),
+                            # cost_micros intentionally omitted (left NULL by
+                            # ModelCallRepository.record's own default) — no
+                            # model_pricing rate lookup is wired in yet (see
+                            # ModelPricingRepository, app/db/observability_repository.py);
+                            # pricing every call here would mean guessing a
+                            # rate rather than reading a real one.
+                        })
                     else:
                         turn.event(event.get("stage") or "progress", **{k: v for k, v in event.items() if k != "stage"})
                     stage = event.get("stage")
+                    if event.get("agent"):
+                        nonlocal turn_route
+                        turn_route = event["agent"]
                     if stage:
                         # Merge, don't replace — later stages (e.g. code_queued
                         # after agent_selected) add fields without discarding
                         # what an earlier stage already recorded this turn.
-                        existing = self.sessions.get(sid).get("turn_checkpoint") or {}
+                        existing_session = await self.sessions.get(sid)
+                        existing = existing_session.get("turn_checkpoint") or {}
                         checkpoint = {
                             **({} if existing.get("turn_id") != turn_id else existing),
                             "turn_id": turn_id, "stage": stage, "label": event.get("label"),
                             "started_at": existing.get("started_at") or now_iso(), "updated_at": now_iso(),
-                            "user_message": message, "agent_mode": agent_mode,
+                            "user_message": message,
                             "agent": event.get("agent", existing.get("agent")),
                             "skills": event.get("tools", existing.get("skills")),
                             "sources_count": event.get("count", existing.get("sources_count")),
                             "hitl_request_id": event.get("request_id", existing.get("hitl_request_id")),
                             "tool_calls": event.get("tool_calls", existing.get("tool_calls")),
                         }
-                        self.sessions.set_field(sid, "turn_checkpoint", checkpoint)
+                        await self.sessions.set_field(sid, "turn_checkpoint", checkpoint)
                     if on_event is not None:
                         await on_event(event)
 
                 if not input_check["allowed"]:
                     response = input_check["message"]
-                    self.sessions.append(sid, "assistant", response)
-                    self.sessions.set_field(sid, "turn_checkpoint", None)
+                    await self.sessions.append(sid, "assistant", response)
+                    await self.sessions.set_field(sid, "turn_checkpoint", None)
                     turn.set_output(response, metadata={"blocked": "input"})
+                    turn_status = "blocked"
                     return {
                         "response": response, "session_id": sid,
                         "guardrails": {"input": input_check, "context": None, "output": None},
@@ -1195,18 +1269,11 @@ class CopilotService:
                 # already underway, not a new request to classify. Only once nothing
                 # is pending does plan_turn() decide what this message should do.
                 #
-                # That decision used to be a fixed if/elif chain over
-                # SkillPackageStore.select_for_chat's substring match, evaluated ahead
-                # of agent_mode — which made the three composer toggles mutually
-                # exclusive in effect (see app/agents.py:plan_turn's header comment for
-                # the exact failure). They're now permissions bounding what plan_turn
-                # may choose, and the route itself comes from the query:
-                #
-                #   agent_mode    -> may the "agent" route be chosen at all
-                #   web_search    -> may this turn call the live web (any route)
-                #   auto_generate -> may a finished spec generate without HITL approval
-                #
-                # so all three compose on one turn instead of overriding each other.
+                # No more Agent mode / Web search toggles gating this — every turn
+                # gets full agent capability unconditionally (see app/agents.py:
+                # plan_turn's header comment). The only remaining permission is
+                # auto_generate: may a finished file spec generate without HITL
+                # approval.
                 skill_run_meta = None
                 routing: dict | None = None
                 pending_skill_run = session.get("pending_skill_run")
@@ -1246,7 +1313,7 @@ class CopilotService:
                         plan = await plan_turn(
                             message, skills=self.skill_packages.list(),
                             keyword_match=keyword_match.public() if keyword_match else None,
-                            allow_agent=agent_mode, allow_web=web_search, provider=self.provider,
+                            provider=self.provider,
                         )
                     routing = plan.public()
                     await emit({
@@ -1257,7 +1324,7 @@ class CopilotService:
                     if plan.route == "deck":
                         response, deck_meta = await self.deck_builder.start(
                             sid, self.skill_packages.get(plan.skill_id), message, auto_generate,
-                            web_search=web_search, on_event=emit,
+                            on_event=emit, delivery=plan.delivery,
                         )
                         context_check = None
                         meta = {
@@ -1270,6 +1337,7 @@ class CopilotService:
                     elif plan.route == "skill":
                         response, skill_run_meta = await self._start_chat_skill_run(
                             sid, self.skill_packages.get(plan.skill_id), on_event=emit,
+                            delivery=plan.delivery,
                         )
                         context_check = None
                         meta = {
@@ -1283,7 +1351,6 @@ class CopilotService:
                         result = await self.orchestrator.run(message, {
                             "session_id": sid, "history": history, "images": images,
                             "memory_state": memory_state.to_dict(), "allow_live_hitl_wait": allow_live_hitl_wait,
-                            "web_search": web_search,
                         }, on_event=emit)
                         response = result.text
                         context_check = result.context_guardrail
@@ -1298,8 +1365,9 @@ class CopilotService:
                             "downloadable_artifacts": result.downloadable_artifacts,
                         }
                     else:
-                        # Direct model call for simple, single-step requests (no agent/skill
-                        # selection, so there's no retrieved context for the context guardrail).
+                        # plan.route == "direct" — router judged this message needs no
+                        # augmentation (no tools, no RAG grounding). A plain model call,
+                        # so there's no retrieved context for the context guardrail.
                         context_check = None
                         await emit({"stage": "thinking", "label": "Thinking…"})
                         compacted, memory_state = await compact_history(self.provider, history, memory_state, BUFFER_SIZE)
@@ -1312,6 +1380,8 @@ class CopilotService:
                             "provider": provider_result.provider, "model": provider_result.model,
                             "used_fallback": provider_result.used_fallback,
                             "prompt_preview": message[:2000], "response_preview": response[:2000],
+                            "prompt_tokens": provider_result.prompt_tokens,
+                            "completion_tokens": provider_result.completion_tokens,
                         })
                         meta = {
                             "agent": None, "skills": [], "provider": provider_result.provider,
@@ -1321,13 +1391,16 @@ class CopilotService:
                         }
 
                 output_check = self.guardrails.check_output(response)
+                await self.observability.record_guardrail_check(
+                    stage="check_output", findings=output_check, session_id=sid, turn_id=turn_id,
+                )
                 if not output_check["allowed"]:
                     response = "The response was blocked by the configured guardrails."
                 elif output_check["redacted_text"] is not None:
                     response = output_check["redacted_text"]
 
-                self.sessions.append(sid, "assistant", response)
-                self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
+                await self.sessions.append(sid, "assistant", response)
+                await self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
                 turn.set_output(response, metadata={
                     "agent": meta.get("agent"), "skills": meta.get("skills"),
                     "provider": meta.get("provider"), "model": meta.get("model"),
@@ -1348,7 +1421,19 @@ class CopilotService:
             # docstring and app/storage.py's module docstring. A no-op if it
             # was already cleared (set_field is idempotent for an unknown
             # session too, so this is always safe to call).
-            self.sessions.set_field(sid, "turn_checkpoint", None)
+            await self.sessions.set_field(sid, "turn_checkpoint", None)
+            # A plain try/finally (no except) has no local exception variable
+            # to read — sys.exc_info() is the standard way to see "is this
+            # finally running because something raised" without adding an
+            # except clause that would have to immediately re-raise anyway.
+            exc = sys.exc_info()[1]
+            if exc is not None:
+                turn_status, turn_error = "error", str(exc)
+            await self.observability.record_turn(
+                turn_id=turn_id, session_id=sid, route=turn_route, status=turn_status,
+                started_at=turn_started_at, ended_at=datetime.now(timezone.utc), error=turn_error,
+                model_calls=collected_model_calls,
+            )
 
     @staticmethod
     def _parse_model_choice(model: str | None) -> tuple[str | None, str | None]:
@@ -1360,21 +1445,23 @@ class CopilotService:
         return (provider or None), (model_name or None)
 
     async def chat_stream(
-        self, message: str, agent_mode: bool, session_id: str | None, cancellation_token: CancellationToken,
-        model: str | None = None, images: list[dict] | None = None, web_search: bool = False,
+        self, message: str, session_id: str | None, cancellation_token: CancellationToken,
+        model: str | None = None, images: list[dict] | None = None,
         auto_generate: bool = False,
     ) -> AsyncIterator[dict]:
         """SSE-friendly variant of chat(): yields incremental event dicts
         instead of returning one final dict.
 
         Real token-by-token AutoGen streaming (app/streaming.py) powers the
-        plain direct-chat case (agent_mode off, no skill match, input
-        allowed) — the one case that's genuinely a bare "stream the model's
-        answer." It also yields a "model_info" event (the actual resolved
-        provider/model, not a guess) and a "status" event ("thinking") before
-        the first token.
+        plain direct-chat case (the router picked "agent" for this turn — no
+        toggle-off state any more — but a plain "agent" turn with no tool
+        calls is still, in effect, a bare "stream the model's answer"; only
+        input-blocked and file-generation turns skip this) — see
+        `attempt_real_stream` below. It also yields a "model_info" event (the
+        actual resolved provider/model, not a guess) and a "status" event
+        ("thinking") before the first token.
 
-        Every other case (blocked input, skill Q&A, agent_mode) delegates to
+        Every other case (blocked input, skill Q&A) delegates to
         chat() via a background task, but still streams live: chat() accepts
         an `on_event` callback (see its docstring) that fires real progress
         events — knowledge retrieval, thinking, skill drafting/generation —
@@ -1389,7 +1476,7 @@ class CopilotService:
         (see app/providers.py's describe_model_error), never silently
         swapped for mock — that would hide exactly what the picker is for.
         """
-        session = self.sessions.get_or_create(session_id)
+        session = await self.sessions.get_or_create(session_id)
         sid = session["session_id"]
         yield {"type": "session", "session_id": sid}
 
@@ -1398,6 +1485,11 @@ class CopilotService:
         # See chat()'s matching comment: redact before anything downstream
         # (the model call, session history, the trace) ever sees the raw value.
         input_check = self.guardrails.check_input(message)
+        # No turn_id here (unlike chat()) — chat_stream doesn't mint one or
+        # participate in the tracer.turn()/checkpoint machinery; guardrail_
+        # events.turn_id is nullable specifically for this case (see that
+        # column's own comment, app/db/models.py).
+        await self.observability.record_guardrail_check(stage="check_input", findings=input_check, session_id=sid)
         if input_check["redacted_text"] is not None:
             message = input_check["redacted_text"]
         pending_skill_run = session.get("pending_skill_run")
@@ -1415,10 +1507,18 @@ class CopilotService:
             plan = await plan_turn(
                 message, skills=self.skill_packages.list(),
                 keyword_match=keyword_match.public() if keyword_match else None,
-                allow_agent=agent_mode, allow_web=web_search, provider=self.provider,
+                provider=self.provider,
             )
             would_skill_route = plan.route in ("deck", "skill")
-        attempt_real_stream = input_check["allowed"] and not would_skill_route and not agent_mode
+        # Real token streaming only for plan.route == "direct" — the router's
+        # own signal that this turn needs no augmentation (no RAG grounding,
+        # no tools). Any turn that might benefit from either ("agent") goes
+        # through the slower delegate path below so it actually gets them —
+        # stream_chat is a bare completion with no grounding/tool-calling of
+        # its own, so real-streaming an "agent" turn would silently drop both.
+        attempt_real_stream = (
+            input_check["allowed"] and not would_skill_route and plan is not None and plan.route == "direct"
+        )
 
         if attempt_real_stream:
             history = list(session["messages"])
@@ -1429,7 +1529,7 @@ class CopilotService:
             result_model = None
             memory_state = CompactMemoryState.from_dict(session.get("memory_state"))
             async with tracer.turn(
-                "chat_turn_stream", input=message, metadata={"agent_mode": False, "session_id": sid},
+                "chat_turn_stream", input=message, metadata={"session_id": sid},
             ) as turn:
                 async for event in stream_chat(
                     message, history, cancellation_token,
@@ -1453,7 +1553,7 @@ class CopilotService:
                         yield event
                     elif event["type"] == "memory_state":
                         memory_state = CompactMemoryState.from_dict(event["state"])
-                        self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
+                        await self.sessions.set_field(sid, "memory_state", memory_state.to_dict())
                     elif event["type"] == "cancelled":
                         cancelled = True
                     elif event["type"] == "error":
@@ -1465,12 +1565,12 @@ class CopilotService:
                     # closes with a note of why, rather than a silently empty one.
                     turn.set_output(None, metadata={"fallback": "delegate"})
                 else:
-                    self.sessions.append(sid, "user", message)
+                    await self.sessions.append(sid, "user", message)
                     result_provider = result_provider or explicit_provider or "unknown"
                     result_model = result_model or explicit_model
                     if cancelled:
                         response = full_text or "(cancelled before any output)"
-                        self.sessions.append(sid, "assistant", response)
+                        await self.sessions.append(sid, "assistant", response)
                         turn.set_output(response, metadata={"cancelled": True, "provider": result_provider, "model": result_model})
                         yield {
                             "response": response, "session_id": sid, "type": "done", "cancelled": True,
@@ -1484,7 +1584,7 @@ class CopilotService:
                     if error:
                         response = (f"Couldn't get a response from {explicit_provider}/{explicit_model}: {error}"
                                     if explicit_provider else f"Something went wrong generating that response ({error}).")
-                        self.sessions.append(sid, "assistant", response)
+                        await self.sessions.append(sid, "assistant", response)
                         turn.set_output(response, metadata={"error": error, "provider": result_provider, "model": result_model})
                         yield {
                             "response": response, "session_id": sid, "type": "done", "model_error": True,
@@ -1496,6 +1596,9 @@ class CopilotService:
                         }
                         return
                     output_check = self.guardrails.check_output(full_text)
+                    await self.observability.record_guardrail_check(
+                        stage="check_output", findings=output_check, session_id=sid,
+                    )
                     if not output_check["allowed"]:
                         full_text = "The response was blocked by the configured guardrails."
                     elif output_check["redacted_text"] is not None:
@@ -1509,7 +1612,7 @@ class CopilotService:
                         # PII/secret leak in a streamed reply is visible even
                         # though it couldn't be intercepted mid-stream.
                         full_text = output_check["redacted_text"]
-                    self.sessions.append(sid, "assistant", full_text)
+                    await self.sessions.append(sid, "assistant", full_text)
                     turn.generation(
                         "stream_chat", model=result_model, provider=result_provider,
                         input=message[:2000], output=full_text[:2000],
@@ -1525,8 +1628,9 @@ class CopilotService:
                     }
                     return
 
-        # Delegate: input blocked, skill-routed, agent_mode, or real streaming
-        # unavailable. Still streams live: chat()'s on_event callback (fired
+        # Delegate: input blocked, skill-routed, an "agent" turn (needs
+        # augmentation), or real streaming unavailable. Still streams live:
+        # chat()'s on_event callback (fired
         # from real, already-happening steps — knowledge retrieval, thinking,
         # skill drafting/generation) is bridged through this queue to "status"
         # SSE events while chat() runs as a background task, instead of the
@@ -1551,8 +1655,8 @@ class CopilotService:
         # continuation), passed down so chat() reuses it instead of calling the
         # router a second time and possibly landing somewhere else.
         chat_task = asyncio.ensure_future(self.chat(
-            message, agent_mode, sid, on_event=on_event, images=images, allow_live_hitl_wait=True,
-            web_search=web_search, auto_generate=auto_generate, plan=plan,
+            message, sid, on_event=on_event, images=images, allow_live_hitl_wait=True,
+            auto_generate=auto_generate, plan=plan,
         ))
         cancellation_token.link_future(chat_task)
         try:
@@ -1607,14 +1711,16 @@ class CopilotService:
 
     async def _start_chat_skill_run(
         self, session_id: str, skill, on_event: Callable[[dict], Awaitable[None]] | None = None,
+        delivery: str = "file",
     ) -> tuple[str, dict]:
         run = self.skill_runs.start(skill.skill_id)
         question_ids = [q.id for q in skill.questions]
         if not question_ids:
-            return await self._finish_chat_skill_run(run.run_id, {}, on_event=on_event)
+            return await self._finish_chat_skill_run(run.run_id, {}, on_event=on_event, delivery=delivery)
 
-        self.sessions.set_field(session_id, "pending_skill_run", {
+        await self.sessions.set_field(session_id, "pending_skill_run", {
             "run_id": run.run_id, "skill_id": skill.skill_id, "question_ids": question_ids, "index": 0,
+            "delivery": delivery,
         })
         first_question = skill.questions[0]
         text = self._format_skill_question(skill, first_question, index=0, total=len(question_ids))
@@ -1633,7 +1739,7 @@ class CopilotService:
             skill = self.skill_packages.get(skill_id)
             run = self.skill_runs.get(run_id)
         except KeyError:
-            self.sessions.set_field(session_id, "pending_skill_run", None)
+            await self.sessions.set_field(session_id, "pending_skill_run", None)
             return "That skill run is no longer available — say the word again (e.g. \"create a docx\") to start over.", None
 
         question = next(q for q in skill.questions if q.id == question_ids[index])
@@ -1650,7 +1756,7 @@ class CopilotService:
         run.answers[question.id] = answer
         next_index = index + 1
         if next_index < len(question_ids):
-            self.sessions.set_field(session_id, "pending_skill_run", {**pending, "index": next_index})
+            await self.sessions.set_field(session_id, "pending_skill_run", {**pending, "index": next_index})
             next_question = next(q for q in skill.questions if q.id == question_ids[next_index])
             text = self._format_skill_question(skill, next_question, next_index, len(question_ids))
             return text, {
@@ -1658,20 +1764,28 @@ class CopilotService:
                 "question": self._question_public(next_question), "download_ready": False,
             }
 
-        self.sessions.set_field(session_id, "pending_skill_run", None)
-        return await self._finish_chat_skill_run(run_id, run.answers, on_event=on_event)
+        await self.sessions.set_field(session_id, "pending_skill_run", None)
+        return await self._finish_chat_skill_run(
+            run_id, run.answers, on_event=on_event,
+            # .get, not ["delivery"]: a pending_skill_run written before this
+            # field existed must not KeyError mid-conversation.
+            delivery=pending.get("delivery", "file"),
+        )
 
     async def _finish_chat_skill_run(
         self, run_id: str, answers: dict, on_event: Callable[[dict], Awaitable[None]] | None = None,
+        delivery: str = "file",
     ) -> tuple[str, dict]:
         try:
-            run = await self.skill_runs.submit_answers(run_id, answers, on_event=on_event)
+            run = await self.skill_runs.submit_answers(run_id, answers, on_event=on_event, delivery=delivery)
         except Exception as exc:  # noqa: BLE001 - a run failure is a chat response, not a crash
             return f"Couldn't generate that: {exc}", None
         skill = self.skill_packages.get(run.skill_id)
         if run.status == "COMPLETED":
             text = (f"Done! Generated **{skill.name}.{skill.output}**. "
                     "Download it below, or open the Skills tab to view/edit it.")
+        elif run.status == "COMPLETED_INLINE":
+            text = run.rendered_text or ""
         else:
             text = f"Generation failed: {run.error or 'unknown error'}. Open the Skills tab to try again."
         return text, {**run.public(), "skill_name": skill.name, "output": skill.output}

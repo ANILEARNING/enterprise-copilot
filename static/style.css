@@ -1055,3 +1055,79 @@ a:hover { color: var(--primary-hover); }
   .msg-bubble-wrap { max-width: 88%; }
   .chat-panel { height: calc(100vh - var(--topbar-h) - 28px); min-height: 380px; }
 }
+
+/* ==========================================================================
+   Auth gate — full-screen overlay shown whenever no one is signed in.
+   Mirrors .cmdk-backdrop's glass-panel-over-blurred-scrim pattern, just
+   centered and non-dismissible (no click-outside-to-close — the whole
+   point is the app underneath isn't usable until this resolves).
+   ========================================================================== */
+
+.auth-gate-overlay {
+  position: fixed; inset: 0;
+  background: rgba(7, 8, 15, .7);
+  display: none; align-items: center; justify-content: center;
+  padding: 24px; z-index: 1200; backdrop-filter: blur(4px);
+}
+.auth-gate-overlay.open { display: flex; }
+/* The app shell keeps rendering underneath (cheap, avoids a flash-of-empty-
+   shell once the gate closes) but must never be reachable while it's up. */
+body.auth-gate-active { overflow: hidden; }
+body.auth-gate-active .app-shell { filter: blur(6px); pointer-events: none; user-select: none; }
+
+.auth-gate-card {
+  width: 420px; max-width: 100%;
+  background: var(--glass-bg-strong);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), var(--glow-primary);
+  padding: 32px 28px 28px;
+  display: flex; flex-direction: column; align-items: center;
+  text-align: center;
+  animation: fade-in .18s ease;
+}
+.auth-gate-card .brand-mark { margin-bottom: 14px; }
+.auth-gate-card h2 { font-size: 19px; font-weight: 700; margin: 0 0 6px; color: var(--text); }
+.auth-gate-sub { font-size: 13.5px; color: var(--text-faint); margin: 0 0 20px; line-height: 1.5; }
+.auth-gate-pending .auth-gate-sub { margin-bottom: 10px; }
+.auth-gate-pending #authPendingBack { margin-top: 18px; }
+
+.auth-tabs {
+  display: flex; width: 100%; gap: 4px;
+  background: var(--surface-2); border-radius: var(--radius-md);
+  padding: 4px; margin-bottom: 20px;
+}
+.auth-tab {
+  flex: 1; border: none; background: transparent; cursor: pointer;
+  padding: 8px 10px; border-radius: var(--radius-sm);
+  font-size: 13px; font-weight: 600; color: var(--text-faint);
+  transition: background var(--transition), color var(--transition);
+}
+.auth-tab.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow-sm); }
+
+.auth-form { width: 100%; text-align: left; display: flex; flex-direction: column; }
+.auth-form .form-label { margin-top: 12px; }
+.auth-form .form-label:first-child { margin-top: 0; }
+.auth-form .form-optional { font-weight: 400; text-transform: none; color: var(--text-faint); }
+.auth-form .form-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 4px; }
+.auth-form button[type="submit"] { margin-top: 20px; }
+
+.auth-password-wrap { position: relative; display: flex; }
+.auth-password-wrap .form-control { padding-right: 40px; }
+.auth-password-toggle {
+  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+  width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; cursor: pointer;
+  font-size: 15px; line-height: 1; border-radius: var(--radius-sm);
+  color: var(--text-faint); transition: background var(--transition), color var(--transition);
+}
+.auth-password-toggle:hover { background: var(--surface-hover); color: var(--text); }
+.auth-password-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+.auth-gate-error {
+  width: 100%; margin: 16px 0 0; padding: 10px 12px;
+  background: var(--danger-soft); color: var(--danger);
+  border-radius: var(--radius-sm); font-size: 13px; text-align: left;
+}

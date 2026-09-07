@@ -93,8 +93,28 @@ presented as more than it is:
 | Clean | Implemented — whitespace/newline normalization (`retrieval.clean_text`). |
 | Chunk | Structure-aware, parent-child chunking (`retrieval.chunk_blocks`, `ParentChildChunk`): headings start new parent sections, tables are atomic chunks, prose packs via paragraph/sentence bounding with overlap; each chunk carries `parent_text`, `heading_path`, and a `content_hash` used for incremental re-embedding. A flat-text back-compat wrapper (`chunk_text`) remains for callers with no structural blocks. |
 | Metadata | Implemented — `document_id`, `filename`, `chunk_index`, `tenant_id`, `content_hash`, `heading_path`, `is_table`, timestamps, embedding provenance per chunk. |
-| Embedding | Implemented behind `EmbeddingProvider` (`app/providers.py`), unchanged from v1: `AI_MODE=mock` (default) uses the deterministic offline hash embedder; `AI_MODE=configured` builds a `ChainEmbeddingProvider` per `MODEL_PROVIDER` (Ollama then Gemini as a cross-provider safety net, hash embedder always the final always-available step). Chunks embedded by different providers are guarded by a dimension check so mismatched vector spaces are never compared. |
+| Embedding | Implemented behind `EmbeddingProvider` (`app/providers.py`), unchanged from v1: `AI_MODE=mock` (default) uses the deterministic offline hash embedder; `AI_MODE=configured` builds a `ChainEmbeddingProvider` per `MODEL_PROVIDER` (Ollama or Azure as the primary depending on which is configured, then Gemini as a cross-provider safety net, hash embedder always the final always-available step). Chunks embedded by different providers are guarded by a dimension check so mismatched vector spaces are never compared. |
 | Vector DB | Implemented behind `VectorStore` (`app/vector_store.py`): `QdrantVectorStore` (Qdrant Cloud or any Qdrant instance) when `AI_MODE=configured` and both `QDRANT_URL`/`QDRANT_API_KEY` are set — collection and its `tenant_id` payload index are created lazily on first use, sized to the actual embedding dimension; `InMemoryVectorStore` (an exhaustive cosine scan) is the always-available fallback otherwise, same graceful-degrade posture as the embedding provider chain. A configured-but-unreachable Qdrant falls back to in-memory at construction time, not per-call, so a running store never silently splits one tenant's data across two backends. |
+
+**Caveat — switching embedding providers can break an existing Qdrant
+collection.** The collection is sized to whatever embedding dimension its
+*first* point had (Gemini's `gemini-embedding-001` is 3072-dim, Azure's
+`text-embedding-3-small` is 1536-dim, Ollama's `nomic-embed-text` is
+768-dim) — it does NOT resize itself when `MODEL_PROVIDER` changes to a
+provider with a different dimension. Every later query/upsert against the
+mismatched collection fails outright with Qdrant's own `400 Bad Request:
+Vector dimension error`, not a graceful degrade — this bypasses the
+embedding-provider fallback chain entirely, since the failure is Qdrant
+rejecting the request, not the embedder failing to produce a vector. Hit
+live switching this app to `MODEL_PROVIDER=azure` against a collection
+already indexed under Gemini. Fix: drop the stale collection (e.g. via
+`qdrant_client.AsyncQdrantClient.delete_collection`) and re-add every
+existing document through `RAGStore.add` (delete-then-re-add each one first
+if easier) — a fresh, prior-chunk-hash-free ingestion re-embeds every chunk
+against the now-active provider and `_ensure_collection` recreates the
+collection at the correct new dimension on the next upsert. There is no
+automatic re-index-on-provider-switch; this is a manual, one-time step
+after intentionally changing providers, not routine maintenance.
 | Document store | Implemented — `DocumentStore` (`app/document_store.py`), file-backed (one JSON per document, mirrors `SessionStore`), persists full content, structural blocks, and per-chunk content hashes so a restart recovers search/citations without re-embedding anything. |
 | Retrieve | Hybrid — vector leg (Qdrant or in-memory, tenant-filtered) + pure-Python BM25 leg (`retrieval.BM25Index`), combined by reciprocal rank fusion. |
 | Rerank | Implemented as a heuristic lexical-coverage/density reranker (`retrieval.lexical_rerank_score`) over the fused candidate pool — not a trained cross-encoder. |

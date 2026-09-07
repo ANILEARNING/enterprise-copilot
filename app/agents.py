@@ -7,12 +7,14 @@ services, or the UI (see .claude/rules/autogen-maf.md).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+import httpx
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import Response, TaskResult
 from autogen_agentchat.messages import TextMessage, ToolCallExecutionEvent, ToolCallRequestEvent
@@ -97,31 +99,35 @@ def reset_router_provider_cache() -> None:
 # --- autonomous turn routing (plan_turn) -------------------------------------
 #
 # WHAT THIS REPLACES: CopilotService.chat() used to route a turn with a fixed
-# if/elif chain over SkillPackageStore.select_for_chat's substring match,
-# evaluated BEFORE the agent_mode toggle was ever consulted. That made the
-# three composer toggles (Agent mode / Web search / Auto-generate) mutually
-# exclusive in effect even though the UI presents them as independent, and no
-# single turn could ever honour more than one of them:
+# if/elif chain over SkillPackageStore.select_for_chat's substring match, and
+# separately gated multi-step/tool capability behind an "Agent mode" toggle
+# and live web research behind a "Web search" toggle — three composer
+# controls (Agent mode / Web search / Auto-generate) that were mutually
+# exclusive in effect even though the UI presented them as independent:
 #
-#   "...presentation..."     -> Deck Builder    (agent_mode + web_search dropped)
-#   "...create a report..."  -> fixed Q&A form  (all three dropped)
+#   "...presentation..."     -> Deck Builder    (agent capability + web search dropped)
+#   "...create a report..."  -> fixed Q&A form  (all dropped)
 #   anything else, agent on  -> agent           (auto_generate dropped)
 #
-# So a user who ticked all three and asked for a researched, auto-generated
-# deck got a deck built with two of their three choices silently discarded.
+# So a user who ticked every toggle and asked for a researched, auto-generated
+# deck got a deck built with most of their choices silently discarded.
 #
 # WHAT IT DOES INSTEAD: one small, fast LLM call reads the message and picks
 # the route itself, using the same cheap router model AgentRegistry.select_llm
-# already uses (see _build_router_provider). The toggles stop being mode
-# switches and become permissions — they bound what the router is ALLOWED to
-# pick, and within those bounds the decision comes from the query rather than
-# from whichever substring happened to appear in it.
+# already uses (see _build_router_provider). Agent mode and Web search are no
+# longer toggles at all — every turn gets full agent capability (tools, live
+# web research whenever Tavily is configured, this organisation's own indexed
+# documents) unconditionally; the only thing the router still decides is
+# whether the message wants a FILE generated instead of answered.
+# Auto-generate remains a deliberate, explicit safety gate (queue a drafted
+# file spec for human approval vs. generate it immediately) — see
+# ChatRequest.auto_generate.
 #
 # The degrade path is deliberately exact: with no router provider (mock mode,
 # no GEMINI_API_KEY, a call that fails or answers nonsense) this falls back to
-# _deterministic_plan, which reproduces the previous if/elif chain move for
-# move — so the "every flow works end-to-end with zero credentials" guarantee
-# and all existing routing behaviour survive unchanged.
+# _deterministic_plan, which reproduces the same unconditional-agent-capability
+# behaviour without a model call — so the "every flow works end-to-end with
+# zero credentials" guarantee holds.
 
 # Enough for this answer shape (four short fields) with real headroom — a
 # truncated answer is worse than a slightly costlier one, since it reads as
@@ -171,7 +177,8 @@ _ROUTE_DESCRIPTIONS = {
     "skill": "The user wants one of the file generators listed below to produce a document file.",
     "agent": ("The request needs multi-step work — tools, live web research, code, or this "
               "organisation's own indexed documents — rather than a single direct answer."),
-    "direct": "A simple, single-step request the model can answer straight out.",
+    "direct": ("A simple, single-step request the model can answer straight out, with no need for "
+               "tools, live web research, code, or this organisation's own documents."),
 }
 
 
@@ -179,29 +186,45 @@ _ROUTE_DESCRIPTIONS = {
 class TurnPlan:
     """One turn's routing decision.
 
-    `needs_web` is ADVISORY only — reported to the UI, never used to gate
-    anything. The Web search toggle is a hard ceiling on capability (a user who
-    switched it off must not get web calls because a router decided the query
-    "needed" them), and inside that ceiling the model already decides per-call
-    whether an offered tool is worth invoking. Its job is to explain the
-    decision, and to let the UI point out when a turn would have benefited from
-    a capability the user left switched off.
+    `needs_web` is ADVISORY only — reported to the UI, explaining whether this
+    turn's route benefits from live web results. It never gates anything: web
+    search is offered to every tool-using route whenever Tavily is configured
+    (see get_mcp_tools's call site in AutoGenOrchestrator.run), and the model
+    itself decides per-call whether the offered tool is worth invoking. There
+    is no user-facing toggle to serve as a ceiling any more — this field's only
+    job is to explain the routing decision to the UI.
 
     There is deliberately no `needs_knowledge` counterpart: knowledge-base
     grounding is already autonomous and relevance-gated on every agent turn
     (see AutoGenOrchestrator.run), so a router hint would change nothing and
     only costs the router tokens it can't spare — see the prompt below.
+
+    `delivery` — only meaningful when `route` is "deck"/"skill" (a file
+    generator matched at all): "file" (the default) means generate and hand
+    back a real downloadable file, exactly as before this field existed.
+    "inline" means the router judged the user wants the content shown in
+    chat instead — "just tell me," "summarize it here" — rather than
+    delivered as a file. This is a real capability GATE, not advisory like
+    needs_web: app/skill_render.py's render_spec_as_chat_text only covers
+    docx-generator and pptx today, so a caller must still check its return
+    value (None means "no renderer for this skill yet") and fall back to
+    generating the file regardless of what `delivery` says — "inline" is a
+    request the render step is allowed to grant, not a guarantee it can.
+    Defaults to "file" (unambiguous today's-behavior default) whenever no
+    router is available or the router's answer doesn't clearly ask for
+    inline content — see _deterministic_plan and the prompt below.
     """
     route: str
     skill_id: str | None = None
     needs_web: bool = False
+    delivery: str = "file"
     routed_by_llm: bool = False
     reason: str = ""
 
     def public(self) -> dict:
         return {
             "route": self.route, "skill_id": self.skill_id, "needs_web": self.needs_web,
-            "routed_by_llm": self.routed_by_llm, "reason": self.reason,
+            "delivery": self.delivery, "routed_by_llm": self.routed_by_llm, "reason": self.reason,
         }
 
 
@@ -245,29 +268,72 @@ def _as_bool(value: object) -> bool:
     return str(value).strip().lower() in ("true", "yes", "1")
 
 
-def _deterministic_plan(keyword_match: dict | None, allow_agent: bool, allow_web: bool) -> TurnPlan:
-    """Exactly the routing CopilotService.chat() did before plan_turn existed —
-    the fallback whenever no router model is available. `keyword_match` is
+def _parse_delivery(value: object) -> str:
+    """Anything other than exactly "inline" means "file" — the safe,
+    today's-behaviour default. Never raises: a malformed/missing/unexpected
+    answer here must not fail the whole routing decision the way a bad
+    `route` does (see plan_turn's `route not in allowed` check)."""
+    return "inline" if str(value).strip().lower() == "inline" else "file"
+
+
+def _deterministic_plan(keyword_match: dict | None) -> TurnPlan:
+    """The fallback whenever no router model is available: matches a chat
+    trigger straight to its generator, otherwise routes to the agent — every
+    turn gets full multi-step/tool/RAG capability unconditionally, there's no
+    toggle left to gate it. (This fallback never picks "direct" — telling a
+    genuinely simple question apart from one that needs grounding/tools is
+    exactly the judgment call that needs a real router call; without one, the
+    safe default is the fully-capable route.) `keyword_match` is
     SkillPackageStore.select_for_chat's result (as .public()), i.e. the same
     substring match that used to be the whole routing decision."""
     if keyword_match is not None:
         skill_id = keyword_match["skill_id"]
         return TurnPlan(
             route="deck" if skill_id == "pptx" else "skill", skill_id=skill_id,
-            # The Deck Builder used to hardcode web_search=True regardless of the
-            # toggle; recording that as "this route wants the web" keeps the same
-            # intent while letting the toggle stay the thing that actually decides.
             needs_web=(skill_id == "pptx"),
             reason="matched this generator's chat triggers",
         )
-    if allow_agent:
-        return TurnPlan(route="agent", needs_web=allow_web, reason="agent mode is on")
-    return TurnPlan(route="direct", reason="no generator matched and agent mode is off")
+    return TurnPlan(route="agent", needs_web=True, reason="every turn gets full agent capability")
+
+
+# Retried router-call statuses: transient upstream conditions worth one more
+# attempt before giving up on real reasoning entirely — 503 (momentarily
+# overloaded) and 429 (rate limited) are Google's own signal that the SAME
+# request would likely succeed a moment later, unlike a 400 (malformed
+# request) or 401/403 (bad/missing credentials), which would just fail
+# identically again and shouldn't burn an extra round-trip.
+_RETRYABLE_STATUS_CODES = {429, 503}
+_ROUTER_RETRY_DELAY_SECONDS = 1.5
+
+
+async def _complete_with_retry(router_provider: AIProvider, prompt: str, *, max_tokens: int):
+    """One bounded retry for a transient upstream failure (see
+    _RETRYABLE_STATUS_CODES) — verified live: plan_turn's router call
+    failing on a real `503 Service Unavailable` from Gemini's API was
+    silently degrading EVERY turn to trigger matching (zero reasoning) for
+    as long as Gemini stayed flaky, which is exactly the condition
+    _deterministic_plan has no judgment for (a bare keyword_match like
+    "docx" always wins, with no way to tell "draft new" from "convert
+    existing content" apart — see docs/agent-routing.md). A single retry
+    trades a bit of latency on the rare turn that hits this for keeping
+    real reasoning in the loop instead of falling back to none. Anything
+    else (a non-retryable status, a second failure) still raises straight
+    through to plan_turn's own except, which degrades exactly as before."""
+    try:
+        return await router_provider.complete(prompt, [], max_tokens=max_tokens, json_mode=True)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in _RETRYABLE_STATUS_CODES:
+            raise
+        logger.info(
+            "Turn router call got %s, retrying once after %.1fs…",
+            exc.response.status_code, _ROUTER_RETRY_DELAY_SECONDS,
+        )
+        await asyncio.sleep(_ROUTER_RETRY_DELAY_SECONDS)
+        return await router_provider.complete(prompt, [], max_tokens=max_tokens, json_mode=True)
 
 
 async def plan_turn(
-    message: str, *, skills: list[dict], keyword_match: dict | None,
-    allow_agent: bool, allow_web: bool, provider: AIProvider,
+    message: str, *, skills: list[dict], keyword_match: dict | None, provider: AIProvider,
 ) -> TurnPlan:
     """Decides what this turn should DO, from the message itself.
 
@@ -275,34 +341,42 @@ async def plan_turn(
     generators (id/name/output/description) rather than a hardcoded list, so an
     uploaded skill package becomes routable the moment it's installed.
 
-    `allow_agent`/`allow_web`: the Agent mode and Web search toggles, as
-    permissions. allow_agent picks which non-generation route is on the menu
-    ("agent" when on, "direct" when off) — the router chooses between
-    generating a file and answering, never between those two. allow_web never
-    restricts routing at all (it gates tool offering at the point of use) and
-    is passed only so the deterministic fallback can reproduce the previous
-    behaviour exactly.
+    No permission toggles any more — "agent" and "direct" are both always on
+    the menu, never gated by anything the user switched on or off. The router
+    picks between three things, purely from the query: generate a FILE
+    ("deck"/"skill"), answer using full capability — tools, live web research
+    when Tavily is configured, this organisation's indexed documents —
+    ("agent"), or answer directly with no augmentation needed at all
+    ("direct"). "direct" exists so CopilotService.chat_stream can real-stream
+    tokens for a genuinely simple question instead of paying for the full
+    orchestrator pipeline on every turn — see its `attempt_real_stream`. A
+    turn that might benefit from grounding/tools, even a little, should get
+    "agent"; "direct" is only for what's unambiguously safe to answer from the
+    model alone (arithmetic, wordplay, "explain X" where X is common
+    knowledge, continuing a conversation that needed no augmentation so far).
 
     `provider`: the caller's chat provider, used only for the same
     bare-MockProvider check AutoGenOrchestrator.run makes — explicitly mock
     means "deterministic, no real model call", so the router is never built
     for it and routing stays fully reproducible in tests.
+
+    On a "deck"/"skill" route, the router is also asked to judge
+    `delivery` — "file" (generate and hand back a real downloadable file,
+    the default) or "inline" (the user wants the content shown in chat
+    instead — see TurnPlan's docstring). Ambiguous phrasing defaults to
+    "file", matching every existing flow's behaviour from before this field
+    existed.
     """
-    fallback = _deterministic_plan(keyword_match, allow_agent, allow_web)
+    fallback = _deterministic_plan(keyword_match)
     router_provider = _build_turn_router_provider() if not isinstance(provider, MockProvider) else None
     if router_provider is None:
         return fallback
 
     by_id = {s["skill_id"]: s for s in skills}
-    # "agent" and "direct" are the two ends of the same non-generation route,
-    # picked by the toggle rather than by the router: Agent mode on means every
-    # non-generation turn gets the agent's RAG grounding and tools, off means
-    # every one is a plain answer. That's unchanged, and deliberately so —
-    # letting the router downgrade an agent-mode turn to "direct" would quietly
-    # cost it the relevance-gated knowledge-base grounding AutoGenOrchestrator.
-    # run does on every turn. What the router decides is the thing that was
-    # actually broken: whether this message wants a FILE generated at all.
-    allowed = ["agent"] if allow_agent else ["direct"]
+    # "agent" and "direct" are both always on the menu — neither is gated by
+    # a toggle any more. What the router decides is whether this message
+    # wants a FILE generated, and if not, whether it needs augmentation at all.
+    allowed = ["agent", "direct"]
     if "pptx" in by_id:
         allowed.append("deck")
     if any(skill_id != "pptx" for skill_id in by_id):
@@ -321,18 +395,31 @@ async def plan_turn(
     ) or "(none installed)"
     prompt = (
         "Route one message in an enterprise copilot. Answer with ONLY this JSON:\n"
-        '{"route": "...", "skill_id": "..." or null, "needs_web": true|false, "reason": "..."}\n\n'
+        '{"route": "...", "skill_id": "..." or null, "needs_web": true|false, '
+        '"delivery": "file"|"inline", "reason": "..."}\n\n'
         f"Routes:\n{routes_block}\n\n"
         f'Generators (use as "skill_id" for the file routes):\n{skills_block}\n\n'
-        'Pick a file route ONLY if the user wants a FILE made. Asking about, reviewing or '
-        "discussing a document or deck is not a request to generate one.\n"
+        'Pick a file route ONLY if the user wants a NEW document/deck DRAFTED from scratch '
+        "(these generators ask their own topic/audience/tone questions and know nothing already "
+        'said in this conversation). If the user instead wants EXISTING content — something '
+        'already produced or discussed in this conversation (a web search result, a prior '
+        'answer, a file already generated) — repackaged, converted, or exported as a file '
+        '(e.g. "turn that into a docx", "convert this to a file", "save the above as a PDF"), '
+        'route to "agent" instead: only the coding agent can take arbitrary existing content '
+        "and write real code to package it, rather than blindly re-drafting from a blank form. "
+        "Asking about, reviewing or discussing a document or deck is not a request to generate "
+        "one either.\n"
         '"needs_web": true only if answering needs current external facts.\n'
+        '"delivery" only matters for the deck/skill routes: "inline" ONLY if the user clearly '
+        'wants the content shown here in chat instead of a downloadable file (e.g. "just tell '
+        'me", "summarize it here", "no need for a file") — default "file" whenever this is '
+        "ambiguous or unstated.\n"
         '"reason": under 10 words, shown to the user.\n\n'
         f"Message:\n{message}"
     )
 
     try:
-        result = await router_provider.complete(prompt, [], max_tokens=_ROUTER_MAX_TOKENS, json_mode=True)
+        result = await _complete_with_retry(router_provider, prompt, max_tokens=_ROUTER_MAX_TOKENS)
         parsed = _loads_router_json(result.text)
         route = str(parsed.get("route", "")).strip()
     except Exception as exc:  # noqa: BLE001 - a router failure must degrade to trigger matching, never break the turn
@@ -353,8 +440,7 @@ async def plan_turn(
             # Still nothing real to run. Answering the message beats running
             # the wrong generator against it.
             return TurnPlan(
-                route="agent" if allow_agent else "direct", routed_by_llm=True,
-                reason="no matching generator is installed",
+                route="agent", routed_by_llm=True, reason="no matching generator is installed",
             )
         # Keep route and skill_id consistent however the router paired them:
         # "pptx" is the Deck Builder's conversational flow, every other skill is
@@ -367,6 +453,10 @@ async def plan_turn(
 
     return TurnPlan(
         route=route, skill_id=skill_id, needs_web=_as_bool(parsed.get("needs_web")),
+        # delivery only means anything on a file route — leaving it "file" (the
+        # dataclass default) for "agent"/"direct" avoids reading a stray/
+        # hallucinated "inline" answer as meaningful on a route it can't apply to.
+        delivery=_parse_delivery(parsed.get("delivery")) if route in ("deck", "skill") else "file",
         routed_by_llm=True, reason=str(parsed.get("reason", "")).strip()[:120],
     )
 
@@ -650,7 +740,7 @@ class AgentRegistry:
             # model is Gemma (a "thinking" model whose hidden reasoning can't
             # be disabled the way real Gemini models' can — see
             # app/providers.py:GeminiProvider.complete for why).
-            result = await router_provider.complete(prompt, [], max_tokens=64, json_mode=True)
+            result = await _complete_with_retry(router_provider, prompt, max_tokens=64)
             parsed = json.loads(result.text)
             chosen_name = str(parsed.get("agent", "")).strip()
         except Exception as exc:  # noqa: BLE001 - a router failure must degrade to keyword matching, never break the turn
@@ -962,8 +1052,11 @@ class AutoGenOrchestrator(AgentOrchestrator):
         # (settings.ai_mode alone isn't enough: it can be "configured" with
         # real credentials in .env while a test still injects MockProvider()
         # directly, and that must stay mock, not silently call a real model).
+        # web_search=True unconditionally — no per-request toggle any more;
+        # get_mcp_tools itself only actually adds the Tavily tool when
+        # TAVILY_API_KEY is configured, so this is a no-op when it isn't.
         mcp_tools = (
-            await get_mcp_tools(web_search=bool(context.get("web_search")))
+            await get_mcp_tools(web_search=True)
             if not isinstance(self.provider, MockProvider) else []
         )
         if mcp_tools:
@@ -1002,6 +1095,12 @@ class AutoGenOrchestrator(AgentOrchestrator):
                         "label": f"Answered ({provider_name}/{model_name})"
                                  + (f" using {len(tool_names)} tool call(s)." if tool_names else "."),
                         "provider": provider_name, "model": model_name, "used_fallback": False,
+                        # No token counts on this path — the tool-calling agent
+                        # runs through AutoGen's own AssistantAgent/model_client
+                        # (build_streaming_model_client), not a direct
+                        # AIProvider.complete() call, so there's no ProviderResult
+                        # here to read prompt_tokens/completion_tokens off of.
+                        "prompt_tokens": None, "completion_tokens": None,
                         # The real system_message this turn's AssistantAgent was
                         # built with (_build_agent_mode_system_message,
                         # recomputed identically here — deterministic given the
@@ -1052,6 +1151,7 @@ class AutoGenOrchestrator(AgentOrchestrator):
                 "stage": "model_call",
                 "label": f"Answered ({provider_name}{f'/{model_name}' if model_name else ''}).",
                 "provider": provider_name, "model": model_name, "used_fallback": used_fallback,
+                "prompt_tokens": result.prompt_tokens, "completion_tokens": result.completion_tokens,
                 # No separate system_preview here: this is the plain-completion
                 # path (AIProvider.complete — mock/Gemini/Ollama's own simple
                 # HTTP call), which has no distinct system-prompt concept, only
@@ -1363,14 +1463,10 @@ class DeckBuilderOrchestrator:
         clarifying Q&A) plus this turn's new user message, already merged by
         the caller.
 
-        `context["web_search"]`: this turn's Web search toggle. Previously the
-        Tavily tool was offered unconditionally here (`web_search=True`), which
-        meant a deck request made live web calls whether or not the user had
-        asked for that — the toggle was simply not reachable from this route.
-        It now behaves the same way it does on an agent turn: offered when the
-        user permits it, and the model still decides per-call whether to use
-        it. Defaults True so a caller that doesn't pass one (tests, any future
-        internal caller) keeps the previous behaviour."""
+        The Tavily web_search tool is always offered here (no per-request
+        toggle any more — see get_mcp_tools, which only actually adds it when
+        TAVILY_API_KEY is configured) and the model still decides per-call
+        whether a deck genuinely needs it."""
         model_client, provider_name, model_name = build_streaming_model_client(function_calling=True)
         if model_client is None:
             await _emit(on_event, {"stage": "drafting_spec", "label": "No model configured — using a basic deck."})
@@ -1385,7 +1481,7 @@ class DeckBuilderOrchestrator:
         # turn that really did three web searches look like it did nothing.
         web_sources: list[dict] = []
         try:
-            tools = await get_mcp_tools(web_search=context.get("web_search", True))
+            tools = await get_mcp_tools(web_search=True)
             agent = AssistantAgent(
                 "deck_builder", model_client=model_client, tools=tools,
                 system_message=_build_deck_builder_system_message(self.skill.instructions),

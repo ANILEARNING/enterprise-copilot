@@ -8,10 +8,17 @@ def test_build_sandbox_returns_local_subprocess_sandbox():
     assert isinstance(build_sandbox(), LocalSubprocessSandbox)
 
 
+def test_build_sandbox_returns_e2b_sandbox_when_configured(monkeypatch):
+    from app.sandbox import E2BSandbox
+    monkeypatch.setattr(settings, "code_execution_mode", "e2b")
+    assert isinstance(build_sandbox(), E2BSandbox)
+
+
 # --- successful execution -----------------------------------------------------
 
-def test_successful_execution_reports_completed_ok_and_stdout():
-    result = LocalSubprocessSandbox().run("print('hello from sandbox')")
+@pytest.mark.asyncio
+async def test_successful_execution_reports_completed_ok_and_stdout():
+    result = await LocalSubprocessSandbox().run("print('hello from sandbox')")
     assert result.status == ExecutionStatus.COMPLETED
     assert result.ok is True
     assert result.returncode == 0
@@ -22,16 +29,18 @@ def test_successful_execution_reports_completed_ok_and_stdout():
 
 # --- invalid code / script failure ---------------------------------------------
 
-def test_syntax_error_is_captured_not_raised():
-    result = LocalSubprocessSandbox().run("def broken(:\n    pass")
+@pytest.mark.asyncio
+async def test_syntax_error_is_captured_not_raised():
+    result = await LocalSubprocessSandbox().run("def broken(:\n    pass")
     assert result.status == ExecutionStatus.COMPLETED  # the sandbox itself ran fine
     assert result.ok is False
     assert result.returncode != 0
     assert "SyntaxError" in result.stderr
 
 
-def test_runtime_exception_is_captured_not_raised():
-    result = LocalSubprocessSandbox().run("raise ValueError('boom')")
+@pytest.mark.asyncio
+async def test_runtime_exception_is_captured_not_raised():
+    result = await LocalSubprocessSandbox().run("raise ValueError('boom')")
     assert result.status == ExecutionStatus.COMPLETED
     assert result.ok is False
     assert result.returncode != 0
@@ -39,17 +48,19 @@ def test_runtime_exception_is_captured_not_raised():
     assert "boom" in result.stderr
 
 
-def test_output_is_truncated_to_cap():
-    result = LocalSubprocessSandbox().run("print('x' * 50000)")
+@pytest.mark.asyncio
+async def test_output_is_truncated_to_cap():
+    result = await LocalSubprocessSandbox().run("print('x' * 50000)")
     assert result.ok is True
     assert len(result.stdout) <= 10000
 
 
 # --- timeout -------------------------------------------------------------------
 
-def test_timeout_is_reported_not_hung(monkeypatch):
+@pytest.mark.asyncio
+async def test_timeout_is_reported_not_hung(monkeypatch):
     monkeypatch.setattr(settings, "max_code_execution_seconds", 1)
-    result = LocalSubprocessSandbox().run("import time; time.sleep(5)")
+    result = await LocalSubprocessSandbox().run("import time; time.sleep(5)")
     assert result.status == ExecutionStatus.TIMEOUT
     assert result.ok is False
     assert "timeout" in (result.error or "").lower()
@@ -57,9 +68,10 @@ def test_timeout_is_reported_not_hung(monkeypatch):
 
 # --- disabled mode ---------------------------------------------------------------
 
-def test_disabled_mode_refuses_without_running(monkeypatch):
+@pytest.mark.asyncio
+async def test_disabled_mode_refuses_without_running(monkeypatch):
     monkeypatch.setattr(settings, "code_execution_mode", "disabled")
-    result = LocalSubprocessSandbox().run("print('should never run')")
+    result = await LocalSubprocessSandbox().run("print('should never run')")
     assert result.status == ExecutionStatus.DISABLED
     assert result.ok is False
     assert result.stdout == ""
@@ -67,66 +79,74 @@ def test_disabled_mode_refuses_without_running(monkeypatch):
 
 # --- best-effort static guard (file access restriction) ------------------------
 
-def test_env_access_is_blocked_before_running():
-    result = LocalSubprocessSandbox().run("import os\nprint(os.environ.get('SECRET'))")
+@pytest.mark.asyncio
+async def test_env_access_is_blocked_before_running():
+    result = await LocalSubprocessSandbox().run("import os\nprint(os.environ.get('SECRET'))")
     assert result.status == ExecutionStatus.BLOCKED
     assert result.ok is False
     assert result.stdout == ""  # never actually ran
 
 
-def test_absolute_path_open_is_blocked_before_running():
-    result = LocalSubprocessSandbox().run("open('C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts')")
+@pytest.mark.asyncio
+async def test_absolute_path_open_is_blocked_before_running():
+    result = await LocalSubprocessSandbox().run("open('C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts')")
     assert result.status == ExecutionStatus.BLOCKED
     assert result.stdout == ""
 
 
-def test_relative_path_open_is_not_blocked():
+@pytest.mark.asyncio
+async def test_relative_path_open_is_not_blocked():
     # only absolute paths trip the guard -- a script writing inside its own
     # workspace via a relative path is the whole point of "generated artifacts".
-    result = LocalSubprocessSandbox().run("open('note.txt', 'w').write('hi')")
+    result = await LocalSubprocessSandbox().run("open('note.txt', 'w').write('hi')")
     assert result.status == ExecutionStatus.COMPLETED
     assert result.ok is True
 
 
 # --- artifact tracking -----------------------------------------------------------
 
-def test_generated_artifact_is_tracked_by_name():
+@pytest.mark.asyncio
+async def test_generated_artifact_is_tracked_by_name():
     code = "with open('report.csv', 'w') as f:\n    f.write('a,b\\n1,2\\n')"
-    result = LocalSubprocessSandbox().run(code)
+    result = await LocalSubprocessSandbox().run(code)
     assert result.ok is True
     assert "report.csv" in result.artifacts
 
 
-def test_no_artifacts_when_script_writes_nothing():
-    result = LocalSubprocessSandbox().run("print('no files here')")
+@pytest.mark.asyncio
+async def test_no_artifacts_when_script_writes_nothing():
+    result = await LocalSubprocessSandbox().run("print('no files here')")
     assert result.artifacts == []
 
 
 # --- downloadable artifact capture (dashboards/reports) -------------------------
 
-def test_html_artifact_content_is_captured():
+@pytest.mark.asyncio
+async def test_html_artifact_content_is_captured():
     code = "open('output.html', 'w', encoding='utf-8').write('<html><body>Hi</body></html>')"
-    result = LocalSubprocessSandbox().run(code)
+    result = await LocalSubprocessSandbox().run(code)
     assert result.ok is True
     assert "output.html" in result.artifacts
     assert result.artifact_files == {"output.html": b"<html><body>Hi</body></html>"}
 
 
-def test_non_downloadable_extension_is_listed_but_not_captured():
+@pytest.mark.asyncio
+async def test_non_downloadable_extension_is_listed_but_not_captured():
     # report.csv still shows up in `artifacts` (any file the script wrote)
     # but its content is never read into artifact_files — only .html/.htm/.pdf
     # qualify (app/sandbox.py:DOWNLOADABLE_ARTIFACT_EXTENSIONS).
     code = "open('report.csv', 'w').write('a,b\\n1,2\\n')"
-    result = LocalSubprocessSandbox().run(code)
+    result = await LocalSubprocessSandbox().run(code)
     assert "report.csv" in result.artifacts
     assert result.artifact_files == {}
 
 
-def test_artifact_content_not_captured_when_script_fails():
+@pytest.mark.asyncio
+async def test_artifact_content_not_captured_when_script_fails():
     # A failed run's half-written file isn't worth keeping — see
     # _run_in_workspace's `if proc.returncode == 0` guard.
     code = "open('output.html', 'w').write('<html>')\nraise ValueError('boom')"
-    result = LocalSubprocessSandbox().run(code)
+    result = await LocalSubprocessSandbox().run(code)
     assert result.ok is False
     assert "output.html" in result.artifacts  # still listed
     assert result.artifact_files == {}  # but not captured
@@ -212,7 +232,7 @@ async def test_hitl_rejected_request_never_calls_sandbox():
     from app.services import HitlService
 
     class ExplodingSandbox:
-        def run(self, code):
+        async def run(self, code):
             raise AssertionError("sandbox.run must not be called for a rejected request")
 
     hitl = HitlService(ExplodingSandbox())

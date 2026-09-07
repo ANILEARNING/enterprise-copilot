@@ -7,7 +7,7 @@ decides this — it's a deterministic substring match, checked before any model 
 
 ## Workflow
 Inspect → implement → test → fix → validate — same as the general engineering discipline this
-project's own `CLAUDE.md` workflow follows. Concretely, in agent mode:
+project's own `CLAUDE.md` workflow follows. Concretely, on the router's "agent" route:
 
 1. The turn's system prompt (`_build_agent_mode_system_message`, `app/agents.py`) is extended
    with `_CODING_SYSTEM_ADDENDUM`, which mandates two things the model must not skip:

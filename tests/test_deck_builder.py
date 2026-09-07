@@ -24,9 +24,9 @@ def _service(tmp_path) -> CopilotService:
 @pytest.mark.asyncio
 async def test_pptx_trigger_sets_pending_deck_builder_not_pending_skill_run(tmp_path):
     service = _service(tmp_path)
-    result = await service.chat("make me a powerpoint about our roadmap", agent_mode=False, session_id=None)
+    result = await service.chat("make me a powerpoint about our roadmap", session_id=None)
     sid = result["session_id"]
-    session = service.sessions.get(sid)
+    session = await service.sessions.get(sid)
     assert session.get("pending_skill_run") is None
     assert result["skill_run"] is None
     assert result["agent"] == "deck-builder"
@@ -40,7 +40,7 @@ async def test_no_credentials_degrades_via_fallback_deck_spec(tmp_path):
     # "every skill works end-to-end with zero credentials" guarantee every
     # other skill already has.
     service = _service(tmp_path)
-    result = await service.chat("make me a powerpoint about our roadmap", agent_mode=False, session_id=None)
+    result = await service.chat("make me a powerpoint about our roadmap", session_id=None)
     assert result["response"]  # got SOME usable response, not an exception
     # auto_generate defaults False -> queued for approval, not generated yet.
     pending = service.hitl.list()
@@ -69,7 +69,7 @@ async def test_auto_generate_on_produces_artifact_immediately(tmp_path, monkeypa
         service.deck_builder, "_orchestrator_for", lambda skill: _fake_orchestrator(_TEST_SPEC)(skill),
     )
     result = await service.chat(
-        "make me a powerpoint about Q3", agent_mode=False, session_id=None, auto_generate=True,
+        "make me a powerpoint about Q3", session_id=None, auto_generate=True,
     )
     assert result["downloadable_artifacts"], "expected an artifact to be produced immediately"
     artifact_id = result["downloadable_artifacts"][0]["artifact_id"]
@@ -78,7 +78,7 @@ async def test_auto_generate_on_produces_artifact_immediately(tmp_path, monkeypa
     # No HITL record created for the auto-generate path.
     assert not any(r["kind"] == "deck_generation" for r in service.hitl.list())
     # pending_deck_builder cleared after successful completion.
-    session = service.sessions.get(result["session_id"])
+    session = await service.sessions.get(result["session_id"])
     assert session.get("pending_deck_builder") is None
     assert session.get("last_deck_spec") == _TEST_SPEC
 
@@ -90,7 +90,7 @@ async def test_auto_generate_off_queues_hitl_approval(tmp_path, monkeypatch):
         service.deck_builder, "_orchestrator_for", lambda skill: _fake_orchestrator(_TEST_SPEC)(skill),
     )
     result = await service.chat(
-        "make me a powerpoint about Q3", agent_mode=False, session_id=None, auto_generate=False,
+        "make me a powerpoint about Q3", session_id=None, auto_generate=False,
     )
     assert result["downloadable_artifacts"] == []  # nothing generated yet
     pending = [r for r in service.hitl.list() if r["kind"] == "deck_generation"]
@@ -124,7 +124,7 @@ async def test_deck_phases_that_queue_nothing_report_no_pending_approval(tmp_pat
         service.deck_builder, "_orchestrator_for", lambda skill: _fake_orchestrator(_TEST_SPEC)(skill),
     )
     generated = await service.chat(
-        "make me a powerpoint about Q3", agent_mode=False, session_id=None, auto_generate=True,
+        "make me a powerpoint about Q3", session_id=None, auto_generate=True,
     )
     assert generated["downloadable_artifacts"]
     assert generated["hitl_pending"] == []
@@ -134,7 +134,7 @@ async def test_deck_phases_that_queue_nothing_report_no_pending_approval(tmp_pat
             return DeckBuilderResult(clarifying_text="Who is the audience?", provider="mock")
 
     monkeypatch.setattr(service.deck_builder, "_orchestrator_for", lambda skill: _Clarifying(skill))
-    clarifying = await service.chat("make me a powerpoint about Q4", agent_mode=False, session_id=None)
+    clarifying = await service.chat("make me a powerpoint about Q4", session_id=None)
     assert clarifying["hitl_pending"] == []
 
 
@@ -145,7 +145,7 @@ async def test_decide_rejected_never_runs_generation(tmp_path, monkeypatch):
         service.deck_builder, "_orchestrator_for", lambda skill: _fake_orchestrator(_TEST_SPEC)(skill),
     )
     result = await service.chat(
-        "make me a powerpoint about Q3", agent_mode=False, session_id=None, auto_generate=False,
+        "make me a powerpoint about Q3", session_id=None, auto_generate=False,
     )
     pending = [r for r in service.hitl.list() if r["kind"] == "deck_generation"][0]
 
@@ -206,15 +206,15 @@ async def test_pending_deck_builder_persists_across_clarifying_turn(tmp_path, mo
 
     monkeypatch.setattr(service.deck_builder, "_orchestrator_for", lambda skill: _ClarifyThenSpec(skill))
 
-    first = await service.chat("make me a powerpoint about Q3", agent_mode=False, session_id=None)
+    first = await service.chat("make me a powerpoint about Q3", session_id=None)
     sid = first["session_id"]
     assert "audience" in first["response"].lower()
-    session = service.sessions.get(sid)
+    session = await service.sessions.get(sid)
     pending = session.get("pending_deck_builder")
     assert pending is not None
     assert pending["phase"] == "clarifying"
 
-    second = await service.chat("Executives", agent_mode=False, session_id=sid)
-    session_after = service.sessions.get(sid)
+    second = await service.chat("Executives", session_id=sid)
+    session_after = await service.sessions.get(sid)
     assert session_after.get("pending_deck_builder") is None  # cleared once a spec was ready
     assert second["downloadable_artifacts"] == []  # auto_generate defaulted False -> queued, not generated

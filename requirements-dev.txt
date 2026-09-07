@@ -2,3 +2,8 @@
 pytest
 pytest-asyncio
 httpx
+# Test-only DB engine (see conftest.py) — every JSONB column in app/db/models.py
+# is read/written as a whole blob (never queried with ->>/@>), which is what
+# keeps SQLite substitutable for SQLAlchemy's generic JSON/Uuid types in tests,
+# avoiding a real Postgres dependency for the default test suite.
+aiosqlite
